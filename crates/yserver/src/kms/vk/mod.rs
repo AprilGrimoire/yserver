@@ -8,6 +8,7 @@
 
 pub mod call_stats;
 pub mod compositor;
+pub mod convolution_pipeline;
 pub mod copy_scratch;
 pub mod device;
 pub mod dri3;

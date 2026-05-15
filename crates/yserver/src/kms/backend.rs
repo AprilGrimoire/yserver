@@ -871,6 +871,15 @@ pub struct KmsBackend {
     // as the mask binding for `Composite` calls without a mask
     // (the multiplication by `mask.a == 1.0` is a no-op).
     pub(crate) render_pipelines: Option<crate::kms::vk::render_pipeline::RenderPipelineCache>,
+    /// Single-pass arbitrary-kernel convolution pipeline for X RENDER
+    /// `SetPictureFilter convolution` (xfwm4 / marco / mutter shadow
+    /// blur). Built once at backend init; one pipeline keyed on
+    /// `(Over, B8G8R8A8_UNORM)` for phase 2. `None` when Vulkan
+    /// didn't come up — `try_vk_render_composite` falls back to the
+    /// standard render pipeline (= ignores the convolution kernel,
+    /// matching pre-phase-2 behaviour).
+    pub(crate) convolution_pipeline:
+        Option<crate::kms::vk::convolution_pipeline::ConvolutionPipeline>,
     pub(crate) solid_src_image: Option<crate::kms::vk::render_pipeline::SolidColorImage>,
     pub(crate) solid_mask_image: Option<crate::kms::vk::render_pipeline::SolidColorImage>,
     pub(crate) white_mask_image: Option<crate::kms::vk::render_pipeline::SolidColorImage>,
@@ -1096,9 +1105,17 @@ impl PictureFilter {
         let values_start = name_start + ((name_length + 3) & !3);
         let values = &body[values_start.min(body.len())..];
 
+        // Aliases mirror the QueryFilters reply
+        // (`write_render_query_filters_reply` in yserver-protocol).
+        // X RENDER spec: `fast` aliases `nearest`; `good` and `best`
+        // alias `bilinear`. Keeping this in sync with the advertised
+        // alias table matters — clients that consult QueryFilters
+        // first and then issue SetPictureFilter with the canonical
+        // name (e.g. `nearest` instead of `fast`) get the same
+        // semantics either way.
         match name {
-            b"nearest" => Some(PictureFilter::Nearest),
-            b"bilinear" | b"good" | b"fast" | b"best" => Some(PictureFilter::Bilinear),
+            b"nearest" | b"fast" => Some(PictureFilter::Nearest),
+            b"bilinear" | b"good" | b"best" => Some(PictureFilter::Bilinear),
             b"convolution" => parse_convolution(values),
             _ => None,
         }
@@ -1570,6 +1587,7 @@ impl KmsBackend {
             glyph_atlas: None,
             text_pipeline: None,
             render_pipelines: None,
+            convolution_pipeline: None,
             solid_src_image: None,
             solid_mask_image: None,
             white_mask_image: None,
@@ -2358,6 +2376,28 @@ impl KmsBackend {
             }
         });
 
+        // Phase 2 of the convolution-filter work (plan
+        // 2026-05-15-render-convolution-filter.md). Single-pass
+        // arbitrary-kernel pipeline used when a Composite source has
+        // `SetPictureFilter convolution`. Failure here leaves the
+        // field `None`; `try_vk_render_composite` falls back to the
+        // standard pipeline (= no convolution effect, matches
+        // pre-phase-2 behaviour).
+        let convolution_pipeline = vk.as_ref().and_then(|vkctx| {
+            match crate::kms::vk::convolution_pipeline::ConvolutionPipeline::new(Arc::clone(vkctx))
+            {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    log::warn!(
+                        "convolution pipeline init failed: {e:?} — RENDER convolution-filter \
+                         Composite paths will fall back to the standard sampler (= no kernel \
+                         effect, hard-edged shadows)"
+                    );
+                    None
+                }
+            }
+        });
+
         // 1×1 BGRA8 scratch for `SolidFill` source / `render_fill_rectangles`
         // colour. `cmd_clear_color_image` rewrites it inside each
         // composite CB before sampling.
@@ -2535,6 +2575,7 @@ impl KmsBackend {
             glyph_atlas,
             text_pipeline,
             render_pipelines,
+            convolution_pipeline,
             solid_src_image,
             solid_mask_image,
             white_mask_image,
@@ -3538,6 +3579,7 @@ impl KmsBackend {
             None,
             None,
             false,
+            &PictureFilter::Nearest,
         )
     }
 
@@ -6281,6 +6323,7 @@ impl KmsBackend {
     /// through to pixman.
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn try_vk_render_composite(
         &mut self,
         op: u8,
@@ -6294,6 +6337,7 @@ impl KmsBackend {
         src_xform: Option<PictTransform>,
         mask_xform: Option<PictTransform>,
         mask_component_alpha: bool,
+        src_filter: &PictureFilter,
     ) -> bool {
         use crate::kms::vk::{
             ops::render as vk_render,
@@ -6303,6 +6347,47 @@ impl KmsBackend {
         if rects.is_empty() {
             return true;
         }
+
+        // Convolution-filter early dispatch (phase 2 of the
+        // convolution-filter work, plan
+        // 2026-05-15-render-convolution-filter.md). When the source
+        // picture has `SetPictureFilter convolution`, the destination
+        // is BGRA, the op is Over, there is no mask, and the source
+        // transform / repeat are identity / None, route to the
+        // single-pass convolution pipeline. Anything else falls
+        // through to the standard LINEAR-sampler path below
+        // (kernel is silently ignored — matches pre-phase-2
+        // behaviour, hard-edged shadows).
+        if matches!(src_filter, PictureFilter::Convolution { .. }) {
+            // Diagnostic — every gating predicate we evaluate, so a
+            // single `RUST_LOG=debug` run shows why a convolution-
+            // source composite lands on the standard path instead
+            // (vs. the assumption that the convolution path is
+            // engaging silently).
+            let src_is_drawable = matches!(src, RenderPic::Drawable(_));
+            let mask_is_none = matches!(mask, RenderPic::None);
+            let xform_identity = src_xform.is_none();
+            let repeat_none = matches!(src_repeat, Repeat::None);
+            let pipeline_ready = self.convolution_pipeline.is_some();
+            log::debug!(
+                "vk composite: convolution-source gating dst=0x{dst_xid:x} op={op} \
+                 src_drawable={src_is_drawable} mask_none={mask_is_none} \
+                 xform_identity={xform_identity} repeat_none={repeat_none} \
+                 pipeline_ready={pipeline_ready}"
+            );
+            if src_is_drawable
+                && mask_is_none
+                && op == 3
+                && xform_identity
+                && repeat_none
+                && pipeline_ready
+                && let Some(t) = self
+                    .try_vk_render_composite_convolution(src, dst_xid, rects, scissor, src_filter)
+            {
+                return t;
+            }
+        }
+
         let Some(std_op) = StdPictOp::from_u8(op) else {
             log::debug!("vk composite bail: unsupported op={op} (dst=0x{dst_xid:x})");
             return false;
@@ -6873,6 +6958,209 @@ impl KmsBackend {
                      {e:?} — falling back to pixman"
                 );
                 false
+            }
+        }
+    }
+
+    /// Phase 2 of the convolution-filter work
+    /// (`docs/superpowers/plans/2026-05-15-render-convolution-filter.md`).
+    /// Composite a Drawable source through its
+    /// [`PictureFilter::Convolution`] kernel onto `dst_xid`.
+    ///
+    /// Caller has already gated on: filter is Convolution, src is
+    /// Drawable, no mask, op == Over, identity src transform,
+    /// Repeat::None, [`convolution_pipeline`] is `Some`.
+    ///
+    /// Returns:
+    /// - `Some(true)` — convolution path took the work.
+    /// - `Some(false)` — structural failure (dst mirror missing, src
+    ///   mirror not sampleable, record failed). Caller surfaces this
+    ///   to its caller; the standard render path would have failed
+    ///   for the same reason.
+    /// - `None` — the kernel falls outside the shader's supported
+    ///   range, or the dst / src mirror format is unexpected. Caller
+    ///   falls through to the standard LINEAR-sampler path (kernel
+    ///   silently ignored, matching pre-phase-2 behaviour).
+    ///
+    /// [`PictureFilter::Convolution`]: PictureFilter::Convolution
+    /// [`convolution_pipeline`]: KmsBackend::convolution_pipeline
+    fn try_vk_render_composite_convolution(
+        &mut self,
+        src: RenderPic,
+        dst_xid: u32,
+        rects: &[crate::kms::vk::ops::render::CompositeRect],
+        scissor: ash::vk::Rect2D,
+        src_filter: &PictureFilter,
+    ) -> Option<bool> {
+        use crate::kms::vk::{
+            convolution_pipeline::{ConvolutionKernelData, KERNEL_UBO_ALIGNMENT},
+            ops::{render as vk_render, render::AffineXform},
+        };
+
+        let RenderPic::Drawable(src_xid) = src else {
+            return Some(false);
+        };
+        let PictureFilter::Convolution {
+            width,
+            height,
+            weights,
+        } = src_filter
+        else {
+            return None;
+        };
+        let kernel_data = match ConvolutionKernelData::from_parsed(*width, *height, weights) {
+            Some(k) => k,
+            None => {
+                log::debug!(
+                    "vk convolution composite: kernel out of range ({width}×{height}), \
+                     falling back to LINEAR (dst=0x{dst_xid:x})"
+                );
+                return None;
+            }
+        };
+
+        let Some((vk_arc, pool_handle)) = self.paint_resources() else {
+            log::debug!(
+                "vk convolution composite bail: paint_resources unavailable (dst=0x{dst_xid:x})"
+            );
+            return Some(false);
+        };
+        // Caller in `try_vk_render_composite` already gated on
+        // `self.convolution_pipeline.is_some()` — no defensive recheck.
+
+        // dst mirror format + extent.
+        let (dst_format, dst_extent) = {
+            let m = if let Some(w) = self.windows.get(&dst_xid) {
+                w.vk_mirror.as_ref()
+            } else if let Some(p) = self.pixmaps.get(&dst_xid) {
+                p.vk_mirror.as_ref()
+            } else {
+                None
+            };
+            let Some(m) = m else {
+                log::debug!(
+                    "vk convolution composite bail: dst mirror missing (dst=0x{dst_xid:x})"
+                );
+                return Some(false);
+            };
+            (m.format, m.extent)
+        };
+        if dst_format != ash::vk::Format::B8G8R8A8_UNORM {
+            // Convolution pipeline is BGRA-only for phase 2.
+            return None;
+        }
+        let _ = dst_extent; // surface in attrs below via the dst_mirror.
+
+        if !self.ensure_drawable_mirror_sampleable(src_xid) {
+            return Some(false);
+        }
+
+        // src view + extent. Convolution pipeline expects a BGRA
+        // mirror (matches the typical xfwm4 shadow source: BGRA
+        // server-owned pixmap painted via PutImage by the
+        // compositor). R8 / depth-1 sources fall back.
+        let (src_view, src_extent) = {
+            let m = if let Some(w) = self.windows.get(&src_xid) {
+                w.vk_mirror.as_ref()
+            } else if let Some(p) = self.pixmaps.get(&src_xid) {
+                p.vk_mirror.as_ref()
+            } else {
+                None
+            };
+            let Some(m) = m else {
+                return Some(false);
+            };
+            if m.format != ash::vk::Format::B8G8R8A8_UNORM {
+                return None;
+            }
+            (m.vk_image_view, m.extent)
+        };
+
+        // Split-borrow on disjoint fields: `convolution_pipeline`
+        // (shared), `scheduler` (mut via record_paint_batch_op),
+        // `windows`/`pixmaps` (mut via the dst_mirror grab).
+        let dst_mirror = if let Some(w) = self.windows.get_mut(&dst_xid) {
+            w.vk_mirror.as_mut()
+        } else if let Some(p) = self.pixmaps.get_mut(&dst_xid) {
+            p.vk_mirror.as_mut()
+        } else {
+            None
+        };
+        let Some(dst_mirror) = dst_mirror else {
+            return Some(false);
+        };
+
+        let conv_pipeline = self.convolution_pipeline.as_ref().expect("checked above");
+        let pipeline = conv_pipeline.pipeline();
+        let pipeline_layout = conv_pipeline.pipeline_layout();
+
+        // Convolution shader reads `dst_origin`, `dst_size`,
+        // `viewport`, `src_origin`, `src_extent`, `src_xform_*` — the
+        // mask + repeat fields are unused. Identity src transform
+        // (precondition), unit mask extent (descriptor has no mask
+        // binding so the mask UV would never be sampled anyway).
+        let attrs = vk_render::CompositeAttrs {
+            src_extent,
+            mask_extent: ash::vk::Extent2D {
+                width: 1,
+                height: 1,
+            },
+            src_repeat: crate::kms::vk::render_pipeline::REPEAT_NONE,
+            mask_repeat: crate::kms::vk::render_pipeline::REPEAT_NONE,
+            src_xform: AffineXform::IDENTITY,
+            mask_xform: AffineXform::IDENTITY,
+        };
+
+        let kernel_size = std::mem::size_of::<ConvolutionKernelData>() as u64;
+        let result = self
+            .scheduler
+            .record_paint_batch_op(vk_arc, pool_handle, |vk, batch, cb| {
+                // Per-draw UBO slice. The arena chunks live until
+                // batch retirement, so the descriptor's buffer
+                // binding stays valid for the full CB lifetime.
+                let alloc = batch
+                    .upload_arena_mut()
+                    .alloc(kernel_size, KERNEL_UBO_ALIGNMENT)
+                    .map_err(|e| match e {
+                        crate::kms::scheduler::batch_upload_arena::ArenaError::Vk(r) => r,
+                        crate::kms::scheduler::batch_upload_arena::ArenaError::NoMemoryType => {
+                            ash::vk::Result::ERROR_OUT_OF_HOST_MEMORY
+                        }
+                    })?;
+                // SAFETY: `alloc.mapped_ptr` is mapped for `alloc.size`
+                // bytes (= `kernel_size` here); we copy exactly that
+                // many bytes from `kernel_data`'s in-memory image.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        kernel_data.as_bytes().as_ptr(),
+                        alloc.mapped_ptr.as_ptr(),
+                        kernel_size as usize,
+                    );
+                }
+                let descriptor_set = conv_pipeline.allocate_descriptor_for_views_into(
+                    batch.descriptor_arena_mut(),
+                    src_view,
+                    alloc.buffer,
+                    alloc.offset,
+                    kernel_size,
+                )?;
+                vk_render::record_render_composite(
+                    vk,
+                    cb,
+                    dst_mirror,
+                    pipeline,
+                    pipeline_layout,
+                    descriptor_set,
+                    &attrs,
+                    rects,
+                    scissor,
+                )
+            });
+        match result {
+            Ok(()) => Some(true),
+            Err(e) => {
+                log::warn!("vk convolution composite: record failed on dst 0x{dst_xid:x}: {e:?}");
+                Some(false)
             }
         }
     }
@@ -11999,43 +12287,72 @@ impl Backend for KmsBackend {
         // shader handles all repeat modes + the affine portion of
         // any transform; SolidFill / Drawable / Gradient sources are
         // resolved by `resolve_render_pic_with_gradient_xid`.
-        let (src_repeat, src_transform) = match self.pictures.get(&host_src) {
-            Some(PictureState::SolidFill { repeat, .. }) => (*repeat, None),
+        let (src_repeat, src_transform, src_filter) = match self.pictures.get(&host_src) {
+            Some(PictureState::SolidFill { repeat, .. }) => (*repeat, None, PictureFilter::Nearest),
             Some(PictureState::Gradient {
                 repeat, transform, ..
-            }) => (*repeat, *transform),
+            }) => (*repeat, *transform, PictureFilter::Nearest),
             Some(PictureState::Drawable {
-                repeat, transform, ..
-            }) => (*repeat, *transform),
+                repeat,
+                transform,
+                filter,
+                ..
+            }) => (*repeat, *transform, filter.clone()),
             None => {
                 log::debug!("render_composite: host_src 0x{host_src:x} not found");
                 return Ok(());
             }
         };
-        let (mask_repeat, mask_transform, mask_component_alpha) = if host_mask == 0 {
-            (Repeat::None, None, false)
+        let (mask_repeat, mask_transform, mask_component_alpha, mask_filter) = if host_mask == 0 {
+            (Repeat::None, None, false, PictureFilter::Nearest)
         } else {
             match self.pictures.get(&host_mask) {
                 Some(PictureState::SolidFill {
                     repeat,
                     component_alpha,
                     ..
-                }) => (*repeat, None, *component_alpha),
+                }) => (*repeat, None, *component_alpha, PictureFilter::Nearest),
                 Some(PictureState::Gradient {
                     repeat, transform, ..
-                }) => (*repeat, *transform, false),
+                }) => (*repeat, *transform, false, PictureFilter::Nearest),
                 Some(PictureState::Drawable {
                     repeat,
                     transform,
                     component_alpha,
+                    filter,
                     ..
-                }) => (*repeat, *transform, *component_alpha),
+                }) => (*repeat, *transform, *component_alpha, filter.clone()),
                 None => {
                     log::debug!("render_composite: host_mask 0x{host_mask:x} not found");
                     return Ok(());
                 }
             }
         };
+
+        // Convolution-filter diagnostic: log when either side carries
+        // a convolution kernel so we can see which clients use it on
+        // src vs mask (xfwm4 / picom / mutter shadow blur). Phase 2
+        // only honors src-side; mask-side falls through silently
+        // (kernel ignored).
+        if log::log_enabled!(log::Level::Debug) {
+            let summarize = |f: &PictureFilter| -> &'static str {
+                match f {
+                    PictureFilter::Convolution { .. } => "convolution",
+                    PictureFilter::Bilinear => "bilinear",
+                    PictureFilter::Nearest => "nearest",
+                }
+            };
+            if matches!(src_filter, PictureFilter::Convolution { .. })
+                || matches!(mask_filter, PictureFilter::Convolution { .. })
+            {
+                log::debug!(
+                    "render_composite: convolution-bearing composite op={op} \
+                     src=0x{host_src:x}/{} mask=0x{host_mask:x}/{} dst=0x{host_dst:x}",
+                    summarize(&src_filter),
+                    summarize(&mask_filter),
+                );
+            }
+        }
 
         let (dst_xid, clip) = match self.pictures.get(&host_dst) {
             Some(PictureState::Drawable { host_xid, clip, .. }) => (*host_xid, clip.clone()),
@@ -12074,6 +12391,7 @@ impl Backend for KmsBackend {
                 src_transform,
                 mask_transform,
                 mask_component_alpha,
+                &src_filter,
             );
         }
 
@@ -12186,6 +12504,7 @@ impl Backend for KmsBackend {
             None,
             None,
             false,
+            &PictureFilter::Nearest,
         );
         if !took {
             log::debug!(
@@ -12608,6 +12927,23 @@ impl Backend for KmsBackend {
             );
             return Ok(());
         };
+        let filter_summary = match &filter {
+            PictureFilter::Nearest => "nearest".to_string(),
+            PictureFilter::Bilinear => "bilinear".to_string(),
+            PictureFilter::Convolution { width, height, .. } => {
+                format!("convolution {width}x{height}")
+            }
+        };
+        let picture_kind = match self.pictures.get(&host_pic) {
+            Some(PictureState::Drawable { .. }) => "Drawable",
+            Some(PictureState::SolidFill { .. }) => "SolidFill",
+            Some(PictureState::Gradient { .. }) => "Gradient",
+            None => "<absent>",
+        };
+        log::debug!(
+            "render_set_picture_filter: picture=0x{host_pic:x} kind={picture_kind} \
+             filter={filter_summary}"
+        );
         if let Some(PictureState::Drawable { filter: slot, .. }) = self.pictures.get_mut(&host_pic)
         {
             *slot = filter;

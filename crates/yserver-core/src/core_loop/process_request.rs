@@ -1209,6 +1209,9 @@ fn handle_render_request(
             }
         }
         29 => {
+            log::debug!(
+                "render: RenderQueryFilters from client {client_id:?} sequence={sequence:?}"
+            );
             let mut buf: Vec<u8> = Vec::with_capacity(64);
             x11::write_render_query_filters_reply(&mut buf, byte_order, sequence)?;
             let Some(client) = state.clients.get_mut(&client_id.0) else {
