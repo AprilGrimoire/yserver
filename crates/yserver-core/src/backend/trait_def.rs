@@ -405,6 +405,35 @@ pub trait Backend: Send {
         Ok(())
     }
 
+    /// Mark `host_window` as redirected-Manual (or clear the mark).
+    /// While marked, the backend's scanout pass must skip the window's
+    /// own mirror — the compositor that issued `RedirectWindow` /
+    /// `RedirectSubwindows update=Manual(1)` is responsible for
+    /// painting the window's visible content to the root via
+    /// `RENDER Composite` from a `NameWindowPixmap` alias of the
+    /// backing.
+    ///
+    /// Called from the COMPOSITE activation / teardown / mode-
+    /// transition paths in `crates/yserver-core/src/core_loop/process_request.rs`
+    /// and from `teardown_redirect_for_window` in
+    /// `process_disconnect.rs`. Kept as an explicit toggle rather than
+    /// piggybacking on `allocate_redirected_backing` /
+    /// `release_redirected_backing` so resize (which releases the old
+    /// backing while the window stays redirected) cannot accidentally
+    /// clear the flag.
+    ///
+    /// Default no-op for backends without a scanout pass of their own
+    /// (host-X11 forwards paint to the host server, so the host
+    /// performs its own composite).
+    fn set_window_scanout_skipped(
+        &mut self,
+        origin: Option<OriginContext>,
+        host_window: WindowHandle,
+        skip: bool,
+    ) {
+        let _ = (origin, host_window, skip);
+    }
+
     // ──────────────────────────────────────────────────────────────
     // Resources (pixmap, font, cursor)
     // ──────────────────────────────────────────────────────────────

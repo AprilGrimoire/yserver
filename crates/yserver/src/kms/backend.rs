@@ -1007,6 +1007,15 @@ pub struct KmsBackend {
     /// up the matching backing here. Cleared by B.6c when a
     /// redirect is torn down.
     pub(crate) host_window_to_backing: HashMap<u32, PixmapHandle>,
+    /// Set of host XIDs flagged "redirected Manual" — their own
+    /// window mirror is omitted from the scanout walk because the
+    /// compositor that owns the redirect paints the visible content
+    /// to the root via RENDER Composite from a `NameWindowPixmap`
+    /// alias.  Maintained explicitly via `set_window_scanout_skipped`
+    /// (called at activate / teardown / mode-transition sites) so
+    /// resize, which releases the old backing while the window
+    /// stays redirected, doesn't accidentally clear membership.
+    pub(crate) windows_redirected_manual: std::collections::HashSet<u32>,
 }
 
 /// State for a RENDER picture on the KMS backend.
@@ -1630,6 +1639,7 @@ impl KmsBackend {
             shape_input: HashMap::new(),
             alias_registry: AliasRegistry::default(),
             host_window_to_backing: HashMap::new(),
+            windows_redirected_manual: std::collections::HashSet::new(),
         }
     }
 
@@ -2624,6 +2634,7 @@ impl KmsBackend {
             shape_input: HashMap::new(),
             alias_registry: AliasRegistry::default(),
             host_window_to_backing: HashMap::new(),
+            windows_redirected_manual: std::collections::HashSet::new(),
         };
         // Try to bring up the DRM hardware cursor plane. A failure
         // here is non-fatal — the compositor falls back to the
@@ -8629,7 +8640,19 @@ impl KmsBackend {
             && abs_x < output_w
             && abs_y < output_h;
 
-        if on_screen && let Some(mirror) = window.vk_mirror.as_ref() {
+        // COMPOSITE Manual redirect skip: the compositor owns the
+        // visible paint for this window via RENDER Composite from a
+        // NameWindowPixmap alias of the backing; pushing the
+        // own-mirror quad would stack stale window-mirror content
+        // on top of the compositor's paint. Recursion into
+        // children continues — descendants with their own visible
+        // paint still draw.
+        let scanout_skipped = self.windows_redirected_manual.contains(&window_id);
+
+        if on_screen
+            && !scanout_skipped
+            && let Some(mirror) = window.vk_mirror.as_ref()
+        {
             // SHAPE bounding region cuts the window's quad. Without a
             // bounding entry we draw the whole mirror; with one we
             // emit one quad per visible rect (in window-local coords)
@@ -10578,6 +10601,19 @@ impl Backend for KmsBackend {
             self.free_pixmap(origin, raw)?;
         }
         Ok(())
+    }
+
+    fn set_window_scanout_skipped(
+        &mut self,
+        _origin: Option<OriginContext>,
+        host_window: WindowHandle,
+        skip: bool,
+    ) {
+        if skip {
+            self.windows_redirected_manual.insert(host_window.as_raw());
+        } else {
+            self.windows_redirected_manual.remove(&host_window.as_raw());
+        }
     }
 
     fn allocate_redirected_backing(
@@ -13481,6 +13517,30 @@ mod tests {
             backend.alias_registry.get(backing).map(|e| e.refcount),
             Some(1)
         );
+    }
+
+    #[test]
+    fn set_window_scanout_skipped_toggles_membership() {
+        // T1 — scanout-skip is the backend-side flag the walk consults
+        // for COMPOSITE Manual redirect. Activation paths flip it true;
+        // teardown paths flip it false. Explicit toggle (not auto-toggle
+        // inside allocate/release) so resize, which releases the old
+        // backing while the window stays redirected, can't accidentally
+        // clear membership.
+        let mut backend = KmsBackend::for_tests();
+        let host_window = yserver_core::backend::WindowHandle::from_raw_panicking(0x100_0030);
+        let raw = host_window.as_raw();
+        assert!(!backend.windows_redirected_manual.contains(&raw));
+        backend.set_window_scanout_skipped(None, host_window, true);
+        assert!(backend.windows_redirected_manual.contains(&raw));
+        // Idempotent: setting true twice keeps single membership.
+        backend.set_window_scanout_skipped(None, host_window, true);
+        assert!(backend.windows_redirected_manual.contains(&raw));
+        backend.set_window_scanout_skipped(None, host_window, false);
+        assert!(!backend.windows_redirected_manual.contains(&raw));
+        // Idempotent: clearing an absent entry is a no-op.
+        backend.set_window_scanout_skipped(None, host_window, false);
+        assert!(!backend.windows_redirected_manual.contains(&raw));
     }
 
     #[test]
