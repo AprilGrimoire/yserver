@@ -437,6 +437,18 @@ yserver-wmaker-xterm-hw log="debug":
         echo "yserver log: yserver-hw.log";\
         echo "wmaker log:   wmaker-hw.log"'
 
+# Run picom against yserver as a RENDER-convolution smoke test
+# (phase 2 of render-convolution-filter plan). picom v13's `xrender`
+# backend issues XRenderSetPictureFilter("convolution", …) when its
+# kernel blur-method is configured, so this is the canonical way
+# to exercise yserver's convolution pipeline. The script writes a
+# temp picom.conf; no per-user config needed. Optional argument
+# overrides the test client (default xclock):
+#     just yserver-picom-hw                 # xclock + kernel blur
+#     just yserver-picom-hw client=xterm    # transparent terminal
+yserver-picom-hw client="xclock":
+    tools/picom-yserver.sh {{client}}
+
 yserver-xfce-hw log="debug":
     cargo build --bin yserver
     bash -c '\

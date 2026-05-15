@@ -152,18 +152,78 @@ Cross-cutting bugs and followups that don't fit a phase live in
 
 ### In progress
 
-- [~] **RENDER convolution filter (xfwm4 shadow blur)** — on
+- [~] **RENDER convolution filter** — on
   `render-convolution-filter` branch off `graphics-followups`.
+  Phase 2 code complete but **no real-world consumer reaches the
+  path on yserver** (see "Hardware smoke outcome" below); branch
+  stays uncommitted pending a consumer.
   - Phase 1 done (`898dd19`): `SetPictureFilter` wire body parsed;
     `PictureFilter::{Nearest, Bilinear, Convolution{w, h, weights}}`
     stored on `PictureState::Drawable`. No rendering effect yet.
-  - Phase 2 planned: `docs/superpowers/plans/2026-05-15-render-convolution-filter.md`.
-    Single-pass arbitrary-kernel convolution shader (new
-    `kms/vk/convolution_pipeline.rs`), kernel UBO, integration
-    branch in `try_vk_render_composite`. Estimated 3-4h. Goal:
-    xfwm4 menu / window shadows render as smooth Gaussian fades
-    instead of the current flat blocks (see scanout at
-    2026-05-15 14:44).
+  - Phase 2 code complete (uncommitted, validated against lavapipe):
+    `docs/superpowers/plans/2026-05-15-render-convolution-filter.md`.
+    - T1: new `kms/vk/convolution_pipeline.rs` —
+      `ConvolutionKernelData` (8 B header + 441 × f32 = 1772 B,
+      static-asserted, with `from_parsed` + size/dim validation) +
+      `ConvolutionPipeline` (sampler NEAREST + CLAMP_TO_EDGE, 2-
+      binding DSL: sampler@0 + UBO@1, pipeline layout reuses
+      `RenderPushConsts`, single fixed `(Over, BGRA8)` pipeline).
+      New `convolution.frag.glsl` (scalar block layout, loops over
+      `dims.x × dims.y` weights).
+    - T2: build.rs auto-picks up the new `.glsl` — no code change.
+    - T3: kernel UBO uses per-draw `BatchUploadArena` slice
+      (deviation from plan's persistent buffer — avoids the WAW
+      hazard between back-to-back convolution composites in one
+      paint batch). `BatchUploadArena` gained `UNIFORM_BUFFER`
+      usage; new `KERNEL_UBO_ALIGNMENT = 256` const satisfies every
+      reported `minUniformBufferOffsetAlignment` in the wild.
+    - T4: `try_vk_render_composite` early-dispatches to a new
+      `try_vk_render_composite_convolution` helper when src is
+      Drawable + filter is Convolution + op == Over + no mask +
+      identity transform + Repeat::None + dst is BGRA. Out-of-range
+      kernel / wrong dst format returns `None` so the caller falls
+      through to the standard LINEAR-sampler path (silent kernel-
+      ignore, matches pre-phase-2 behaviour).
+    - T5: 7 unit tests for `ConvolutionKernelData` (size, byte
+      layout, validation) + an `#[ignore]` integration test
+      (`tests/convolution_pipeline_smoke.rs`) that builds the
+      pipeline against a real VkContext and roundtrips a 5×5
+      box-blur kernel through a `BatchUploadArena` UBO slot.
+      All 163 lib tests + the convolution integration test PASS
+      under the sandbox's lavapipe ICD.
+    - **Hardware smoke outcome (2026-05-15):** xfwm4 / marco /
+      xfwm4-shadow use **pre-rendered alpha pixmaps** for shadows,
+      not RENDER convolution — confirmed by 89 SetPictureFilter
+      calls in a fresh xfwm4 run, all `nearest`. picom v13 with
+      `xrender` + kernel blur is the canonical RENDER convolution
+      consumer; under `just yserver-picom-hw` picom imports
+      windows + screen-redirects but then only runs
+      `_draw_callback` once and goes silent — likely a Damage /
+      XFixes infrastructure gap on yserver that blocks per-Damage
+      recompositing. No filter calls reached yserver from picom.
+    - **Independent fix landed alongside (uncommitted):**
+      `write_render_query_filters_reply` in
+      `yserver-protocol/src/x11/mod.rs` now advertises the
+      standard X.Org filter list (was empty: 0 filters / 0
+      aliases). Clients that consult QueryFilters before issuing
+      SetPictureFilter (picom does, xfwm4 doesn't) will now find
+      `convolution` in the advertised set.
+    - **Picom validation harness landed (uncommitted):**
+      `tools/picom-yserver.sh` + `just yserver-picom-hw` — writes
+      a temp `picom.conf` with `xrender + kernel + 9x9gaussian +
+      inactive-opacity 0.7`, runs picom against yserver. Useful
+      when the Damage/XFixes gap is fixed and we want to validate
+      the convolution path against a real consumer.
+    - The unrelated **black bars around xfce pop-up menus** that
+      motivated the smoke turned out to be `NameWindowPixmap`
+      returning `BadAlloc` under Manual-mode redirect, not a
+      missing filter — diagnosis logged at
+      `[[feedback-namewindowpixmap-badalloc]]` and in
+      `known-issues.md`. xfwm4 falls back to compositing the live
+      window, which only has visible RGB — GTK CSD shadow-alpha
+      in the offscreen backing is unreachable, so xfwm4 emits
+      opaque shadow-color pixels where the alpha gradient should
+      fade.
 
 ### Remaining — in priority order
 

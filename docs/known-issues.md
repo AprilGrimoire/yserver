@@ -154,18 +154,57 @@ from.
       off-screen / fully behind another) is the proper fix and is
       deferred. Re-open if a real validation scenario demonstrates a
       backing-store gap.
-- [ ] **KMS: `render_set_picture_filter` is currently a no-op.**
-      With pixman removed, `render_set_picture_filter`
-      (`crates/yserver/src/kms/backend.rs:12392`) accepts the request
-      but ignores the filter — the Vk Composite shader uses a fixed
-      `LINEAR` sampler. Clients that request `Nearest` /
-      `Convolution` / `Best` get LINEAR regardless. To honor the
-      request: store filter on `PictureState::Drawable`, create
-      multiple samplers per filter mode in `RenderPipelineCache`,
-      pick the matching one at composite time. RENDER's default
-      filter is `Nearest`; defaulting to LINEAR is the wrong
-      direction for pixel-art / 1:1 blits, so this is a correctness
-      gap, not just polish.
+- [~] **KMS: `render_set_picture_filter` — convolution code in
+      tree but unreachable; Nearest / Bilinear still share LINEAR.**
+      Phase 1 (`898dd19`, 2026-05-15) parses `SetPictureFilter` +
+      stores the filter on `PictureState::Drawable`. Phase 2 (in
+      tree, uncommitted as of 2026-05-15) wires the `convolution`
+      case through a new GPU pipeline
+      (`kms/vk/convolution_pipeline.rs`,
+      `docs/superpowers/plans/2026-05-15-render-convolution-filter.md`):
+      builds clean, unit + integration tests pass against lavapipe.
+      However, no real-world consumer reaches the path: xfwm4 /
+      marco / xfwm4-shadow use pre-rendered alpha pixmaps (no
+      kernel filter); picom v13 with `xrender` + kernel blur is
+      the canonical consumer, but on yserver it stops drawing
+      after one frame (likely Damage / XFixes infrastructure gap).
+      Independent fix landed alongside: `QueryFilters` reply now
+      advertises the standard X.Org filter list (was previously
+      empty), so clients that consult it before sending
+      `SetPictureFilter` will at least find `convolution` in the
+      list. Also Nearest / Bilinear distinction is still
+      collapsed to the standard pipeline's LINEAR sampler — fixing
+      that needs the multi-sampler split in `RenderPipelineCache`
+      called out in the original entry. Lower priority than
+      finding a real consumer for the convolution path;
+      rendercheck passes either way.
+
+- [ ] **Compositor shadow margins render as opaque bars
+      (NameWindowPixmap → BadAlloc).** Diagnosed 2026-05-15 from
+      `xfce.xtrace`: xfwm4's built-in compositor under
+      xfce4-session calls `NameWindowPixmap` on each redirected
+      window (e.g. menu pop-up depth-32 183×501,
+      `window=0x00d000f4`), and yserver's `name_window_pixmap`
+      (`kms::backend::KmsBackend`, `backend.rs:10506`) returns
+      `Err(NotFound)` → wire **BadAlloc** because
+      `host_window_to_backing` is empty: the 2026-05-14 Manual-
+      redirect fix (`feedback_composite_manual_redirect_trap`)
+      registered the redirect record but skipped
+      `activate_redirect_backing_for`, so no backing is allocated.
+      xfwm4 falls back to `CreatePicture` on the **live** window,
+      which only carries visible RGB — the GTK Client-Side-
+      Decoration shadow-alpha that lives in the offscreen backing
+      is unreachable, so xfwm4 emits opaque shadow-color pixels
+      where the alpha gradient should fade. Visible as thin
+      perpendicular dark bars to the right and below xfce pop-up
+      menus. Same gap will affect every Manual-mode compositor
+      (xfwm4, picom xrender backend, xcompmgr, compton). Fix
+      shape: implement Manual-mode redirect backing properly —
+      allocate at redirect activation, route window drawing into
+      the backing, keep live for compositors. Half-day snapshot
+      variant (lazy-alloc on `NameWindowPixmap` + one-shot copy
+      from the existing window mirror) would mask the artefact
+      for short-lived popups but lies about live updates.
 - [ ] **KMS: `MapSubwindows` doesn't re-Expose deep descendants
       promoted by the map_window viewable cascade.** After commit
       `304858f` (`fix(resources): propagate Viewable down through
