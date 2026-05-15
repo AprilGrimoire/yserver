@@ -752,26 +752,18 @@ fn destroy_window_subtree(
         );
     }
     // L2 plan B.15 — release the reason-1 hold on each destroyed
-    // window's redirected backing. Surviving `NameWindowPixmap`
-    // aliases keep the backing alive; their `client_pixmap`
-    // resources remain valid X protocol pixmaps until the client's
-    // `FreePixmap` (or the disconnect cleanup).
-    let redirect_backings: Vec<crate::backend::PixmapHandle> = order
-        .iter()
-        .filter_map(|w| {
-            state
-                .resources
-                .window(*w)
-                .and_then(|win| win.redirected_backing.as_ref().map(|b| b.host_pixmap))
-        })
-        .collect();
-    for backing in redirect_backings {
-        if let Err(err) = backend.release_redirected_backing(origin, backing) {
-            log::warn!(
-                "DestroyWindow: release_redirected_backing(0x{:x}) failed: {err}",
-                backing.as_raw()
-            );
-        }
+    // window's redirected backing and clear the scanout-skip flag
+    // through the shared `teardown_redirect_for_window` helper.
+    // Routing through the helper (instead of an inline
+    // release_redirected_backing loop) means the scanout-skip /
+    // backing-take state lives in one place for every exit path:
+    // unredirect, mode-transition, disconnect, and destroy all
+    // converge here. Surviving `NameWindowPixmap` aliases keep the
+    // backing's pixmap alive via the alias registry refcount;
+    // their `client_pixmap` resources remain valid X protocol
+    // pixmaps until the client's `FreePixmap`.
+    for window in &order {
+        crate::core_loop::process_disconnect::teardown_redirect_for_window(state, backend, *window);
     }
     // Drop any COMPOSITE redirect records still keyed against the
     // destroyed windows. The actual backing teardown happened
@@ -2752,10 +2744,21 @@ fn handle_composite_request(
                 state
                     .composite_redirects
                     .remove(&(ResourceId(window), subwindows));
-                // L2 plan B.6c: release the backing's reason-1 hold
-                // for the single-window case. Subtree redirects walk
-                // their subtree in B.6b — same teardown helper.
-                if !subwindows {
+                // L2 plan B.6c: release the backing's reason-1 hold and
+                // clear the scanout-skip flag. Single-window: just the
+                // named window. RedirectSubwindows: walk each direct
+                // child of the named parent — that's where the backings
+                // live (RedirectSubwindows activates per-child, not on
+                // the parent itself).
+                if subwindows {
+                    let parent = ResourceId(window);
+                    let children: Vec<ResourceId> = state.resources.children(parent).to_vec();
+                    for child in children {
+                        crate::core_loop::process_disconnect::teardown_redirect_for_window(
+                            state, backend, child,
+                        );
+                    }
+                } else {
                     crate::core_loop::process_disconnect::teardown_redirect_for_window(
                         state,
                         backend,
@@ -11939,6 +11942,87 @@ mod tests {
                 .is_some(),
             "redirected_backing must be populated after Automatic→Manual",
         );
+    }
+
+    #[test]
+    fn unredirect_subwindows_tears_down_all_children() {
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        install_window_with_host_xid(&mut state, 0x0100_0070, 0x0200_0070);
+        install_window_with_host_xid(&mut state, 0x0100_0071, 0x0200_0071);
+        // Activate Manual subwindows redirect on root.
+        let body = composite_redirect_request_body(ROOT_WINDOW.0, 1);
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 144,
+                data: 2, // REDIRECT_SUBWINDOWS
+                length_units: 3,
+            },
+            &body,
+            None,
+        )
+        .unwrap();
+        // Confirm preconditions: both children carry a backing now.
+        assert!(
+            state
+                .resources
+                .window(ResourceId(0x0100_0070))
+                .and_then(|w| w.redirected_backing.as_ref())
+                .is_some()
+        );
+        assert!(
+            state
+                .resources
+                .window(ResourceId(0x0100_0071))
+                .and_then(|w| w.redirected_backing.as_ref())
+                .is_some()
+        );
+        // UnredirectSubwindows on root.
+        let body = composite_redirect_request_body(ROOT_WINDOW.0, 0);
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(2),
+            RequestHeader {
+                opcode: 144,
+                data: 4, // UNREDIRECT_SUBWINDOWS
+                length_units: 3,
+            },
+            &body,
+            None,
+        )
+        .unwrap();
+        // Both children torn down: redirected_backing cleared, the
+        // backend received per-child SetWindowScanoutSkipped(false).
+        for child in [0x0100_0070u32, 0x0100_0071] {
+            assert!(
+                state
+                    .resources
+                    .window(ResourceId(child))
+                    .and_then(|w| w.redirected_backing.as_ref())
+                    .is_none(),
+                "redirected_backing must be cleared for child 0x{child:x}",
+            );
+        }
+        let calls = backend.calls();
+        let clears: Vec<u32> = calls
+            .iter()
+            .filter_map(|c| match c {
+                RecordedCall::SetWindowScanoutSkipped {
+                    host_window,
+                    skip: false,
+                } => Some(*host_window),
+                _ => None,
+            })
+            .collect();
+        assert!(clears.contains(&0x0200_0070), "child 1 not cleared");
+        assert!(clears.contains(&0x0200_0071), "child 2 not cleared");
     }
 
     #[test]

@@ -185,20 +185,28 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
         .damage_objects
         .retain(|_, damage| damage.owner != client_id && !dead_windows.contains(&damage.drawable));
     // L2 plan B.1b: walk redirects owned by the departing client and
-    // tear each one down (the helper handles `Window.redirected_backing`
-    // reset + alias_registry refcount decrement when B.6c lands; for
-    // now it's a logged no-op so the wiring is in place when the
-    // backing-allocation tasks land). Then filter by both ownership
-    // and dead-window so any leftovers caught by the previous rule
-    // are still removed.
+    // tear each one down. For single-window records the helper acts on
+    // the named window directly; for `RedirectSubwindows` records the
+    // backings live on the parent's *children* (per-child activation
+    // in process_request), so the walk must descend into the children
+    // instead of acting on the parent xid (which has no backing of its
+    // own). Then filter by both ownership and dead-window so any
+    // leftovers caught by the previous rule are still removed.
     let owned_redirects: Vec<(ResourceId, bool)> = state
         .composite_redirects
         .iter()
         .filter(|(_, rec)| rec.owner == client_id)
         .map(|((win, sub), _)| (*win, *sub))
         .collect();
-    for (window, _subwindows) in &owned_redirects {
-        teardown_redirect_for_window(state, backend, *window);
+    for (window, subwindows) in &owned_redirects {
+        if *subwindows {
+            let children: Vec<ResourceId> = state.resources.children(*window).to_vec();
+            for child in children {
+                teardown_redirect_for_window(state, backend, child);
+            }
+        } else {
+            teardown_redirect_for_window(state, backend, *window);
+        }
     }
     state
         .composite_redirects
@@ -455,6 +463,133 @@ mod tests {
         let mut backend = RecordingBackend::new();
         process_disconnect(&mut state, &mut backend, ClientId(1));
         assert!(state.composite_redirects.is_empty());
+    }
+
+    #[test]
+    fn disconnect_with_subwindows_redirect_walks_children() {
+        // A `RedirectSubwindows(P, Manual)` record's key window is P,
+        // not the children. The per-child backings are attached to P's
+        // direct children, so a disconnect walk that only acts on
+        // `record.window` would skip them and leak backings. The fix
+        // descends into `state.resources.children(P)`.
+        use crate::{
+            backend::{WindowHandle, recording::RecordedCall},
+            resources::RedirectedBacking,
+        };
+        use yserver_protocol::x11::CreateWindowRequest;
+
+        let mut state = ServerState::new();
+        // Client 1 is the compositor that requested RedirectSubwindows.
+        // Client 2 owns the actual top-level windows — they survive
+        // client 1's disconnect (which is the realistic flow:
+        // xfwm4 dies, app windows stay).
+        install_client(&mut state, 1);
+        install_client(&mut state, 2);
+        // Two direct children of root owned by client 2, each with a
+        // host xid + an already-allocated backing (simulates the
+        // post-activation state right before client 1 disconnects).
+        for (id, host_xid, backing_xid) in [
+            (0x0200_0080u32, 0x0220_0080u32, 0x0320_0080u32),
+            (0x0200_0081, 0x0220_0081, 0x0320_0081),
+        ] {
+            state.resources.create_window(
+                ClientId(2),
+                CreateWindowRequest {
+                    window: ResourceId(id),
+                    parent: ROOT_WINDOW,
+                    x: 0,
+                    y: 0,
+                    width: 80,
+                    height: 80,
+                    border_width: 0,
+                    depth: 32,
+                    visual: ResourceId(0),
+                    class: 0,
+                    background_pixel: None,
+                    bit_gravity: None,
+                    win_gravity: None,
+                    backing_store: None,
+                    backing_planes: None,
+                    backing_pixel: None,
+                    override_redirect: Some(true),
+                    save_under: None,
+                    event_mask: None,
+                    do_not_propagate_mask: None,
+                    colormap: None,
+                },
+            );
+            if let Some(w) = state.resources.window_mut(ResourceId(id)) {
+                w.host_xid = Some(WindowHandle::from_raw_panicking(host_xid));
+                w.redirected_backing = Some(RedirectedBacking {
+                    host_pixmap: crate::backend::PixmapHandle::from_raw_panicking(backing_xid),
+                    width: 80,
+                    height: 80,
+                    depth: 32,
+                });
+            }
+        }
+        state.composite_redirects.insert(
+            (ROOT_WINDOW, true),
+            RedirectRecord {
+                mode: CompositeRedirectMode::Manual,
+                owner: ClientId(1),
+            },
+        );
+        let mut backend = RecordingBackend::new();
+        process_disconnect(&mut state, &mut backend, ClientId(1));
+
+        // Record removed; both children's backings released and
+        // their scanout-skip flags cleared. Children themselves
+        // survive (owned by client 2, not client 1).
+        assert!(state.composite_redirects.is_empty());
+        for id in [0x0200_0080u32, 0x0200_0081] {
+            assert!(
+                state.resources.window(ResourceId(id)).is_some(),
+                "child 0x{id:x} should outlive client 1's disconnect",
+            );
+            assert!(
+                state
+                    .resources
+                    .window(ResourceId(id))
+                    .and_then(|w| w.redirected_backing.as_ref())
+                    .is_none(),
+                "redirected_backing must be cleared for child 0x{id:x}",
+            );
+        }
+        let calls = backend.calls.lock().unwrap().clone();
+        let releases: Vec<u32> = calls
+            .iter()
+            .filter_map(|c| match c {
+                RecordedCall::ReleaseRedirectedBacking(raw) => Some(*raw),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            releases.contains(&0x0320_0080),
+            "child 1 backing not released"
+        );
+        assert!(
+            releases.contains(&0x0320_0081),
+            "child 2 backing not released"
+        );
+        let clears: Vec<u32> = calls
+            .iter()
+            .filter_map(|c| match c {
+                RecordedCall::SetWindowScanoutSkipped {
+                    host_window,
+                    skip: false,
+                } => Some(*host_window),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            clears.contains(&0x0220_0080),
+            "child 1 scanout-skip not cleared"
+        );
+        assert!(
+            clears.contains(&0x0220_0081),
+            "child 2 scanout-skip not cleared"
+        );
     }
 
     #[test]
