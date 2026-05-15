@@ -4623,13 +4623,68 @@ pub fn write_render_query_filters_reply(
     byte_order: ClientByteOrder,
     sequence: SequenceNumber,
 ) -> io::Result<()> {
-    let mut out = vec![1u8, 0];
+    // Advertise the standard X.Org RENDER filter set: three canonical
+    // filters (`nearest`, `bilinear`, `convolution`) plus three named
+    // aliases (`fast` → nearest, `good` / `best` → bilinear). Clients
+    // like picom v13's xrender backend consult this list before
+    // emitting `SetPictureFilter`: when `convolution` is absent, they
+    // silently disable kernel blur — so the reply itself is
+    // load-bearing for any RENDER-based convolution work.
+    //
+    // Reply wire layout (per Xrender protocol spec):
+    //   1    reply opcode (1)
+    //   1    unused
+    //   2    sequence
+    //   4    reply length (4-byte units of post-header data)
+    //   4    num_aliases (= filter count; one alias entry per filter)
+    //   4    num_filters
+    //   16   unused
+    //   2n   aliases: LISTofCARD16 — alias-target index per filter,
+    //        padded to multiple of 4
+    //   m    filters: LISTofSTRING8 — each entry is u8 length + name,
+    //        whole list padded to multiple of 4
+    const FILTERS: &[&[u8]] = &[
+        b"fast",
+        b"good",
+        b"best",
+        b"nearest",
+        b"bilinear",
+        b"convolution",
+    ];
+    // Parallel: each entry is the index of the canonical filter this
+    // one resolves to. Indexing matches X.Org's `picture.c`.
+    const ALIASES: [u16; 6] = [3, 4, 4, 3, 4, 5];
+
+    let mut payload: Vec<u8> = Vec::new();
+    for a in ALIASES {
+        write_u16(byte_order, &mut payload, a);
+    }
+    // Pad aliases section to multiple of 4 bytes.
+    while payload.len() % 4 != 0 {
+        payload.push(0);
+    }
+    for name in FILTERS {
+        let len = u8::try_from(name.len()).expect("filter name fits in u8");
+        payload.push(len);
+        payload.extend_from_slice(name);
+    }
+    // Pad filters section to multiple of 4 bytes.
+    while payload.len() % 4 != 0 {
+        payload.push(0);
+    }
+
+    let length_words =
+        u32::try_from(payload.len() / 4).expect("query-filters reply length fits in u32");
+
+    let mut out: Vec<u8> = Vec::with_capacity(32 + payload.len());
+    out.extend_from_slice(&[1u8, 0]);
     write_u16(byte_order, &mut out, sequence.0);
-    write_u32(byte_order, &mut out, 0); // length
-    write_u32(byte_order, &mut out, 0); // num_filters
-    write_u32(byte_order, &mut out, 0); // num_aliases
-    out.extend_from_slice(&[0u8; 16]); // pad to 32 bytes
+    write_u32(byte_order, &mut out, length_words);
+    write_u32(byte_order, &mut out, ALIASES.len() as u32); // num_aliases
+    write_u32(byte_order, &mut out, FILTERS.len() as u32); // num_filters
+    out.extend_from_slice(&[0u8; 16]); // pad to 32-byte header
     debug_assert_eq!(out.len(), 32);
+    out.extend_from_slice(&payload);
     writer.write_all(&out)
 }
 
