@@ -404,6 +404,7 @@ yserver-e16-xterm-hw log="debug":
 # hover-popup gating or other event-flow oddities.
 yserver-e16-xterm-hw-trace log="debug":
     cargo build --bin yserver
+    rm -f e16.xtrace
     bash -c '\
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
@@ -487,6 +488,7 @@ yserver-mate-hw log="debug":
 # yserver" client-side bug.
 yserver-xfce-hw-trace log="debug":
     cargo build --bin yserver
+    rm -f xfce.xtrace
     bash -c '\
         RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw.log 2>&1 &\
         yserver_pid=$!;\
@@ -510,6 +512,7 @@ yserver-xfce-hw-trace log="debug":
 # whatever). Defaults to the current `$DISPLAY` (host Xorg); pass
 # `real=":1"` etc. to override.
 thunar-xorg-trace real="$DISPLAY":
+    rm -f thunar-xorg.xtrace
     bash -c '\
         x11trace -d {{real}} -D :8 -n -o thunar-xorg.xtrace &\
         xtrace_pid=$!;\
@@ -525,6 +528,7 @@ thunar-xorg-trace real="$DISPLAY":
 # stateful view-switch "fix".
 yserver-mate-hw-trace log="debug":
     cargo build --bin yserver
+    rm -f mate.xtrace
     bash -c '\
         RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw.log 2>&1 &\
         yserver_pid=$!;\
