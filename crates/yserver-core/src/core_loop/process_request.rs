@@ -593,9 +593,24 @@ fn rotate_redirected_backing_on_resize(
     let Some(host_window) = host_window else {
         return;
     };
-    // Allocate the new backing before swapping; if allocation fails
-    // we leave the old backing in place so paint keeps landing
-    // somewhere defined.
+    // Release the old backing FIRST so allocate isn't stuck on the
+    // idempotency check in `allocate_redirected_backing` (which
+    // returns the existing handle without re-allocating when
+    // `host_window_to_backing` already maps this window). Surviving
+    // `NameWindowPixmap` aliases keep the old pixmap alive via the
+    // alias_registry refcount; their X resources (NamedCompositePixmap
+    // entries on `Window.composite_named_pixmaps`) retain the old
+    // `host_pixmap` raw and stay valid.
+    if let Err(err) = backend.release_redirected_backing(origin, old_backing) {
+        log::warn!(
+            "rotate_redirected_backing_on_resize: release_redirected_backing(0x{:x}) failed: {err}",
+            old_backing.as_raw()
+        );
+        // Release failed — leave state unchanged. The window keeps
+        // its old backing (which may be in an undefined state).
+        return;
+    }
+    // Allocate a fresh backing at the new geometry.
     let new_backing = match backend.allocate_redirected_backing(
         origin,
         host_window,
@@ -610,6 +625,14 @@ fn rotate_redirected_backing_on_resize(
                  allocate failed: {err}",
                 window.0
             );
+            // We already released the old backing — clear the stale
+            // pointer so paint routing doesn't dispatch to a dropped
+            // pixmap. Window will be invisible until next redirect
+            // activation, which is better than crashing on dangling
+            // host_drawable_target lookups.
+            if let Some(w) = state.resources.window_mut(window) {
+                w.redirected_backing = None;
+            }
             return;
         }
     };
@@ -620,12 +643,6 @@ fn rotate_redirected_backing_on_resize(
             height: new_height,
             depth,
         });
-    }
-    if let Err(err) = backend.release_redirected_backing(origin, old_backing) {
-        log::warn!(
-            "rotate_redirected_backing_on_resize: release_redirected_backing(0x{:x}) failed: {err}",
-            old_backing.as_raw()
-        );
     }
 }
 
