@@ -11945,6 +11945,68 @@ mod tests {
     }
 
     #[test]
+    fn resize_redirected_manual_window_rotates_backing_without_clearing_skip() {
+        // The resize rotation releases the OLD backing and allocates a
+        // NEW one in its place, while the window stays redirected the
+        // whole time. The plan's load-bearing invariant: the scanout-
+        // skip flag must NOT be toggled by the rotation — it lives on
+        // the backend's `windows_redirected_manual` set, toggled only
+        // at activate / teardown / mode-transition boundaries.
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let win_xid = 0x0100_0040;
+        let host_xid = 0x0200_0040;
+        install_window_with_host_xid(&mut state, win_xid, host_xid);
+        dispatch_composite_redirect(&mut state, &mut backend, ClientId(1), win_xid, 1);
+        // Reset the call log: anything before the rotation is
+        // already-tested noise.
+        backend.calls.lock().unwrap().clear();
+        // Simulate the resize path.
+        rotate_redirected_backing_on_resize(
+            &mut state,
+            &mut backend,
+            None,
+            ResourceId(win_xid),
+            200,
+            150,
+        );
+        let calls = backend.calls();
+        // Allocation of the new backing happened…
+        assert!(
+            calls.iter().any(|c| matches!(
+                c,
+                RecordedCall::AllocateRedirectedBacking { host_window, width, height, .. }
+                    if *host_window == host_xid && *width == 200 && *height == 150
+            )),
+            "resize must allocate a new backing at new dimensions, got: {calls:?}",
+        );
+        // …old backing released…
+        assert!(
+            calls
+                .iter()
+                .any(|c| matches!(c, RecordedCall::ReleaseRedirectedBacking(_))),
+            "resize must release the old backing, got: {calls:?}",
+        );
+        // …but scanout-skip MUST stay set: no false-toggle was emitted.
+        assert!(
+            !calls
+                .iter()
+                .any(|c| matches!(c, RecordedCall::SetWindowScanoutSkipped { skip: false, .. })),
+            "resize must not clear scanout-skip while window stays redirected, got: {calls:?}",
+        );
+        // State-side: the backing now reflects the new geometry.
+        let backing = state
+            .resources
+            .window(ResourceId(win_xid))
+            .and_then(|w| w.redirected_backing.as_ref())
+            .copied()
+            .expect("redirected_backing populated after rotation");
+        assert_eq!(backing.width, 200);
+        assert_eq!(backing.height, 150);
+    }
+
+    #[test]
     fn unredirect_subwindows_tears_down_all_children() {
         let mut state = ServerState::new();
         let _peer = install_client(&mut state, 1);
