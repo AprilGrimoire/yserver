@@ -187,33 +187,29 @@ from.
       Same gap will affect every Manual-mode compositor: xfwm4,
       picom's xrender backend, xcompmgr, compton.
 
-      **Five-step fault chain (xtrace evidence in parentheses):**
+      **Five-step fault chain:**
 
-      1. xfwm4 issues `RedirectSubwindows update=Manual(0x01)`
-         on root (xfce.xtrace, e.g. `005:<:0731`). Accepted by
-         the 2026-05-14 fix
+      1. xfwm4 issues `RedirectSubwindows update=Manual(0x01)` on
+         root. Accepted by the 2026-05-14 fix
          (`feedback_composite_manual_redirect_trap`).
       2. That fix registered the redirect *record* but **skipped**
          `activate_redirect_backing_for`, so
          `host_window_to_backing` stays empty for every redirected
          window.
-      3. xfwm4 issues `NameWindowPixmap window=0x00d000f4
-         pixmap=0x0060043e` for the menu (depth-32, override-
-         redirect, 183×501) — xfce.xtrace `005:<:1d7c`.
+      3. xfwm4 issues `NameWindowPixmap` for the menu (depth-32,
+         override-redirect).
       4. yserver's `name_window_pixmap`
          (`kms::backend::KmsBackend`, `backend.rs:10506`) looks up
          `host_window_to_backing`, finds nothing → returns
-         `Err(NotFound)` → wire-level **BadAlloc** —
-         xfce.xtrace `005:>:1d7c:Error 11=Alloc: major=144,
-         minor=6, bad=0x0060043e`.
-      5. xfwm4 falls back to `CreatePicture pid=0x0060043f
-         drawable=0x00d000f4` — a picture **directly on the live
-         window** — xfce.xtrace `005:<:1d7e` — and composites
-         from it (`005:<:1d8b`). The live window only carries
-         visible RGB; the GTK CSD shadow-alpha that lives in the
-         offscreen backing is unreachable, so xfwm4 emits opaque
-         shadow-color pixels where the alpha gradient should
-         fade.
+         `Err(NotFound)` → wire-level **BadAlloc** on
+         `Composite-Request(144, 6)`.
+      5. xfwm4 falls back to `CreatePicture` directly on the
+         **live window** instead of its offscreen pixmap, then
+         composites from that picture. The live window only
+         carries visible RGB; the GTK CSD shadow-alpha that lives
+         in the offscreen backing is unreachable, so xfwm4 emits
+         opaque shadow-color pixels where the alpha gradient
+         should fade.
 
       **Fix shape:** implement Manual-mode redirect backing
       properly — allocate at redirect activation, route window
