@@ -150,6 +150,21 @@ Cross-cutting bugs and followups that don't fit a phase live in
     - The work past the tag is preserved on `graphics-followups`; it should NOT ship as-is.
     - Next attempt needs the comprehensive design pass with codex — every submission path (paint, compositor, one-shot, init_clear) must signal the timeline AND annotate handles, BEFORE migrating any consumer call site.
 
+### In progress
+
+- [~] **RENDER convolution filter (xfwm4 shadow blur)** — on
+  `render-convolution-filter` branch off `graphics-followups`.
+  - Phase 1 done (`898dd19`): `SetPictureFilter` wire body parsed;
+    `PictureFilter::{Nearest, Bilinear, Convolution{w, h, weights}}`
+    stored on `PictureState::Drawable`. No rendering effect yet.
+  - Phase 2 planned: `docs/superpowers/plans/2026-05-15-render-convolution-filter.md`.
+    Single-pass arbitrary-kernel convolution shader (new
+    `kms/vk/convolution_pipeline.rs`), kernel UBO, integration
+    branch in `try_vk_render_composite`. Estimated 3-4h. Goal:
+    xfwm4 menu / window shadows render as smooth Gaussian fades
+    instead of the current flat blocks (see scanout at
+    2026-05-15 14:44).
+
 ### Remaining — in priority order
 
 - [ ] **Phase 6 — Resource lifetime: batch-owned refcounted handles**
