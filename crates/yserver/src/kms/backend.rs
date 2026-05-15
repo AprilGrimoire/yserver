@@ -1021,6 +1021,11 @@ enum PictureState {
         subwindow_mode: u8,
         poly_edge: u8,
         poly_mode: u8,
+        /// Sampling filter set via `SetPictureFilter`. Defaults to
+        /// Nearest per X RENDER spec; xfwm4's compositor sets
+        /// `convolution` with a Gaussian kernel to blur window shadow
+        /// pixmaps before compositing them onto the screen.
+        filter: PictureFilter,
     },
     /// CreateSolidFill source: a single premultiplied BGRA colour
     /// the Vk render pipeline reads from a uniform / 1×1 sampler
@@ -1036,6 +1041,102 @@ enum PictureState {
         repeat: Repeat,
         transform: Option<PictTransform>,
     },
+}
+
+/// X RENDER `SetPictureFilter` selection. Per the X RENDER protocol
+/// spec, filters are identified by ASCII name string. We honor the
+/// ones that affect actual rendering paths today; unknown names fall
+/// back to `Bilinear` so the picture still renders something sane.
+#[derive(Debug, Clone)]
+enum PictureFilter {
+    /// X RENDER `nearest`: point sampling. Per spec this is RENDER's
+    /// default. Most modern clients explicitly request `bilinear`.
+    Nearest,
+    /// X RENDER `bilinear` / `good` / `fast` / `best` — single-sample
+    /// linear filtering between the four neighbour texels. The Vk
+    /// composite shader's hard-coded LINEAR sampler matches.
+    Bilinear,
+    /// X RENDER `convolution` filter: an N×M kernel of FIXED weights
+    /// applied per output pixel. xfwm4's compositor uses this to
+    /// apply a Gaussian blur to window-shadow pixmaps before
+    /// compositing. `weights` is row-major (height rows × width
+    /// columns); the Vk render pipeline runs a separable / direct
+    /// convolution pre-pass to produce a blurred intermediate that
+    /// the subsequent Composite reads as the source picture.
+    Convolution {
+        // Field reads land in the upcoming convolution-render pipeline;
+        // suppress the dead-code warning for the
+        // parse-and-store-only commit.
+        #[allow(dead_code)]
+        width: u16,
+        #[allow(dead_code)]
+        height: u16,
+        #[allow(dead_code)]
+        weights: Vec<f32>,
+    },
+}
+
+impl PictureFilter {
+    fn parse(body: &[u8]) -> Option<Self> {
+        // SetPictureFilter request body (after the 4-byte picture xid
+        // already consumed by the caller):
+        //   name_length: u16
+        //   pad: 2 bytes
+        //   name: STRING8, padded to 4-byte boundary
+        //   values: LISTofFIXED (i32 each, 16.16 fixed-point)
+        if body.len() < 4 {
+            return None;
+        }
+        let name_length = u16::from_le_bytes([body[0], body[1]]) as usize;
+        let name_start = 4;
+        if body.len() < name_start + name_length {
+            return None;
+        }
+        let name = &body[name_start..name_start + name_length];
+        let values_start = name_start + ((name_length + 3) & !3);
+        let values = &body[values_start.min(body.len())..];
+
+        match name {
+            b"nearest" => Some(PictureFilter::Nearest),
+            b"bilinear" | b"good" | b"fast" | b"best" => Some(PictureFilter::Bilinear),
+            b"convolution" => parse_convolution(values),
+            _ => None,
+        }
+    }
+}
+
+fn parse_convolution(values: &[u8]) -> Option<PictureFilter> {
+    // First two FIXED values are the kernel dimensions (integer parts),
+    // followed by width*height FIXED kernel weights.
+    if values.len() < 8 {
+        return None;
+    }
+    let read_fixed = |bytes: &[u8]| -> f32 {
+        // i32 in two's complement, FIXED 16.16 → float.
+        let raw = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        (raw as f32) / 65536.0
+    };
+    let width = read_fixed(&values[0..4]) as u16;
+    let height = read_fixed(&values[4..8]) as u16;
+    let n = width as usize * height as usize;
+    // Cap kernel size defensively — a Gaussian blur shadow needs ≤21×21.
+    if n == 0 || n > 64 * 64 {
+        return None;
+    }
+    let weights_bytes_needed = n * 4;
+    if values.len() < 8 + weights_bytes_needed {
+        return None;
+    }
+    let mut weights = Vec::with_capacity(n);
+    for i in 0..n {
+        let off = 8 + i * 4;
+        weights.push(read_fixed(&values[off..off + 4]));
+    }
+    Some(PictureFilter::Convolution {
+        width,
+        height,
+        weights,
+    })
 }
 
 fn default_drawable_picture(host_xid: u32) -> PictureState {
@@ -1054,6 +1155,7 @@ fn default_drawable_picture(host_xid: u32) -> PictureState {
         subwindow_mode: 0,
         poly_edge: 0,
         poly_mode: 0,
+        filter: PictureFilter::Nearest,
     }
 }
 
@@ -12488,13 +12590,30 @@ impl Backend for KmsBackend {
     fn render_set_picture_filter(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_pic: u32,
-        _body: &[u8],
+        host_pic: u32,
+        body: &[u8],
     ) -> io::Result<()> {
-        // No-op: with pixman gone the filter selection had no effect
-        // outside the pixman image. The Vk Composite shader uses a
-        // fixed sampler (`LINEAR`); per-picture filter selection is
-        // a 4.1.4.6 follow-up (multiple samplers per filter mode).
+        // Body layout (after the 4-byte picture xid already consumed
+        // by the dispatcher): name_length:u16, 2 pad bytes, name
+        // (STRING8 padded to multiple of 4), values (LISTofFIXED).
+        // The dispatcher (`process_request.rs` opcode 30 handler)
+        // passed `body` including the leading pid; skip those 4 bytes.
+        if body.len() < 4 {
+            return Ok(());
+        }
+        let filter_body = &body[4..];
+        let Some(filter) = PictureFilter::parse(filter_body) else {
+            log::debug!(
+                "render_set_picture_filter: ignoring unknown / malformed filter for picture 0x{host_pic:x}"
+            );
+            return Ok(());
+        };
+        if let Some(PictureState::Drawable { filter: slot, .. }) = self.pictures.get_mut(&host_pic)
+        {
+            *slot = filter;
+        }
+        // SolidFill / Gradient pictures don't carry a filter (their
+        // sampling is fully shader-side); ignore for those types.
         Ok(())
     }
 
