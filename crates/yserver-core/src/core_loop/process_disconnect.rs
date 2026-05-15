@@ -276,11 +276,17 @@ pub(crate) fn teardown_redirect_for_window(
     backend: &mut dyn Backend,
     window: ResourceId,
 ) {
-    let Some(backing) = state
-        .resources
-        .window_mut(window)
-        .and_then(|w| w.redirected_backing.take())
-    else {
+    // Snapshot host_xid + backing in one borrow scope BEFORE `.take()`.
+    // The scanout-skip toggle needs the window's host XID and the
+    // backing-release needs the pixmap handle; reading both up-front
+    // keeps the lifecycle obvious (host_xid is None ⇒ backing must
+    // also be None, since activate requires host_xid).
+    let snapshot = state.resources.window_mut(window).map(|w| {
+        let host_xid = w.host_xid;
+        let backing = w.redirected_backing.take();
+        (host_xid, backing)
+    });
+    let Some((host_xid, Some(backing))) = snapshot else {
         return;
     };
     if let Err(err) = backend.release_redirected_backing(None, backing.host_pixmap) {
@@ -288,6 +294,9 @@ pub(crate) fn teardown_redirect_for_window(
             "release_redirected_backing(0x{:x}) failed: {err}",
             backing.host_pixmap.as_raw()
         );
+    }
+    if let Some(host_window) = host_xid {
+        backend.set_window_scanout_skipped(None, host_window, false);
     }
 }
 

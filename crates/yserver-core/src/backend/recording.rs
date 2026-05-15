@@ -88,6 +88,17 @@ pub enum RecordedCall {
     OpenFont(String),
     CloseFont(u32),
     Ping,
+    AllocateRedirectedBacking {
+        host_window: u32,
+        width: u16,
+        height: u16,
+        depth: u8,
+    },
+    ReleaseRedirectedBacking(u32),
+    SetWindowScanoutSkipped {
+        host_window: u32,
+        skip: bool,
+    },
 }
 
 /// Test double for `Backend`. Auto-allocates host xids from a private
@@ -359,6 +370,44 @@ impl Backend for RecordingBackend {
         _host_window: WindowHandle,
     ) -> io::Result<PixmapHandle> {
         unimplemented!("RecordingBackend: name_window_pixmap not implemented for the current tests")
+    }
+
+    fn allocate_redirected_backing(
+        &mut self,
+        _origin: Option<OriginContext>,
+        host_window: WindowHandle,
+        width: u16,
+        height: u16,
+        depth: u8,
+    ) -> io::Result<PixmapHandle> {
+        self.record(RecordedCall::AllocateRedirectedBacking {
+            host_window: host_window.as_raw(),
+            width,
+            height,
+            depth,
+        });
+        Ok(PixmapHandle::from_raw_panicking(self.allocate_handle()))
+    }
+
+    fn release_redirected_backing(
+        &mut self,
+        _origin: Option<OriginContext>,
+        backing: PixmapHandle,
+    ) -> io::Result<()> {
+        self.record(RecordedCall::ReleaseRedirectedBacking(backing.as_raw()));
+        Ok(())
+    }
+
+    fn set_window_scanout_skipped(
+        &mut self,
+        _origin: Option<OriginContext>,
+        host_window: WindowHandle,
+        skip: bool,
+    ) {
+        self.record(RecordedCall::SetWindowScanoutSkipped {
+            host_window: host_window.as_raw(),
+            skip,
+        });
     }
 
     fn create_pixmap(

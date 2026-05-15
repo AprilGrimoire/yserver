@@ -491,11 +491,17 @@ fn resolve_host_subwindow_visual_to_state(
 /// `host_drawable_target` will simply fall back to the window's
 /// own host XID until a future event populates the backing.
 ///
-/// Currently uncalled — Composite redirect registration was decoupled
-/// from backing activation (see the REDIRECT_WINDOW handler comment)
-/// because no compositor sampling path exists yet. Kept for revival
-/// when the backing-as-source path lands.
-#[allow(dead_code)]
+/// Used by the COMPOSITE Manual-mode redirect path:
+/// `RedirectWindow(_, Manual)` activates a single window;
+/// `RedirectSubwindows(_, Manual)` walks the parent's children and
+/// activates each; the `CreateWindow` future-child hook activates a
+/// freshly-created child of a Manual-redirected parent.
+///
+/// After the backing allocation succeeds, the window's host XID is
+/// inserted into the backend's scanout-skip set (T1) so the compositor
+/// scene's mirror walk omits its own-mirror quad. The compositor that
+/// owns the redirect paints visible content to the root via
+/// RENDER Composite from a `NameWindowPixmap` alias of the backing.
 fn activate_redirect_backing_for(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -519,6 +525,7 @@ fn activate_redirect_backing_for(
                     depth: w_depth,
                 });
             }
+            backend.set_window_scanout_skipped(origin, host_window, true);
         }
         Err(err) => {
             log::warn!(
@@ -527,6 +534,18 @@ fn activate_redirect_backing_for(
             );
         }
     }
+}
+
+/// Returns `true` when `parent` has an active `RedirectSubwindows`
+/// record in Manual mode. Used by the `CreateWindow` future-child
+/// hook so a newly created direct child of a Manual-redirected parent
+/// inherits a backing automatically — the spec implies the child is
+/// covered by the parent's subtree redirect.
+fn parent_has_manual_subwindows_redirect(state: &ServerState, parent: ResourceId) -> bool {
+    state
+        .composite_redirects
+        .get(&(parent, true))
+        .is_some_and(|rec| matches!(rec.mode, crate::server::CompositeRedirectMode::Manual))
 }
 
 /// Resize-time bookkeeping for COMPOSITE-redirected windows. Per
@@ -2644,9 +2663,14 @@ fn handle_composite_request(
                     }
                 };
                 let key = (ResourceId(window), subwindows);
-                if let Some(existing) = state.composite_redirects.get(&key)
-                    && existing.owner != client_id
-                {
+                let prior_mode = state.composite_redirects.get(&key).map(|rec| {
+                    if rec.owner != client_id {
+                        None
+                    } else {
+                        Some(rec.mode)
+                    }
+                });
+                if let Some(None) = prior_mode {
                     return emit_x11_error_with_minor(
                         state,
                         client_id,
@@ -2657,6 +2681,7 @@ fn handle_composite_request(
                         COMPOSITE_MAJOR_OPCODE,
                     );
                 }
+                let prior_mode = prior_mode.flatten();
                 state.composite_redirects.insert(
                     key,
                     crate::server::RedirectRecord {
@@ -2664,12 +2689,61 @@ fn handle_composite_request(
                         owner: client_id,
                     },
                 );
-                // We deliberately do NOT call activate_redirect_backing_for.
-                // A previous fix (`92a2a83`, reverted at `3751c11`) tried
-                // it and broke MATE rendering — paint got diverted to a
-                // backing pixmap that no compositor was reading from. The
-                // backing-as-source path is unimplemented; until it lands,
-                // the redirect record alone is what consumers check.
+                // Manual-only activation gate. The Automatic path keeps
+                // the pre-existing behaviour (record only, no backing) —
+                // paint-to-both semantics for Auto remains unimplemented.
+                // Manual activates the backing(s) so NameWindowPixmap
+                // succeeds; the compositor that owns the redirect paints
+                // visible content to the root via RENDER Composite from
+                // a backing alias. See the plan in
+                // docs/superpowers/plans/2026-05-15-composite-manual-redirect.md.
+                let prev_was_manual = matches!(
+                    prior_mode,
+                    Some(crate::server::CompositeRedirectMode::Manual)
+                );
+                let now_manual = matches!(mode, crate::server::CompositeRedirectMode::Manual);
+                match (prev_was_manual, now_manual) {
+                    (false, true) => {
+                        if subwindows {
+                            let parent = ResourceId(window);
+                            let children: Vec<ResourceId> =
+                                state.resources.children(parent).to_vec();
+                            for child in children {
+                                activate_redirect_backing_for(state, backend, origin, child);
+                            }
+                        } else {
+                            activate_redirect_backing_for(
+                                state,
+                                backend,
+                                origin,
+                                ResourceId(window),
+                            );
+                        }
+                    }
+                    (true, false) => {
+                        // Manual → Automatic: tear backing(s) down.
+                        if subwindows {
+                            let parent = ResourceId(window);
+                            let children: Vec<ResourceId> =
+                                state.resources.children(parent).to_vec();
+                            for child in children {
+                                crate::core_loop::process_disconnect::teardown_redirect_for_window(
+                                    state, backend, child,
+                                );
+                            }
+                        } else {
+                            crate::core_loop::process_disconnect::teardown_redirect_for_window(
+                                state,
+                                backend,
+                                ResourceId(window),
+                            );
+                        }
+                    }
+                    (false, false) | (true, true) => {
+                        // Auto-to-Auto, Manual-to-Manual, fresh-Auto:
+                        // record-only state change; no backing toggle.
+                    }
+                }
             }
         }
         x11composite::UNREDIRECT_WINDOW | x11composite::UNREDIRECT_SUBWINDOWS => {
@@ -6406,12 +6480,15 @@ fn handle_create_window(
                     new_id
                 );
             }
-            // L2 plan B.6b future-child hook: under spec, a freshly
-            // created child of a REDIRECT_SUBWINDOWS parent inherits
-            // the redirect. NameWindowPixmap's check at the top of
-            // NAME_WINDOW_PIXMAP already consults `composite_redirects`
-            // for the parent, so no per-child bookkeeping is needed
-            // until the backing-pixmap path lands.
+            // L2 plan B.6b future-child hook: a freshly created direct
+            // child of a parent under `RedirectSubwindows(_, Manual)`
+            // inherits the redirect — allocate its backing now so a
+            // subsequent NameWindowPixmap from the compositor finds
+            // one. Automatic-mode parents skip this (the backing path
+            // isn't implemented for Auto).
+            if parent_has_manual_subwindows_redirect(state, parent) {
+                activate_redirect_backing_for(state, backend, origin, window_id);
+            }
         }
     }
     let wants_focus = {
@@ -11020,8 +11097,10 @@ mod tests {
     use yserver_protocol::x11::{ClientByteOrder, ClientId, RequestHeader, SequenceNumber};
 
     use super::*;
+    use yserver_protocol::x11::CreateWindowRequest;
+
     use crate::{
-        backend::recording::RecordingBackend,
+        backend::recording::{RecordedCall, RecordingBackend},
         resources::ROOT_WINDOW,
         server::{ClientState, ServerState},
     };
@@ -11648,5 +11727,263 @@ mod tests {
         // BAD_VALUE = 2
         assert_eq!(buf[1], 2, "expected BadValue (2), got {}", buf[1]);
         assert!(state.composite_redirects.is_empty());
+    }
+
+    // ---- T2: Manual-only activation + mode-transition gates --------
+
+    fn install_window_with_host_xid(state: &mut ServerState, id: u32, host_xid: u32) {
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                window: ResourceId(id),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                depth: 32,
+                visual: ResourceId(0),
+                class: 0,
+                background_pixel: None,
+                bit_gravity: None,
+                win_gravity: None,
+                backing_store: None,
+                backing_planes: None,
+                backing_pixel: None,
+                override_redirect: Some(true),
+                save_under: None,
+                event_mask: None,
+                do_not_propagate_mask: None,
+                colormap: None,
+            },
+        );
+        let handle = crate::backend::WindowHandle::from_raw_panicking(host_xid);
+        if let Some(w) = state.resources.window_mut(ResourceId(id)) {
+            w.host_xid = Some(handle);
+        }
+    }
+
+    #[test]
+    fn redirect_window_manual_activates_backing_and_skip_scanout() {
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let win_xid = 0x0100_0001;
+        let host_xid = 0x0200_0001;
+        install_window_with_host_xid(&mut state, win_xid, host_xid);
+        dispatch_composite_redirect(&mut state, &mut backend, ClientId(1), win_xid, 1);
+        // Backend allocated a backing AND was told to skip the window
+        // in scanout.
+        let calls = backend.calls();
+        assert!(
+            calls.iter().any(|c| matches!(
+                c,
+                RecordedCall::AllocateRedirectedBacking { host_window, .. }
+                    if *host_window == host_xid
+            )),
+            "expected AllocateRedirectedBacking, got: {calls:?}",
+        );
+        assert!(
+            calls.iter().any(|c| matches!(
+                c,
+                RecordedCall::SetWindowScanoutSkipped { host_window, skip: true }
+                    if *host_window == host_xid
+            )),
+            "expected SetWindowScanoutSkipped(true), got: {calls:?}",
+        );
+        // State-side: redirected_backing populated.
+        assert!(
+            state
+                .resources
+                .window(ResourceId(win_xid))
+                .and_then(|w| w.redirected_backing.as_ref())
+                .is_some(),
+            "redirected_backing should be populated for Manual",
+        );
+    }
+
+    #[test]
+    fn redirect_window_automatic_does_not_activate_backing() {
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let win_xid = 0x0100_0002;
+        let host_xid = 0x0200_0002;
+        install_window_with_host_xid(&mut state, win_xid, host_xid);
+        dispatch_composite_redirect(&mut state, &mut backend, ClientId(1), win_xid, 0);
+        // Regression guard for 92a2a83 (broke MATE by activating
+        // backings in Automatic mode too).
+        let calls = backend.calls();
+        assert!(
+            !calls
+                .iter()
+                .any(|c| matches!(c, RecordedCall::AllocateRedirectedBacking { .. })),
+            "Automatic mode must not allocate a backing, got: {calls:?}",
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|c| matches!(c, RecordedCall::SetWindowScanoutSkipped { .. })),
+            "Automatic mode must not toggle scanout-skip, got: {calls:?}",
+        );
+        assert!(
+            state
+                .resources
+                .window(ResourceId(win_xid))
+                .and_then(|w| w.redirected_backing.as_ref())
+                .is_none(),
+            "Automatic mode must leave redirected_backing as None",
+        );
+    }
+
+    #[test]
+    fn redirect_subwindows_manual_walks_children() {
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        // Two top-level children of root, each with a host xid.
+        install_window_with_host_xid(&mut state, 0x0100_0010, 0x0200_0010);
+        install_window_with_host_xid(&mut state, 0x0100_0011, 0x0200_0011);
+        // RedirectSubwindows(root, Manual) — root is ROOT_WINDOW (xid 1).
+        let body = composite_redirect_request_body(ROOT_WINDOW.0, 1);
+        let outcome = process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 144,
+                data: 2, // REDIRECT_SUBWINDOWS
+                length_units: 3,
+            },
+            &body,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(outcome, RequestOutcome::Handled));
+        let calls = backend.calls();
+        let allocs: Vec<u32> = calls
+            .iter()
+            .filter_map(|c| match c {
+                RecordedCall::AllocateRedirectedBacking { host_window, .. } => Some(*host_window),
+                _ => None,
+            })
+            .collect();
+        assert!(allocs.contains(&0x0200_0010), "child 1 backing missing");
+        assert!(allocs.contains(&0x0200_0011), "child 2 backing missing");
+    }
+
+    #[test]
+    fn mode_transition_manual_to_automatic_tears_backing() {
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let win_xid = 0x0100_0020;
+        let host_xid = 0x0200_0020;
+        install_window_with_host_xid(&mut state, win_xid, host_xid);
+        // First Manual → backing activated.
+        dispatch_composite_redirect(&mut state, &mut backend, ClientId(1), win_xid, 1);
+        // Same owner re-redirects as Automatic — must tear backing
+        // down and clear scanout-skip.
+        dispatch_composite_redirect(&mut state, &mut backend, ClientId(1), win_xid, 0);
+        let calls = backend.calls();
+        assert!(
+            calls
+                .iter()
+                .any(|c| matches!(c, RecordedCall::ReleaseRedirectedBacking(_))),
+            "Manual → Automatic must release backing, got: {calls:?}",
+        );
+        assert!(
+            calls.iter().any(|c| matches!(
+                c,
+                RecordedCall::SetWindowScanoutSkipped { host_window, skip: false }
+                    if *host_window == host_xid
+            )),
+            "Manual → Automatic must clear scanout-skip, got: {calls:?}",
+        );
+        assert!(
+            state
+                .resources
+                .window(ResourceId(win_xid))
+                .and_then(|w| w.redirected_backing.as_ref())
+                .is_none(),
+            "redirected_backing must be cleared after Manual→Automatic",
+        );
+    }
+
+    #[test]
+    fn mode_transition_automatic_to_manual_activates_backing() {
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let win_xid = 0x0100_0030;
+        let host_xid = 0x0200_0030;
+        install_window_with_host_xid(&mut state, win_xid, host_xid);
+        dispatch_composite_redirect(&mut state, &mut backend, ClientId(1), win_xid, 0);
+        dispatch_composite_redirect(&mut state, &mut backend, ClientId(1), win_xid, 1);
+        let calls = backend.calls();
+        assert!(
+            calls.iter().any(|c| matches!(
+                c,
+                RecordedCall::AllocateRedirectedBacking { host_window, .. }
+                    if *host_window == host_xid
+            )),
+            "Automatic → Manual must activate backing, got: {calls:?}",
+        );
+        assert!(
+            state
+                .resources
+                .window(ResourceId(win_xid))
+                .and_then(|w| w.redirected_backing.as_ref())
+                .is_some(),
+            "redirected_backing must be populated after Automatic→Manual",
+        );
+    }
+
+    #[test]
+    fn create_window_under_manual_subwindows_inherits_backing() {
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        // RedirectSubwindows(root, Manual). No children yet.
+        let body = composite_redirect_request_body(ROOT_WINDOW.0, 1);
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 144,
+                data: 2,
+                length_units: 3,
+            },
+            &body,
+            None,
+        )
+        .unwrap();
+        backend.calls.lock().unwrap().clear();
+        // A new direct child of root should pick up a backing.
+        install_window_with_host_xid(&mut state, 0x0100_0050, 0x0200_0050);
+        // CreateWindow handler activates via parent_has_manual_subwindows_redirect.
+        // The helper directly calls activate_redirect_backing_for in
+        // production via the CreateWindow request path; for this unit
+        // test we invoke the same helper to keep the assertion focused.
+        let parent = state
+            .resources
+            .window(ResourceId(0x0100_0050))
+            .map(|w| w.parent)
+            .unwrap();
+        assert!(parent_has_manual_subwindows_redirect(&state, parent));
+        activate_redirect_backing_for(&mut state, &mut backend, None, ResourceId(0x0100_0050));
+        let calls = backend.calls();
+        assert!(
+            calls.iter().any(|c| matches!(
+                c,
+                RecordedCall::AllocateRedirectedBacking { host_window, .. }
+                    if *host_window == 0x0200_0050
+            )),
+            "new child under Manual-subwindows redirect must get a backing, got: {calls:?}",
+        );
     }
 }
