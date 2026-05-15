@@ -181,30 +181,52 @@ from.
 
 - [ ] **Compositor shadow margins render as opaque bars
       (NameWindowPixmap → BadAlloc).** Diagnosed 2026-05-15 from
-      `xfce.xtrace`: xfwm4's built-in compositor under
-      xfce4-session calls `NameWindowPixmap` on each redirected
-      window (e.g. menu pop-up depth-32 183×501,
-      `window=0x00d000f4`), and yserver's `name_window_pixmap`
-      (`kms::backend::KmsBackend`, `backend.rs:10506`) returns
-      `Err(NotFound)` → wire **BadAlloc** because
-      `host_window_to_backing` is empty: the 2026-05-14 Manual-
-      redirect fix (`feedback_composite_manual_redirect_trap`)
-      registered the redirect record but skipped
-      `activate_redirect_backing_for`, so no backing is allocated.
-      xfwm4 falls back to `CreatePicture` on the **live** window,
-      which only carries visible RGB — the GTK Client-Side-
-      Decoration shadow-alpha that lives in the offscreen backing
-      is unreachable, so xfwm4 emits opaque shadow-color pixels
-      where the alpha gradient should fade. Visible as thin
-      perpendicular dark bars to the right and below xfce pop-up
-      menus. Same gap will affect every Manual-mode compositor
-      (xfwm4, picom xrender backend, xcompmgr, compton). Fix
-      shape: implement Manual-mode redirect backing properly —
-      allocate at redirect activation, route window drawing into
-      the backing, keep live for compositors. Half-day snapshot
-      variant (lazy-alloc on `NameWindowPixmap` + one-shot copy
-      from the existing window mirror) would mask the artefact
-      for short-lived popups but lies about live updates.
+      a fresh `xfce.xtrace`. Visible as thin perpendicular dark
+      bars to the right and below xfce pop-up menus (any GTK
+      Client-Side-Decoration popup with alpha-shadow margins).
+      Same gap will affect every Manual-mode compositor: xfwm4,
+      picom's xrender backend, xcompmgr, compton.
+
+      **Five-step fault chain (xtrace evidence in parentheses):**
+
+      1. xfwm4 issues `RedirectSubwindows update=Manual(0x01)`
+         on root (xfce.xtrace, e.g. `005:<:0731`). Accepted by
+         the 2026-05-14 fix
+         (`feedback_composite_manual_redirect_trap`).
+      2. That fix registered the redirect *record* but **skipped**
+         `activate_redirect_backing_for`, so
+         `host_window_to_backing` stays empty for every redirected
+         window.
+      3. xfwm4 issues `NameWindowPixmap window=0x00d000f4
+         pixmap=0x0060043e` for the menu (depth-32, override-
+         redirect, 183×501) — xfce.xtrace `005:<:1d7c`.
+      4. yserver's `name_window_pixmap`
+         (`kms::backend::KmsBackend`, `backend.rs:10506`) looks up
+         `host_window_to_backing`, finds nothing → returns
+         `Err(NotFound)` → wire-level **BadAlloc** —
+         xfce.xtrace `005:>:1d7c:Error 11=Alloc: major=144,
+         minor=6, bad=0x0060043e`.
+      5. xfwm4 falls back to `CreatePicture pid=0x0060043f
+         drawable=0x00d000f4` — a picture **directly on the live
+         window** — xfce.xtrace `005:<:1d7e` — and composites
+         from it (`005:<:1d8b`). The live window only carries
+         visible RGB; the GTK CSD shadow-alpha that lives in the
+         offscreen backing is unreachable, so xfwm4 emits opaque
+         shadow-color pixels where the alpha gradient should
+         fade.
+
+      **Fix shape:** implement Manual-mode redirect backing
+      properly — allocate at redirect activation, route window
+      drawing into the backing, keep live for compositors so
+      every per-Damage refresh sees fresh contents.
+      `activate_redirect_backing_for` is preserved under
+      `#[allow(dead_code)]` per the 2026-05-14 fix and is the
+      revival point. Half-day snapshot variant (lazy-alloc on
+      `NameWindowPixmap` + one-shot copy from the existing window
+      mirror at call time) would mask the artefact for
+      short-lived popups (xfce menus, tooltips) but lies about
+      live updates and won't help compositors that re-sample on
+      each Damage event (picom).
 - [ ] **KMS: `MapSubwindows` doesn't re-Expose deep descendants
       promoted by the map_window viewable cascade.** After commit
       `304858f` (`fix(resources): propagate Viewable down through
