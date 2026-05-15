@@ -6348,6 +6348,25 @@ impl KmsBackend {
             return true;
         }
 
+        // Self-composite (src or mask aliases dst) needs a staging
+        // image; not supported. Checked up-front so the convolution
+        // dispatch below cannot record a single render pass that
+        // samples and writes the same VkImage (Vulkan feedback loop).
+        let src_xid_if_drawable = match src {
+            RenderPic::Drawable(xid) => Some(xid),
+            _ => None,
+        };
+        let mask_xid_if_drawable = match mask {
+            RenderPic::Drawable(xid) => Some(xid),
+            _ => None,
+        };
+        if src_xid_if_drawable == Some(dst_xid) || mask_xid_if_drawable == Some(dst_xid) {
+            log::debug!(
+                "vk composite bail: self-composite src/mask aliases dst (dst=0x{dst_xid:x})"
+            );
+            return false;
+        }
+
         // Convolution-filter early dispatch (phase 2 of the
         // convolution-filter work, plan
         // 2026-05-15-render-convolution-filter.md). When the source
@@ -6392,23 +6411,6 @@ impl KmsBackend {
             log::debug!("vk composite bail: unsupported op={op} (dst=0x{dst_xid:x})");
             return false;
         };
-
-        // Self-composite (src or mask aliases dst) needs a staging
-        // image; not supported in this commit.
-        let src_xid_if_drawable = match src {
-            RenderPic::Drawable(xid) => Some(xid),
-            _ => None,
-        };
-        let mask_xid_if_drawable = match mask {
-            RenderPic::Drawable(xid) => Some(xid),
-            _ => None,
-        };
-        if src_xid_if_drawable == Some(dst_xid) || mask_xid_if_drawable == Some(dst_xid) {
-            log::debug!(
-                "vk composite bail: self-composite src/mask aliases dst (dst=0x{dst_xid:x})"
-            );
-            return false;
-        }
 
         // 3F-1: acquire batch resources up-front (gated by
         // renderer_failed). Replaces the raw vk + ops_pool reads;
@@ -7059,21 +7061,55 @@ impl KmsBackend {
         // mirror (matches the typical xfwm4 shadow source: BGRA
         // server-owned pixmap painted via PutImage by the
         // compositor). R8 / depth-1 sources fall back.
-        let (src_view, src_extent) = {
-            let m = if let Some(w) = self.windows.get(&src_xid) {
-                w.vk_mirror.as_ref()
+        //
+        // For depth-24 sources we sample through `no_alpha_src_image_view`
+        // (swizzles α=1) so the X RENDER "missing alpha component
+        // defaults to 1" rule holds when the kernel multiplies sampled
+        // values. The standard path at the same predicate enforces
+        // the same invariant — see the comment block at the
+        // `RenderPic::Drawable` arm of `build_render_composite_inputs`.
+        let (src_format, src_extent, src_depth) = {
+            let (m, depth) = if let Some(w) = self.windows.get(&src_xid) {
+                (w.vk_mirror.as_ref(), w.depth)
             } else if let Some(p) = self.pixmaps.get(&src_xid) {
-                p.vk_mirror.as_ref()
+                (p.vk_mirror.as_ref(), p.depth)
             } else {
-                None
+                (None, 0)
             };
             let Some(m) = m else {
                 return Some(false);
             };
-            if m.format != ash::vk::Format::B8G8R8A8_UNORM {
-                return None;
+            (m.format, m.extent, depth)
+        };
+        if src_format != ash::vk::Format::B8G8R8A8_UNORM {
+            return None;
+        }
+        let src_view = if src_depth == 24 {
+            let v = if let Some(w) = self.windows.get_mut(&src_xid) {
+                w.vk_mirror
+                    .as_mut()
+                    .map(|m| m.no_alpha_src_image_view())
+                    .transpose()
+            } else if let Some(p) = self.pixmaps.get_mut(&src_xid) {
+                p.vk_mirror
+                    .as_mut()
+                    .map(|m| m.no_alpha_src_image_view())
+                    .transpose()
+            } else {
+                Ok(None)
+            };
+            match v {
+                Ok(Some(v)) => v,
+                _ => return Some(false),
             }
-            (m.vk_image_view, m.extent)
+        } else if let Some(w) = self.windows.get(&src_xid) {
+            w.vk_mirror.as_ref().expect("checked above").vk_image_view
+        } else {
+            self.pixmaps
+                .get(&src_xid)
+                .and_then(|p| p.vk_mirror.as_ref())
+                .expect("checked above")
+                .vk_image_view
         };
 
         // Split-borrow on disjoint fields: `convolution_pipeline`

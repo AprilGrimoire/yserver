@@ -3369,7 +3369,12 @@ mod tests {
         }
 
         #[test]
-        fn query_filters_empty_reply_shape() {
+        fn query_filters_advertises_standard_xorg_set() {
+            // Mirrors X.Org's render.c QueryFilters encoding: three
+            // canonical filters (nearest/bilinear/convolution) with
+            // FilterAliasNone (0xFFFF) alias slots, then three aliases
+            // (fast→nearest, good→bilinear, best→bilinear) with their
+            // canonical filter's INDEX in the alias slot.
             let mut out = Vec::new();
             write_render_query_filters_reply(
                 &mut out,
@@ -3378,14 +3383,42 @@ mod tests {
             )
             .unwrap();
 
-            assert_eq!(out.len(), 32);
+            // 32-byte header + 12-byte alias array (6 × u16) + 44-byte
+            // names list (5+5+5+8+9+12 names, no trailing pad needed).
+            assert_eq!(out.len(), 32 + 12 + 44);
             assert_eq!(out[0], 1);
             assert_eq!(out[1], 0);
             assert_eq!(&out[2..4], &0x1234u16.to_le_bytes());
-            assert_eq!(&out[4..8], &0u32.to_le_bytes());
-            assert_eq!(&out[8..12], &0u32.to_le_bytes());
-            assert_eq!(&out[12..16], &0u32.to_le_bytes());
-            assert!(out[16..].iter().all(|b| *b == 0));
+            // length_words = (12 + 44) / 4 = 14
+            assert_eq!(&out[4..8], &14u32.to_le_bytes());
+            // num_aliases = num_filters = 6
+            assert_eq!(&out[8..12], &6u32.to_le_bytes());
+            assert_eq!(&out[12..16], &6u32.to_le_bytes());
+            assert!(out[16..32].iter().all(|b| *b == 0));
+
+            // aliases[0..3] = FilterAliasNone for the canonical filters.
+            assert_eq!(&out[32..34], &0xFFFFu16.to_le_bytes());
+            assert_eq!(&out[34..36], &0xFFFFu16.to_le_bytes());
+            assert_eq!(&out[36..38], &0xFFFFu16.to_le_bytes());
+            // aliases[3..6]: fast→0 (nearest), good→1 (bilinear), best→1.
+            assert_eq!(&out[38..40], &0u16.to_le_bytes());
+            assert_eq!(&out[40..42], &1u16.to_le_bytes());
+            assert_eq!(&out[42..44], &1u16.to_le_bytes());
+
+            // Name list: canonical first, then aliases.
+            let names = &out[44..];
+            assert_eq!(names[0], 7);
+            assert_eq!(&names[1..8], b"nearest");
+            assert_eq!(names[8], 8);
+            assert_eq!(&names[9..17], b"bilinear");
+            assert_eq!(names[17], 11);
+            assert_eq!(&names[18..29], b"convolution");
+            assert_eq!(names[29], 4);
+            assert_eq!(&names[30..34], b"fast");
+            assert_eq!(names[34], 4);
+            assert_eq!(&names[35..39], b"good");
+            assert_eq!(names[39], 4);
+            assert_eq!(&names[40..44], b"best");
         }
     }
 
@@ -4631,45 +4664,51 @@ pub fn write_render_query_filters_reply(
     // silently disable kernel blur — so the reply itself is
     // load-bearing for any RENDER-based convolution work.
     //
+    // Wire layout matches X.Org `render/render.c:ProcRenderQueryFilters`:
+    // canonical filters come first, aliases after. The parallel
+    // `aliases` array stores `FilterAliasNone` (= -1, wire 0xFFFF) for
+    // canonical entries and the canonical filter's INDEX for alias
+    // entries. See `xserver/render/render.c:1707-1726` for the
+    // reference encoding.
+    //
     // Reply wire layout (per Xrender protocol spec):
     //   1    reply opcode (1)
     //   1    unused
     //   2    sequence
     //   4    reply length (4-byte units of post-header data)
-    //   4    num_aliases (= filter count; one alias entry per filter)
+    //   4    num_aliases (= num_filters; one alias entry per name)
     //   4    num_filters
     //   16   unused
-    //   2n   aliases: LISTofCARD16 — alias-target index per filter,
-    //        padded to multiple of 4
+    //   2n   aliases: LISTofCARD16 — FilterAliasNone for canonical,
+    //        canonical index for aliases; padded to multiple of 4
     //   m    filters: LISTofSTRING8 — each entry is u8 length + name,
     //        whole list padded to multiple of 4
-    const FILTERS: &[&[u8]] = &[
-        b"fast",
-        b"good",
-        b"best",
-        b"nearest",
-        b"bilinear",
-        b"convolution",
-    ];
-    // Parallel: each entry is the index of the canonical filter this
-    // one resolves to. Indexing matches X.Org's `picture.c`.
-    const ALIASES: [u16; 6] = [3, 4, 4, 3, 4, 5];
+    const CANONICAL: &[&[u8]] = &[b"nearest", b"bilinear", b"convolution"];
+    const ALIAS_NAMES: &[&[u8]] = &[b"fast", b"good", b"best"];
+    // Canonical filter each alias resolves to (index into CANONICAL).
+    const ALIAS_TARGETS: &[u16] = &[0, 1, 1];
+    // X.Org `#define FilterAliasNone -1` (render.h:194), wire-encoded
+    // as 0xFFFF in the INT16 alias slot.
+    const FILTER_ALIAS_NONE: u16 = 0xFFFF;
 
     let mut payload: Vec<u8> = Vec::new();
-    for a in ALIASES {
-        write_u16(byte_order, &mut payload, a);
+    for _ in CANONICAL {
+        write_u16(byte_order, &mut payload, FILTER_ALIAS_NONE);
+    }
+    for &target in ALIAS_TARGETS {
+        write_u16(byte_order, &mut payload, target);
     }
     // Pad aliases section to multiple of 4 bytes.
-    while payload.len() % 4 != 0 {
+    while !payload.len().is_multiple_of(4) {
         payload.push(0);
     }
-    for name in FILTERS {
+    for name in CANONICAL.iter().chain(ALIAS_NAMES.iter()) {
         let len = u8::try_from(name.len()).expect("filter name fits in u8");
         payload.push(len);
         payload.extend_from_slice(name);
     }
     // Pad filters section to multiple of 4 bytes.
-    while payload.len() % 4 != 0 {
+    while !payload.len().is_multiple_of(4) {
         payload.push(0);
     }
 
@@ -4680,8 +4719,9 @@ pub fn write_render_query_filters_reply(
     out.extend_from_slice(&[1u8, 0]);
     write_u16(byte_order, &mut out, sequence.0);
     write_u32(byte_order, &mut out, length_words);
-    write_u32(byte_order, &mut out, ALIASES.len() as u32); // num_aliases
-    write_u32(byte_order, &mut out, FILTERS.len() as u32); // num_filters
+    let total_names = CANONICAL.len() + ALIAS_NAMES.len();
+    write_u32(byte_order, &mut out, total_names as u32); // num_aliases
+    write_u32(byte_order, &mut out, total_names as u32); // num_filters
     out.extend_from_slice(&[0u8; 16]); // pad to 32-byte header
     debug_assert_eq!(out.len(), 32);
     out.extend_from_slice(&payload);

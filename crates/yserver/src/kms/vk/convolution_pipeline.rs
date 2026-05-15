@@ -87,13 +87,25 @@ impl ConvolutionKernelData {
     /// Build a kernel UBO image from `(width, height, weights)` as
     /// stored in [`super::super::backend`]'s
     /// `PictureFilter::Convolution`. Returns `None` if the kernel is
-    /// out of range (zero-sized or larger than the shader's static
-    /// cap) — caller should fall back to the standard pipeline.
+    /// out of range (zero-sized, larger than the shader's static cap,
+    /// or even-dimensioned) — caller should fall back to the standard
+    /// pipeline.
+    ///
+    /// Even dimensions are rejected because the shader (and pixman's
+    /// reference convolution) anchors the kernel on the centre texel
+    /// at `dims / 2` and loops `[-half, +half]` inclusive, which only
+    /// produces a symmetric footprint for odd dims. Real RENDER
+    /// consumers (xfwm4, picom) only emit odd-dim kernels; supporting
+    /// even dims would need corner-anchored sampling semantics that
+    /// the X RENDER spec doesn't pin down.
     #[must_use]
     pub fn from_parsed(width: u16, height: u16, weights: &[f32]) -> Option<Self> {
         let w = usize::from(width);
         let h = usize::from(height);
         if w == 0 || h == 0 || w > MAX_KERNEL_DIM || h > MAX_KERNEL_DIM {
+            return None;
+        }
+        if w.is_multiple_of(2) || h.is_multiple_of(2) {
             return None;
         }
         let n = w * h;
@@ -464,6 +476,19 @@ mod tests {
     fn from_parsed_rejects_weight_count_mismatch() {
         let weights = vec![1.0_f32; 8]; // expecting 9 for 3x3
         assert!(ConvolutionKernelData::from_parsed(3, 3, &weights).is_none());
+    }
+
+    #[test]
+    fn from_parsed_rejects_even_dimensions() {
+        // The shader anchors at `dims / 2` and loops inclusively, so
+        // a 2x2 kernel would sample 3x3 with three tail-zero weights.
+        // Reject up front so the caller falls through to LINEAR.
+        let weights_2x2 = vec![0.25_f32; 4];
+        assert!(ConvolutionKernelData::from_parsed(2, 2, &weights_2x2).is_none());
+        let weights_2x3 = vec![0.25_f32; 6];
+        assert!(ConvolutionKernelData::from_parsed(2, 3, &weights_2x3).is_none());
+        let weights_3x4 = vec![0.25_f32; 12];
+        assert!(ConvolutionKernelData::from_parsed(3, 4, &weights_3x4).is_none());
     }
 
     #[test]
