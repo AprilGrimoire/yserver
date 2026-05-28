@@ -99,7 +99,7 @@ fn submit_flip_inner(
     )
 }
 
-pub fn drain_events<F: FnMut(crtc::Handle)>(
+pub fn drain_events<F: FnMut(crtc::Handle, u64, std::time::Duration)>(
     device: &Device,
     mut on_page_flip: F,
 ) -> io::Result<()> {
@@ -109,15 +109,65 @@ pub fn drain_events<F: FnMut(crtc::Handle)>(
     Ok(())
 }
 
+/// T6 (idle-case MSC advance): request a vblank event from the
+/// kernel so the next vblank arrives on the DRM fd even when no
+/// pageflip is in flight. Mirrors Xorg
+/// `present_screen_info::queue_vblank` semantics: ask the driver
+/// for an event at the next vblank on the given CRTC; the run loop
+/// drains the event via [`drain_events`] and uses the kernel
+/// `(msc, ust)` to fire queued `CompleteNotify` / `NotifyMSC`
+/// payloads.
+///
+/// `crtc_index` is the 0-based CRTC ordinal (0..32) — the kernel
+/// encodes this into the `_DRM_VBLANK_HIGH_CRTC_MASK` bits. Higher
+/// CRTC indices use the libdrm `high_crtc` field directly.
+///
+/// Returns the kernel-reported sequence the event was scheduled
+/// for; the actual completion arrives asynchronously as
+/// `Event::Vblank(crtc, frame, time)`.
+pub fn request_next_vblank_event(device: &Device, crtc_index: u32) -> io::Result<()> {
+    use drm::{Device as DrmDevice, VblankWaitFlags, VblankWaitTarget};
+    // Relative(1) = "the next vblank from now"; with EVENT the
+    // ioctl returns immediately and the completion lands on the
+    // DRM fd, picked up by `drain_events` on the next epoll cycle.
+    // `user_data` is opaque; we don't need it for routing because
+    // the `VblankEvent` already carries `crtc`.
+    device
+        .wait_vblank(
+            VblankWaitTarget::Relative(1),
+            VblankWaitFlags::EVENT,
+            crtc_index,
+            0,
+        )
+        .map(drop)
+}
+
 /// Dispatch a single drm event: invoke `on_page_flip` for `Event::PageFlip`
-/// with the completing CRTC handle; ignore `Vblank` and `Unknown`.
+/// or `Event::Vblank` with `(crtc, msc, ust)`; ignore `Unknown`.
+///
+/// `msc` is the kernel vblank sequence widened to u64 (raw sequence wraps
+/// at u32; wrap-tracking is owned by the per-CRTC state in the backend).
+/// `ust` is the kernel-reported timestamp (since-boot Duration, treated
+/// as opaque UST by Present completion consumers).
+///
+/// T6 (idle-case MSC advance): Vblank events flow through the same
+/// callback so the run loop can drain `pending_complete_notify` even
+/// when no pageflip is happening. Vblanks are produced only when the
+/// backend explicitly requests them via `wait_vblank` with the EVENT
+/// flag (so idle sessions don't spin on vblanks); when no request is
+/// in flight, the event stream is naturally PageFlip-only.
 ///
 /// Factored out of [`drain_events`] so the per-event routing is unit-testable
-/// without a real DRM fd (synthetic [`Event::PageFlip`] values can be
-/// constructed via the public `PageFlipEvent` fields).
-fn dispatch_event<F: FnMut(crtc::Handle)>(event: Event, on_page_flip: &mut F) {
-    if let Event::PageFlip(ev) = event {
-        on_page_flip(ev.crtc);
+/// without a real DRM fd (synthetic event values can be constructed via the
+/// public `PageFlipEvent` / `VblankEvent` fields).
+fn dispatch_event<F: FnMut(crtc::Handle, u64, std::time::Duration)>(
+    event: Event,
+    on_page_flip: &mut F,
+) {
+    match event {
+        Event::PageFlip(ev) => on_page_flip(ev.crtc, u64::from(ev.frame), ev.duration),
+        Event::Vblank(ev) => on_page_flip(ev.crtc, u64::from(ev.frame), ev.time),
+        Event::Unknown(_) => {}
     }
 }
 
@@ -139,7 +189,7 @@ mod tests {
         });
 
         let mut seen: Vec<crtc::Handle> = Vec::new();
-        dispatch_event(event, &mut |c| seen.push(c));
+        dispatch_event(event, &mut |c, _msc, _ust| seen.push(c));
 
         assert_eq!(seen, vec![handle]);
     }
@@ -148,7 +198,56 @@ mod tests {
     fn dispatch_event_ignores_unknown() {
         let event = Event::Unknown(Vec::new());
         let mut called = 0u32;
-        dispatch_event(event, &mut |_| called += 1);
+        dispatch_event(event, &mut |_, _, _| called += 1);
         assert_eq!(called, 0);
+    }
+
+    /// T6 (idle-case MSC advance): `Event::Vblank` must also reach the
+    /// dispatch callback. The kernel emits Vblank when a `wait_vblank`
+    /// (with `_DRM_VBLANK_EVENT`) target is reached even if no
+    /// pageflip happened — that's the mechanism that keeps the MSC
+    /// clock running when the compositor is idle. Pre-T6 the
+    /// dispatcher dropped Vblank entirely, so `NotifyMSC` requests
+    /// targeting future MSC values would never fire under an idle
+    /// compositor (paint stalled when the cinnamon shell or Cogl
+    /// frame clock asked "wake me at next vblank").
+    #[test]
+    fn dispatch_event_surfaces_vblank_event() {
+        use drm::control::VblankEvent;
+
+        let handle: crtc::Handle = from_u32(7).expect("non-zero raw handle");
+        let ust = Duration::new(11, 250_000_000);
+        let event = Event::Vblank(VblankEvent {
+            frame: 9876,
+            time: ust,
+            crtc: handle,
+            user_data: 0,
+        });
+
+        let mut seen: Vec<(crtc::Handle, u64, Duration)> = Vec::new();
+        dispatch_event(event, &mut |c, msc, t| seen.push((c, msc, t)));
+
+        assert_eq!(seen, vec![(handle, 9876u64, ust)]);
+    }
+
+    /// T1 (Present pacing): MSC + UST must reach the dispatch callback.
+    /// `frame` widens to u64 (the kernel sequence is u32 — wrap handling
+    /// is a separate concern owned by per-CRTC bookkeeping in T2).
+    /// `duration` flows through as-is; consumers convert to a UST as
+    /// needed.
+    #[test]
+    fn dispatch_event_surfaces_msc_and_ust_for_page_flip() {
+        let handle: crtc::Handle = from_u32(42).expect("non-zero raw handle");
+        let ust = Duration::new(2, 500_000_000);
+        let event = Event::PageFlip(PageFlipEvent {
+            frame: 12345,
+            duration: ust,
+            crtc: handle,
+        });
+
+        let mut seen: Vec<(crtc::Handle, u64, Duration)> = Vec::new();
+        dispatch_event(event, &mut |c, msc, t| seen.push((c, msc, t)));
+
+        assert_eq!(seen, vec![(handle, 12345u64, ust)]);
     }
 }

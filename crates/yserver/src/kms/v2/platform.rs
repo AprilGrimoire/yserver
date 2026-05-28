@@ -456,6 +456,20 @@ pub(crate) struct PageFlipRetirement {
     pub(crate) generation: u64,
 }
 
+/// Returned by `drain_page_flip_events` per CRTC pageflip event. Carries
+/// the kernel-reported MSC (vblank sequence widened to u64) and UST
+/// (timestamp Duration) so the Present extension can fire CompleteNotify
+/// with real values (Xorg `present_screen_info::get_ust_msc` semantics).
+///
+/// `output_idx` is the v2 backend's output index resolved from the
+/// CRTC handle.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PageFlipCompletion {
+    pub(crate) output_idx: usize,
+    pub(crate) msc: u64,
+    pub(crate) ust: std::time::Duration,
+}
+
 // ────────────────────────────────────────────────────────────────
 // FlushOutcome
 // ────────────────────────────────────────────────────────────────
@@ -1171,21 +1185,27 @@ impl PlatformBackend {
         fds
     }
 
-    pub(crate) fn drain_page_flip_events(&self) -> io::Result<Vec<usize>> {
+    pub(crate) fn drain_page_flip_events(&self) -> io::Result<Vec<PageFlipCompletion>> {
         use ::drm::control::crtc;
 
-        let mut flipped: Vec<crtc::Handle> = Vec::new();
-        crate::drm::page_flip::drain_events(&self.device, |c| flipped.push(c))?;
+        let mut flipped: Vec<(crtc::Handle, u64, std::time::Duration)> = Vec::new();
+        crate::drm::page_flip::drain_events(&self.device, |c, msc, ust| {
+            flipped.push((c, msc, ust));
+        })?;
 
-        let mut output_indices = Vec::with_capacity(flipped.len());
-        for crtc in flipped {
+        let mut completions = Vec::with_capacity(flipped.len());
+        for (crtc, msc, ust) in flipped {
             let Some(output_idx) = self.outputs.iter().position(|o| o.output.crtc == crtc) else {
                 log::warn!("v2: pageflip-complete for unknown CRTC {crtc:?}");
                 continue;
             };
-            output_indices.push(output_idx);
+            completions.push(PageFlipCompletion {
+                output_idx,
+                msc,
+                ust,
+            });
         }
-        Ok(output_indices)
+        Ok(completions)
     }
 
     /// VkContext accessor for the engine. Returns `None` on the

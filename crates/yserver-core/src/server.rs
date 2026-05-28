@@ -427,6 +427,14 @@ pub struct ServerState {
     /// hot-path activity (e.g. SHM PutImage bursts) to a recognisable
     /// process name. Updated in the WM_CLASS property handler.
     pub client_wm_class: HashMap<u32, String>,
+    /// T3 (Present pacing): FIFO of CompleteNotify events queued
+    /// at the PresentPixmap handler, awaiting the next CRTC vblank.
+    /// `drain_pending_complete_notify_for_flip` fires entries with
+    /// the real `(msc, ust)` reported by the kernel pageflip event.
+    /// IdleNotify continues to fire immediately for the Copy path
+    /// (matches Xorg `present_execute_copy`'s
+    /// `present_pixmap_idle(..)` call site).
+    pub pending_complete_notify: std::collections::VecDeque<PendingCompleteNotify>,
     /// MIT-SHM segments — keyed by client-supplied `shmseg` ID.
     pub mit_shm_segments: HashMap<u32, MitShmSegment>,
     /// GLX context registry. Indirect-rendering clients allocate one
@@ -593,6 +601,7 @@ impl ServerState {
             present_event_selections: HashMap::new(),
             present_msc: HashMap::new(),
             client_wm_class: HashMap::new(),
+            pending_complete_notify: std::collections::VecDeque::new(),
             mit_shm_segments: HashMap::new(),
             glx_contexts: HashMap::new(),
             glx_next_context_tag: 1,
@@ -883,6 +892,25 @@ pub struct PresentEventSelection {
     pub owner: ClientId,
     pub window: ResourceId,
     pub event_mask: u32,
+}
+
+/// T3 (Present pacing): one CompleteNotify event queued at the request
+/// handler but not yet sent. Drained on the next page-flip retire
+/// (T4 adds target_msc gating). Modeled after Xorg's `present_vblank`
+/// record kept on a per-screen exec queue (`present_scmd.c`).
+///
+/// `target_msc=0` means "fire on next vblank". Non-zero is the
+/// explicit MSC the client asked for in `PresentPixmap` /
+/// `NotifyMSC`; T4 will defer firing until `crtc_msc >= target_msc`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingCompleteNotify {
+    pub client_id: ClientId,
+    pub eid: u32,
+    pub window: ResourceId,
+    pub serial: u32,
+    pub kind: u8,
+    pub mode: u8,
+    pub target_msc: u64,
 }
 
 /// A shared memory segment attached via MIT-SHM. Owns the lifetime of both

@@ -743,7 +743,42 @@ fn drain_present_completions(state: &mut ServerState, backend: &mut dyn Backend)
         // Wake-signal already fired inside the backend's drain via
         // the Arc-pinned handle; we only do X11-side event fan-out
         // here.
+        //
+        // T3 (Present pacing): `fire_present_completion_events` fires
+        // IdleNotify immediately (Xorg `present_execute_copy`
+        // semantics) and enqueues CompleteNotify into
+        // `state.pending_complete_notify`. The flush below picks the
+        // right path:
+        //   - vblank-paced backend (KMS): drain matching the per-CRTC
+        //     pageflip retires returned by `drain_recent_page_flips`,
+        //     so CompleteNotify fires with kernel `(msc, ust)`.
+        //   - non-paced backend (RecordingBackend, HostX11): flush
+        //     immediately with `(0, 0)` so the synchronous
+        //     CompleteNotify path stays in place.
         crate::core_loop::process_request::fire_present_completion_events(state, &entry);
+    }
+    if backend.has_vblank_pacing() {
+        for (msc, ust_micros) in backend.drain_recent_page_flips() {
+            crate::core_loop::process_request::drain_pending_complete_notify_for_flip(
+                state, msc, ust_micros,
+            );
+        }
+        // T6 (idle-case MSC advance): if notifies remain after
+        // draining real pageflip events, ask the kernel for a
+        // standalone vblank event so the next vblank arrives even
+        // when no pageflip is in flight. Mirrors Xorg's
+        // `present_screen_info::queue_vblank` — a paced backend
+        // owes a future `(msc, ust)` for each queued `CompleteNotify`
+        // / `NotifyMSC`. The backend dedups against an in-flight
+        // request internally, so calling this every iteration is
+        // safe.
+        if !state.pending_complete_notify.is_empty()
+            && let Err(e) = backend.request_next_vblank_event()
+        {
+            log::debug!("run: request_next_vblank_event failed: {e}");
+        }
+    } else if !state.pending_complete_notify.is_empty() {
+        crate::core_loop::process_request::drain_pending_complete_notify_for_flip(state, 0, 0);
     }
 }
 

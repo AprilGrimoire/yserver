@@ -144,6 +144,18 @@ pub struct CompletedPresentEvent {
     pub dst_host_xid: u32,
     pub options: u32,
     pub wake: PresentWake,
+    /// T4 (Present pacing): the request's `target_msc` field.
+    /// `fire_present_completion_events` enqueues this onto the
+    /// pending CompleteNotify so the per-flip drain only fires
+    /// the event once the CRTC's MSC has reached the target
+    /// (Xorg `present_get_target_msc` then `present_queue_vblank`
+    /// at `exec_msc` ≥ `target_msc`).
+    ///
+    /// `0` means "fire on the next flip" (the Xorg
+    /// `present_get_target_msc` default when both
+    /// `target_window_msc` and `divisor` are zero — see
+    /// `present_get_target_msc` in `present_request.c`).
+    pub target_msc: u64,
 }
 
 /// Per-PRESENT-path wake target. Surfaces the original
@@ -1470,6 +1482,62 @@ pub trait Backend: Send {
         PresentCaps::default()
     }
 
+    /// T2 (Present pacing): current `(msc, ust)` for the CRTC servicing
+    /// `window`. Xorg counterpart: `present_screen_info::get_ust_msc`.
+    /// MSC is the kernel vblank sequence widened to u64 (wrap handling
+    /// is owned by the backend); UST is the kernel-reported timestamp
+    /// since boot.
+    ///
+    /// Default returns `(0, Duration::ZERO)` so non-KMS backends opt
+    /// out cleanly; their existing Present handlers continue to fire
+    /// completion immediately. Window→CRTC mapping is the backend's
+    /// responsibility (T7 will replace the v2 default-output fallback
+    /// with a geometry-based pick).
+    fn present_get_ust_msc(&self, _window: u32) -> (u64, std::time::Duration) {
+        (0, std::time::Duration::ZERO)
+    }
+
+    /// T3 (Present pacing): return + clear the per-iteration ring of
+    /// page-flip retirements. Each entry is `(msc, ust_micros)` for
+    /// the CRTC that just retired (T7 will extend with `output_idx`).
+    /// `run::drain_present_completions` then drains
+    /// `state.pending_complete_notify` using these values.
+    ///
+    /// Default impl returns empty.
+    fn drain_recent_page_flips(&mut self) -> Vec<(u64, u64)> {
+        Vec::new()
+    }
+
+    /// T3 (Present pacing): does this backend drive real per-CRTC
+    /// vblanks? When `false`, the run loop drains
+    /// `state.pending_complete_notify` with `(msc=0, ust=0)`
+    /// immediately after firing IdleNotify — preserving the
+    /// pre-T3 "fire CompleteNotify synchronously" behavior for
+    /// `HostX11Backend` (the host X server already paces) and
+    /// `RecordingBackend` (no scanout, no vblank). Only the v2
+    /// KMS backend opts into deferred CompleteNotify by overriding
+    /// this to `true`.
+    fn has_vblank_pacing(&self) -> bool {
+        false
+    }
+
+    /// T6 (idle-case MSC advance): ask the backend to schedule a
+    /// kernel vblank event so the run loop can drain
+    /// `pending_complete_notify` even when no pageflip is in flight.
+    /// Mirrors Xorg `present_screen_info::queue_vblank`. Backends
+    /// without a real per-CRTC clock (`HostX11`, `Recording`) return
+    /// the default no-op `Ok(false)` — they flush pending notifies
+    /// synchronously via the `has_vblank_pacing == false` path in
+    /// `drain_present_completions`.
+    ///
+    /// Returns `Ok(true)` iff a vblank request was actually
+    /// scheduled (so the caller can suppress further requests until
+    /// the resulting event arrives — dedup against the existing
+    /// in-flight request lives on the implementing backend).
+    fn request_next_vblank_event(&mut self) -> std::io::Result<bool> {
+        Ok(false)
+    }
+
     /// Stage 5 Task 6.1: enqueue a deferred PRESENT completion. The
     /// backend pins the wake primitive, binds the payload to the GPU
     /// work that makes `dst_host_xid` idle, and returns immediately.
@@ -1638,6 +1706,7 @@ mod present_completion_trait_tests {
                 dst_host_xid: 0,
                 options: 0,
                 wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+                target_msc: 0,
             },
             /* dst_host_xid */ 0,
         );

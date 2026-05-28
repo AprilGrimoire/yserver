@@ -6368,6 +6368,7 @@ fn handle_present_request(
                         wake: crate::backend::PresentWake::Pixmap {
                             idle_fence_xid: req.idle_fence,
                         },
+                        target_msc: req.target_msc,
                     },
                     dst.host_xid(),
                 );
@@ -6424,24 +6425,48 @@ fn handle_present_request(
         }
         x11present::NOTIFY_MSC => {
             if let Some(req) = x11present::parse_notify_msc(body) {
-                let current_msc = state
-                    .present_msc
-                    .get(&ResourceId(req.window))
-                    .copied()
-                    .unwrap_or(0);
-                if notify_msc_satisfied(current_msc, req.target_msc, req.divisor, req.remainder) {
-                    fire_present_notify_msc_complete_events(
-                        state,
-                        byte_order,
-                        PRESENT_MAJOR_OPCODE,
-                        req.window,
-                        req.serial,
-                        current_msc,
-                    );
+                // T5 (Present pacing): enqueue per Xorg's
+                // `present_pixmap`-with-no-pixmap path. The same
+                // `state.pending_complete_notify` queue + vblank
+                // drain that gates PresentPixmap CompleteNotify
+                // also gates NotifyMSC (kind=NOTIFY_MSC), so Cogl /
+                // GLX clients calling `glXWaitVideoSyncSGI` are
+                // paced by real vblanks instead of an instant
+                // synthesised reply.
+                //
+                // divisor/remainder is the periodic-wait corner
+                // (`present_get_target_msc` formula). Cogl /
+                // loader_dri3 don't exercise it; T5 enqueues with
+                // the raw `target_msc` so divisor==0 behaves
+                // correctly. divisor!=0 remains a follow-up
+                // (target_msc would need crtc_msc at enqueue time).
+                let window_rid = ResourceId(req.window);
+                let mut targets: Vec<(u32, ClientId)> = Vec::new();
+                for (eid, sel) in &state.present_event_selections {
+                    if sel.window == window_rid && sel.event_mask & 0x2 != 0 {
+                        targets.push((*eid, sel.owner));
+                    }
                 }
+                for (eid, owner) in targets {
+                    state
+                        .pending_complete_notify
+                        .push_back(crate::server::PendingCompleteNotify {
+                            client_id: owner,
+                            eid,
+                            window: window_rid,
+                            serial: req.serial,
+                            kind: x11present::COMPLETE_KIND_NOTIFY_MSC,
+                            mode: x11present::COMPLETE_MODE_COPY,
+                            target_msc: req.target_msc,
+                        });
+                }
+                // `present_msc` is still maintained as a coarse
+                // per-window monotonic; T6/T7 will phase it out in
+                // favour of the per-CRTC clock once window→CRTC
+                // mapping lands.
                 state
                     .present_msc
-                    .entry(ResourceId(req.window))
+                    .entry(window_rid)
                     .and_modify(|msc| *msc = (*msc).max(req.target_msc).saturating_add(1))
                     .or_insert(req.target_msc.saturating_add(1));
             }
@@ -6598,6 +6623,7 @@ fn handle_present_request(
                                     release_syncobj: req.release_syncobj,
                                     release_value: req.release_value,
                                 },
+                                target_msc: req.target_msc,
                             },
                             dst.host_xid(),
                         );
@@ -6660,16 +6686,6 @@ fn handle_present_request(
         }
     }
     Ok(RequestOutcome::Handled)
-}
-
-fn notify_msc_satisfied(current_msc: u64, target_msc: u64, divisor: u64, remainder: u64) -> bool {
-    if current_msc < target_msc {
-        return false;
-    }
-    if divisor == 0 {
-        return true;
-    }
-    current_msc % divisor == remainder
 }
 
 /// Fan out `CompleteNotify { mode: Copy }` and `IdleNotify` to every
@@ -6774,7 +6790,6 @@ pub fn fire_present_completion_events(
     const IDLE_NOTIFY_MASK: u32 = 0x4;
 
     let window = ResourceId(event.dst_host_xid);
-    let current_msc = state.present_msc.get(&window).copied().unwrap_or(0);
     let pixmap_xid = event.host_xid;
     let idle_fence = match event.wake {
         PresentWake::Pixmap { idle_fence_xid } => idle_fence_xid,
@@ -6804,26 +6819,22 @@ pub fn fire_present_completion_events(
     );
 
     for (eid, owner, mask) in targets {
-        let Some(client) = state.clients.get_mut(&owner.0) else {
-            continue;
-        };
-        // byte_order is sourced from the OWNER client (the one
-        // receiving the event), not the caller. Fixes a latent bug
-        // where events to owners of different endianness than the
-        // submitting client were mis-encoded.
-        let byte_order = client.byte_order;
-        let seq = SequenceNumber(
-            client
-                .last_sequence
-                .load(std::sync::atomic::Ordering::Relaxed),
-        );
-        // Per Xorg's present_execute_copy: IdleNotify fires *first*
-        // (the pixmap is idle as soon as the GPU finishes reading,
-        // which on our synchronous CopyArea path is immediately),
-        // CompleteNotify fires on vblank afterwards. Mesa's
-        // loader_dri3 expects this order — flipping it makes
-        // vkAcquireNextImage hang on the second frame.
-        if mask & IDLE_NOTIFY_MASK != 0 {
+        // T3 (Present pacing): IdleNotify still fires immediately for
+        // the Copy path — Xorg's `present_execute_copy` calls
+        // `present_pixmap_idle(..)` synchronously after the copy
+        // because a Copy fully consumes the source pixmap. Mesa's
+        // loader_dri3 also relies on IdleNotify-before-CompleteNotify
+        // (flipping the order makes vkAcquireNextImage hang on the
+        // second frame).
+        if mask & IDLE_NOTIFY_MASK != 0
+            && let Some(client) = state.clients.get_mut(&owner.0)
+        {
+            let byte_order = client.byte_order;
+            let seq = SequenceNumber(
+                client
+                    .last_sequence
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            );
             let ev = x11present::encode_idle_notify(
                 byte_order,
                 seq,
@@ -6844,25 +6855,29 @@ pub fn fire_present_completion_events(
                 client.outbound.len(),
             );
         }
+        // T3 (Present pacing): CompleteNotify deferred until the next
+        // page-flip retire. The Xorg single-CRTC scheduler queues each
+        // request at `exec_msc` (`present_scmd_pixmap` →
+        // `present_queue_vblank`) and only fires CompleteNotify after
+        // `present_event_notify` delivers the real vblank `(ust, msc)`.
+        // T4 adds `target_msc` gating; today every entry fires at the
+        // next flip regardless.
         if mask & COMPLETE_NOTIFY_MASK != 0 {
-            let ev = x11present::encode_complete_notify(
-                byte_order,
-                seq,
-                PRESENT_MAJOR_OPCODE,
-                eid,
-                window.0,
-                event.serial,
-                x11present::COMPLETE_KIND_PIXMAP,
-                x11present::COMPLETE_MODE_COPY,
-                0, // ust unknown without a real vblank timestamp
-                current_msc,
-            );
+            state
+                .pending_complete_notify
+                .push_back(crate::server::PendingCompleteNotify {
+                    client_id: owner,
+                    eid,
+                    window,
+                    serial: event.serial,
+                    kind: x11present::COMPLETE_KIND_PIXMAP,
+                    mode: x11present::COMPLETE_MODE_COPY,
+                    target_msc: event.target_msc,
+                });
             debug!(
-                "PRESENT CompleteNotify -> client {} eid=0x{eid:x} ({} bytes)",
-                owner.0,
-                ev.len()
+                "PRESENT CompleteNotify -> deferred (client {} eid=0x{eid:x} target_msc={})",
+                owner.0, event.target_msc
             );
-            let _ = write_to_client(client, owner, &ev);
         }
     }
 }
@@ -6925,32 +6940,36 @@ fn fire_present_configure_notify_for_window(
     }
 }
 
-fn fire_present_notify_msc_complete_events(
-    state: &mut ServerState,
-    byte_order: yserver_protocol::x11::ClientByteOrder,
-    extension_major: u8,
-    window: u32,
-    serial: u32,
-    current_msc: u64,
-) {
+/// T3/T4 (Present pacing): drain queued CompleteNotify events that
+/// have reached their `target_msc`. Fires each ready entry with the
+/// kernel-reported `(msc, ust)`. Entries whose `target_msc` is still
+/// in the future stay on the queue and try again on the next flip.
+///
+/// Gate rule (Xorg `present_get_target_msc` + `present_scmd.c`
+/// `msc_is_after(vblank->exec_msc, crtc_msc)`):
+/// - `target_msc == 0`: fire on the very next vblank.
+/// - `target_msc > 0`: fire when the supplied `msc >= target_msc`.
+///
+/// `ust_micros` is the kernel pageflip timestamp packed into the
+/// event's u64 ust field. Mirrors Xorg `present_event_notify` →
+/// `present_execute` → `present_execute_post` ordering.
+pub fn drain_pending_complete_notify_for_flip(state: &mut ServerState, msc: u64, ust_micros: u64) {
     use yserver_protocol::x11::present as x11present;
-    const COMPLETE_NOTIFY_MASK: u32 = 0x2;
+    const PRESENT_MAJOR_OPCODE: u8 = 145;
 
-    let window = ResourceId(window);
-    let mut targets: Vec<(u32, ClientId, u32)> = Vec::new();
-    for (eid, sel) in &state.present_event_selections {
-        if sel.window == window {
-            targets.push((*eid, sel.owner, sel.event_mask));
-        }
-    }
-
-    for (eid, owner, mask) in targets {
-        if mask & COMPLETE_NOTIFY_MASK == 0 {
+    let entries: Vec<_> = state.pending_complete_notify.drain(..).collect();
+    for entry in entries {
+        // T4 gate: requeue if the CRTC hasn't reached the requested
+        // target yet. `target_msc == 0` is "next vblank", which this
+        // call (firing at `msc`) by definition satisfies.
+        if entry.target_msc != 0 && msc < entry.target_msc {
+            state.pending_complete_notify.push_back(entry);
             continue;
         }
-        let Some(client) = state.clients.get_mut(&owner.0) else {
+        let Some(client) = state.clients.get_mut(&entry.client_id.0) else {
             continue;
         };
+        let byte_order = client.byte_order;
         let seq = SequenceNumber(
             client
                 .last_sequence
@@ -6959,21 +6978,22 @@ fn fire_present_notify_msc_complete_events(
         let ev = x11present::encode_complete_notify(
             byte_order,
             seq,
-            extension_major,
-            eid,
-            window.0,
-            serial,
-            x11present::COMPLETE_KIND_NOTIFY_MSC,
-            x11present::COMPLETE_MODE_COPY,
-            0,
-            current_msc,
+            PRESENT_MAJOR_OPCODE,
+            entry.eid,
+            entry.window.0,
+            entry.serial,
+            entry.kind,
+            entry.mode,
+            ust_micros,
+            msc,
         );
         debug!(
-            "PRESENT NotifyMSC CompleteNotify -> client {} eid=0x{eid:x} ({} bytes)",
-            owner.0,
+            "PRESENT CompleteNotify (deferred) -> client {} eid=0x{:x} msc={msc} ust={ust_micros} ({} bytes)",
+            entry.client_id.0,
+            entry.eid,
             ev.len()
         );
-        let _ = write_to_client(client, owner, &ev);
+        let _ = write_to_client(client, entry.client_id, &ev);
     }
 }
 
@@ -17260,6 +17280,355 @@ mod tests {
         assert_eq!(state.composite_redirects.len(), 1);
     }
 
+    /// T3 (Present pacing): CompleteNotify must be deferred from the
+    /// initial `fire_present_completion_events` call (which still
+    /// fires IdleNotify immediately, mirroring Xorg's
+    /// `present_execute_copy` → `present_pixmap_idle` site). Only
+    /// the next CRTC pageflip retire — modeled here by
+    /// `drain_pending_complete_notify_for_flip` — emits CompleteNotify,
+    /// and it carries the kernel `(msc, ust)` values rather than the
+    /// pre-T3 synthesized `(present_msc+1, 0)` pair.
+    /// T5 (Present pacing): a `Present::NotifyMSC` request with a
+    /// future `target_msc` must queue, not fire immediately. The
+    /// drain at a vblank below the target keeps it queued; only the
+    /// vblank that crosses the threshold fires the CompleteNotify.
+    /// Xorg counterpart: NotifyMSC takes the same `present_execute`
+    /// path as PresentPixmap with no pixmap; the vblank queue gates
+    /// firing in both cases.
+    #[test]
+    fn notify_msc_target_msc_in_future_defers_until_vblank() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        const WINDOW: u32 = 0x100;
+        const EID: u32 = 0x0100_0031;
+        const SERIAL: u32 = 0x0100_0032;
+        const COMPLETE_NOTIFY_MASK: u32 = 0x2;
+
+        // SelectInput first.
+        let mut select_body = Vec::new();
+        select_body.extend_from_slice(&EID.to_le_bytes());
+        select_body.extend_from_slice(&WINDOW.to_le_bytes());
+        select_body.extend_from_slice(&COMPLETE_NOTIFY_MASK.to_le_bytes());
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 145,
+                data: yserver_protocol::x11::present::SELECT_INPUT,
+                length_units: 4,
+            },
+            &select_body,
+            None,
+        )
+        .expect("Present SelectInput");
+
+        // NotifyMSC with target_msc = 5 (future).
+        let mut notify_body = Vec::new();
+        notify_body.extend_from_slice(&WINDOW.to_le_bytes());
+        notify_body.extend_from_slice(&SERIAL.to_le_bytes());
+        notify_body.extend_from_slice(&0_u32.to_le_bytes()); // pad
+        notify_body.extend_from_slice(&5_u64.to_le_bytes()); // target_msc
+        notify_body.extend_from_slice(&0_u64.to_le_bytes()); // divisor
+        notify_body.extend_from_slice(&0_u64.to_le_bytes()); // remainder
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(2),
+            RequestHeader {
+                opcode: 145,
+                data: yserver_protocol::x11::present::NOTIFY_MSC,
+                length_units: 10,
+            },
+            &notify_body,
+            None,
+        )
+        .expect("Present NotifyMSC");
+
+        // Must be queued, not fired.
+        assert_eq!(
+            state.pending_complete_notify.len(),
+            1,
+            "NotifyMSC must enqueue and defer firing"
+        );
+        peer.set_nonblocking(true).expect("nonblocking");
+        let mut leftover = [0u8; 1];
+        match peer.read(&mut leftover) {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            other => panic!("NotifyMSC must not fire before vblank; got {other:?}"),
+        }
+        peer.set_nonblocking(false).expect("blocking");
+
+        // Vblank at msc=3 — still below target, no fire.
+        super::drain_pending_complete_notify_for_flip(&mut state, 3, 0);
+        assert_eq!(state.pending_complete_notify.len(), 1);
+
+        // Vblank at msc=5 — fires.
+        super::drain_pending_complete_notify_for_flip(&mut state, 5, 77_777);
+        assert!(state.pending_complete_notify.is_empty());
+
+        let mut complete = [0u8; 40];
+        peer.read_exact(&mut complete).expect("CompleteNotify");
+        assert_eq!(complete[0], 35);
+        assert_eq!(complete[1], 145);
+        assert_eq!(
+            complete[10],
+            yserver_protocol::x11::present::COMPLETE_KIND_NOTIFY_MSC
+        );
+        assert_eq!(
+            u64::from_le_bytes([
+                complete[24],
+                complete[25],
+                complete[26],
+                complete[27],
+                complete[28],
+                complete[29],
+                complete[30],
+                complete[31],
+            ]),
+            77_777
+        );
+        assert_eq!(
+            u64::from_le_bytes([
+                complete[32],
+                complete[33],
+                complete[34],
+                complete[35],
+                complete[36],
+                complete[37],
+                complete[38],
+                complete[39],
+            ]),
+            5
+        );
+    }
+
+    /// T4 (Present pacing): CompleteNotify entries with a non-zero
+    /// `target_msc` must NOT fire until the CRTC's MSC catches up.
+    /// Xorg reference: `present_execute` only calls
+    /// `present_execute_post` (which fires CompleteNotify) once the
+    /// vblank handler's `crtc_msc` is at or past `target_msc` (see
+    /// `present_get_target_msc` + `present_queue_vblank` in
+    /// `present_scmd.c`). Pre-T4 the drain fired every queued entry
+    /// regardless of target — this test pins the new gating.
+    #[test]
+    fn complete_notify_target_msc_gates_drain() {
+        use crate::backend::{CompletedPresentEvent, PresentWake};
+        use yserver_protocol::x11::present as x11present;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        const WINDOW: u32 = 0x100;
+        const EID: u32 = 0x0100_0021;
+        const SERIAL: u32 = 0x0100_0022;
+        const COMPLETE_NOTIFY_MASK: u32 = 0x2;
+
+        state.present_event_selections.insert(
+            EID,
+            crate::server::PresentEventSelection {
+                owner: ClientId(1),
+                window: ResourceId(WINDOW),
+                event_mask: COMPLETE_NOTIFY_MASK,
+            },
+        );
+
+        // Enqueue with target_msc = 42.
+        super::fire_present_completion_events(
+            &mut state,
+            &CompletedPresentEvent {
+                client_id: ClientId(1),
+                serial: SERIAL,
+                host_xid: 0x222,
+                dst_host_xid: WINDOW,
+                options: 0,
+                wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+                target_msc: 42,
+            },
+        );
+        assert_eq!(state.pending_complete_notify.len(), 1);
+
+        // Premature vblank at msc=10 — must NOT fire; entry stays queued.
+        super::drain_pending_complete_notify_for_flip(&mut state, 10, 0);
+        assert_eq!(
+            state.pending_complete_notify.len(),
+            1,
+            "drain at msc<target_msc must leave entry queued"
+        );
+
+        peer.set_nonblocking(true).expect("nonblocking");
+        let mut leftover = [0u8; 1];
+        match peer.read(&mut leftover) {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            other => panic!("no CompleteNotify expected at msc=10; got {other:?}"),
+        }
+        peer.set_nonblocking(false).expect("blocking");
+
+        // Vblank at msc=42 — entry fires now.
+        super::drain_pending_complete_notify_for_flip(&mut state, 42, 999_999);
+        assert!(state.pending_complete_notify.is_empty());
+
+        let mut complete = [0u8; 40];
+        peer.read_exact(&mut complete).expect("CompleteNotify");
+        assert_eq!(complete[0], 35);
+        assert_eq!(complete[1], 145);
+        assert_eq!(
+            u16::from_le_bytes([complete[8], complete[9]]),
+            u16::from(x11present::EVENT_COMPLETE_NOTIFY)
+        );
+        assert_eq!(
+            u64::from_le_bytes([
+                complete[24],
+                complete[25],
+                complete[26],
+                complete[27],
+                complete[28],
+                complete[29],
+                complete[30],
+                complete[31],
+            ]),
+            999_999
+        );
+        assert_eq!(
+            u64::from_le_bytes([
+                complete[32],
+                complete[33],
+                complete[34],
+                complete[35],
+                complete[36],
+                complete[37],
+                complete[38],
+                complete[39],
+            ]),
+            42
+        );
+    }
+
+    #[test]
+    fn complete_notify_defers_to_next_pageflip_and_uses_kernel_msc_ust() {
+        use crate::backend::{CompletedPresentEvent, PresentWake};
+        use yserver_protocol::x11::present as x11present;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        const WINDOW: u32 = 0x100;
+        const EID: u32 = 0x0100_0011;
+        const SERIAL: u32 = 0x0100_0012;
+        const PIXMAP: u32 = 0x0100_0013;
+        const IDLE_FENCE: u32 = 0x0100_0014;
+        const COMPLETE_NOTIFY_MASK: u32 = 0x2;
+        const IDLE_NOTIFY_MASK: u32 = 0x4;
+
+        // SelectInput with BOTH masks so we can prove IdleNotify
+        // fires now and CompleteNotify doesn't.
+        state.present_event_selections.insert(
+            EID,
+            crate::server::PresentEventSelection {
+                owner: ClientId(1),
+                window: ResourceId(WINDOW),
+                event_mask: COMPLETE_NOTIFY_MASK | IDLE_NOTIFY_MASK,
+            },
+        );
+
+        let event = CompletedPresentEvent {
+            client_id: ClientId(1),
+            serial: SERIAL,
+            host_xid: PIXMAP,
+            dst_host_xid: WINDOW,
+            options: 0,
+            wake: PresentWake::Pixmap {
+                idle_fence_xid: IDLE_FENCE,
+            },
+            target_msc: 0,
+        };
+
+        super::fire_present_completion_events(&mut state, &event);
+
+        // IdleNotify is a 32-byte XGE (no extra payload past the
+        // header); CompleteNotify is 40 bytes (length=2 = 8 extra
+        // bytes for ust/msc).
+        let mut idle = [0u8; 32];
+        peer.read_exact(&mut idle).expect("IdleNotify event");
+        assert_eq!(idle[0], 35, "GenericEvent header");
+        assert_eq!(idle[1], 145, "Present extension major opcode");
+        assert_eq!(
+            u16::from_le_bytes([idle[8], idle[9]]),
+            u16::from(x11present::EVENT_IDLE_NOTIFY),
+            "first deferred event should be IdleNotify"
+        );
+
+        peer.set_nonblocking(true).expect("set_nonblocking");
+        let mut leftover = [0u8; 1];
+        match peer.read(&mut leftover) {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            other => {
+                panic!("CompleteNotify must remain pending until pageflip retire, got {other:?}")
+            }
+        }
+        peer.set_nonblocking(false).expect("set_blocking");
+        assert_eq!(state.pending_complete_notify.len(), 1);
+
+        // Pageflip retire with kernel-reported (msc, ust). Drain.
+        super::drain_pending_complete_notify_for_flip(&mut state, 42, 123_456);
+        assert!(state.pending_complete_notify.is_empty());
+
+        let mut complete = [0u8; 40];
+        peer.read_exact(&mut complete)
+            .expect("CompleteNotify event");
+        assert_eq!(complete[0], 35);
+        assert_eq!(complete[1], 145);
+        assert_eq!(
+            u16::from_le_bytes([complete[8], complete[9]]),
+            u16::from(x11present::EVENT_COMPLETE_NOTIFY)
+        );
+        assert_eq!(complete[10], x11present::COMPLETE_KIND_PIXMAP);
+        assert_eq!(complete[11], x11present::COMPLETE_MODE_COPY);
+        assert_eq!(
+            u32::from_le_bytes([complete[12], complete[13], complete[14], complete[15]]),
+            EID
+        );
+        assert_eq!(
+            u32::from_le_bytes([complete[16], complete[17], complete[18], complete[19]]),
+            WINDOW
+        );
+        assert_eq!(
+            u32::from_le_bytes([complete[20], complete[21], complete[22], complete[23]]),
+            SERIAL
+        );
+        // ust (u64 at offset 24) — pre-T3 fired with 0, post-T3 with
+        // the kernel timestamp microseconds.
+        assert_eq!(
+            u64::from_le_bytes([
+                complete[24],
+                complete[25],
+                complete[26],
+                complete[27],
+                complete[28],
+                complete[29],
+                complete[30],
+                complete[31],
+            ]),
+            123_456
+        );
+        // msc (u64 at offset 32) — pre-T3 fired with the software
+        // counter; post-T3 with the kernel vblank sequence.
+        assert_eq!(
+            u64::from_le_bytes([
+                complete[32],
+                complete[33],
+                complete[34],
+                complete[35],
+                complete[36],
+                complete[37],
+                complete[38],
+                complete[39],
+            ]),
+            42
+        );
+    }
+
     #[test]
     fn present_notify_msc_immediate_sends_complete_notify() {
         let mut state = ServerState::new();
@@ -17310,6 +17679,16 @@ mod tests {
             None,
         )
         .expect("Present NotifyMSC");
+
+        // T5: NotifyMSC enqueues rather than firing synchronously.
+        // For a non-vblank-paced backend (RecordingBackend, ynest),
+        // `run::drain_present_completions` flushes the queue with
+        // `(msc=0, ust=0)` immediately after returning from
+        // `process_request`. Simulate that drain here so the test
+        // still exercises "client gets a CompleteNotify when its
+        // request is satisfied".
+        assert_eq!(state.pending_complete_notify.len(), 1);
+        super::drain_pending_complete_notify_for_flip(&mut state, 0, 0);
 
         let mut event = [0u8; 40];
         peer.read_exact(&mut event).expect("CompleteNotify event");

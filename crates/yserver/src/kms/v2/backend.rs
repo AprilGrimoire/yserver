@@ -181,6 +181,36 @@ pub struct KmsBackendV2 {
     /// §"`KmsCore` scope — narrowly drawn" split.
     pub(crate) cow_id: Option<crate::kms::v2::store::DrawableId>,
 
+    /// T2 (Present pacing): per-CRTC `(msc, ust)` pair, keyed by v2
+    /// `output_idx`. Updated on every page-flip completion from the
+    /// kernel-reported vblank sequence and timestamp; consumed by
+    /// `present_get_ust_msc` to drive Xorg-style Present completion
+    /// (CompleteNotify/NotifyMSC fire at the real vblank with real
+    /// values rather than synthesized "fire now" pseudovalues).
+    ///
+    /// Entry absence ↔ no pageflip has retired on that CRTC yet;
+    /// `present_get_ust_msc` returns `(0, Duration::ZERO)` for that
+    /// case (matches Xorg behavior before the first scanout).
+    pub(crate) crtc_ust_msc: std::collections::HashMap<usize, (u64, std::time::Duration)>,
+
+    /// T3 (Present pacing): FIFO of pageflip retirements observed
+    /// since the last `drain_recent_page_flips`. Each entry carries
+    /// `(msc, ust_micros)` for the CRTC that just retired. Drained
+    /// per iteration by `run::drain_present_completions` to fire
+    /// queued CompleteNotify events with kernel-real timestamps.
+    /// T7 will widen the tuple with `output_idx` for the
+    /// window→CRTC routing layer.
+    pub(crate) recent_page_flips: Vec<(u64, u64)>,
+
+    /// T6 (idle-case MSC advance): dedup gate for
+    /// `request_next_vblank_event` — true while we've already asked
+    /// the kernel for the next vblank but haven't yet received the
+    /// completion. Cleared in `record_crtc_ust_msc` (which fires for
+    /// both pageflip and vblank events). Prevents an O(notifies)
+    /// `wait_vblank` ioctl storm when the queue is non-empty across
+    /// multiple loop iterations.
+    pub(crate) vblank_request_in_flight: bool,
+
     /// Cached readback of the current GC clip-mask pixmap (depth-1
     /// or depth-8). Populated at `set_clip_pixmap` time by reading
     /// the pixmap bytes via `engine.get_image`; consumed by
@@ -551,6 +581,9 @@ impl KmsBackendV2 {
             last_observed_pool_creates: 0,
             last_observed_pool_resets: 0,
             cow_id: None,
+            crtc_ust_msc: std::collections::HashMap::new(),
+            recent_page_flips: Vec::new(),
+            vblank_request_in_flight: false,
             clip_mask_cache: None,
             kms_outputs_active: true,
             clear_window_area_calls: 0,
@@ -670,6 +703,9 @@ impl KmsBackendV2 {
             last_observed_pool_creates: 0,
             last_observed_pool_resets: 0,
             cow_id: None,
+            crtc_ust_msc: std::collections::HashMap::new(),
+            recent_page_flips: Vec::new(),
+            vblank_request_in_flight: false,
             clip_mask_cache: None,
             kms_outputs_active: true,
             clear_window_area_calls: 0,
@@ -1151,6 +1187,14 @@ impl KmsBackendV2 {
     /// overlay frame can arrive before `GetOverlayWindow` finishes,
     /// leaving the scene in non-authoritative mode even though the
     /// compositor is already active.
+    ///
+    /// T9 (root-composite): also fires for Mutter/Cinnamon — a
+    /// compositor that owns `RedirectSubwindows(root, Manual)` and
+    /// Presents into a reparented stage whose drawing resolves to
+    /// root. Without this branch, scanout would walk all
+    /// redirected top-levels on top of cinnamon's composited root
+    /// and hide its polkit-agent dim + dialog (the
+    /// "dialog under window" symptom).
     fn arm_cow_from_recent_present_if_needed(&mut self) {
         let Some(cow_id) = self.cow_id else {
             return;
@@ -1229,6 +1273,9 @@ impl KmsBackendV2 {
             last_observed_pool_creates: 0,
             last_observed_pool_resets: 0,
             cow_id: None,
+            crtc_ust_msc: std::collections::HashMap::new(),
+            recent_page_flips: Vec::new(),
+            vblank_request_in_flight: false,
             clip_mask_cache: None,
             kms_outputs_active: true,
             clear_window_area_calls: 0,
@@ -2434,6 +2481,53 @@ impl KmsBackendV2 {
         self.store.get_by_xid(host_xid).is_some()
     }
 
+    /// T2/T3 (Present pacing): single-source update on a pageflip
+    /// retire. Writes the latest `(msc, ust)` into `crtc_ust_msc`
+    /// (consumed by `present_get_ust_msc`) AND pushes the event
+    /// onto `recent_page_flips` (drained by
+    /// `drain_recent_page_flips` so the run loop can fire queued
+    /// CompleteNotify events with real timestamps).
+    ///
+    /// Called from `on_page_flip_ready` with kernel-reported values
+    /// (production) and from `note_page_flip_complete_for_tests`
+    /// (regression tests that don't pump real DRM events).
+    pub(crate) fn record_crtc_ust_msc(
+        &mut self,
+        output_idx: usize,
+        msc: u64,
+        ust: std::time::Duration,
+    ) {
+        self.crtc_ust_msc.insert(output_idx, (msc, ust));
+        // T3: `(msc, ust_micros)` queued for the present-completion
+        // drain. Cast saturates rather than wraps — a u64-microsecond
+        // representation lasts ~580k years, so reaching saturation
+        // means the kernel timestamp got corrupted.
+        #[allow(clippy::cast_possible_truncation)]
+        let ust_micros: u64 = ust.as_micros() as u64;
+        self.recent_page_flips.push((msc, ust_micros));
+        // T6 (idle-case MSC advance): clear the dedup gate so the
+        // next iteration can request another vblank if pending
+        // notifies remain. We can't distinguish pageflip vs
+        // requested-vblank here, but that's fine — both signal
+        // "this CRTC's MSC advanced", which is exactly what
+        // `request_next_vblank_event` was waiting for.
+        self.vblank_request_in_flight = false;
+    }
+
+    /// T2 test-only injector: write a synthetic `(msc, ust)` into
+    /// per-CRTC state without going through the DRM event loop.
+    /// Used by Present-pacing regression tests so they can drive
+    /// `present_get_ust_msc` without a real device.
+    #[doc(hidden)]
+    pub fn note_page_flip_complete_for_tests(
+        &mut self,
+        output_idx: usize,
+        msc: u64,
+        ust: std::time::Duration,
+    ) {
+        self.record_crtc_ust_msc(output_idx, msc, ust);
+    }
+
     /// Phase A T7: simulate the pageflip-retire frame-boundary flush
     /// without going through `on_page_flip_ready` (which calls
     /// `drain_page_flip_events` and would error on the test fixture's
@@ -2763,6 +2857,7 @@ impl KmsBackendV2 {
                 dst_host_xid: 0,
                 options: 0,
                 wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+                target_msc: 0,
             },
         };
         self.engine
@@ -2964,6 +3059,7 @@ impl KmsBackendV2 {
                 dst_host_xid: 0,
                 options: 0,
                 wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+                target_msc: 0,
             },
         };
         self.engine
@@ -6549,11 +6645,16 @@ impl Backend for KmsBackendV2 {
                 return;
             }
         };
-        for output_idx in flipped {
-            if self
-                .scene
-                .handle_page_flip_complete(output_idx, &mut self.store, &mut self.platform)
-            {
+        for completion in flipped {
+            // T2: route kernel MSC/UST into per-CRTC state so the
+            // Present extension can later fire CompleteNotify with
+            // real values (Xorg `get_ust_msc` semantics).
+            self.record_crtc_ust_msc(completion.output_idx, completion.msc, completion.ust);
+            if self.scene.handle_page_flip_complete(
+                completion.output_idx,
+                &mut self.store,
+                &mut self.platform,
+            ) {
                 self.telemetry.record_frame_present();
             }
         }
@@ -11699,6 +11800,63 @@ impl Backend for KmsBackendV2 {
         }
     }
 
+    fn present_get_ust_msc(&self, _window: u32) -> (u64, std::time::Duration) {
+        // T2: single-output fallback — pick output 0's most-recently
+        // retired (msc, ust). T7 replaces `_window` with a real
+        // window→CRTC mapping so multi-monitor compositors get the
+        // correct CRTC's clock. Pre-first-pageflip returns
+        // (0, ZERO), matching Xorg's behavior before the first scanout.
+        self.crtc_ust_msc
+            .get(&0)
+            .copied()
+            .unwrap_or((0, std::time::Duration::ZERO))
+    }
+
+    fn drain_recent_page_flips(&mut self) -> Vec<(u64, u64)> {
+        // T3: hand the per-iteration retirement ring to the run loop.
+        // `record_crtc_ust_msc` pushes during `on_page_flip_ready`;
+        // the drain clears the Vec so each entry fires CompleteNotify
+        // exactly once.
+        std::mem::take(&mut self.recent_page_flips)
+    }
+
+    fn has_vblank_pacing(&self) -> bool {
+        // T3: the v2 KMS backend drives real per-CRTC vblanks.
+        // Returning true tells the run loop to defer CompleteNotify
+        // until a `drain_recent_page_flips` entry arrives instead
+        // of flushing on every GPU-completion drain.
+        true
+    }
+
+    fn request_next_vblank_event(&mut self) -> std::io::Result<bool> {
+        // T6 (idle-case MSC advance): ask the kernel for an event
+        // at the next vblank on CRTC 0. T7 will replace the fixed
+        // index with a per-window CRTC pick. `wait_vblank` with
+        // EVENT flag returns immediately; the actual completion
+        // arrives as `Event::Vblank` on the DRM fd and runs
+        // through the same `drain_events` → `record_crtc_ust_msc`
+        // pipeline that pageflips use.
+        if self.vblank_request_in_flight {
+            return Ok(false);
+        }
+        if !self.scanout_allowed() {
+            // Seat not Active (libseat suspended) — no DRM master,
+            // ioctls would fail. Treat as no-op rather than
+            // surfacing the EPERM up to the run loop's drain.
+            return Ok(false);
+        }
+        match crate::drm::page_flip::request_next_vblank_event(&self.platform.device, 0) {
+            Ok(()) => {
+                self.vblank_request_in_flight = true;
+                Ok(true)
+            }
+            Err(e) => {
+                log::warn!("v2 request_next_vblank_event: {e}");
+                Err(e)
+            }
+        }
+    }
+
     // ── Other extensions ────────────────────────────────────────
 
     fn xkb_proxy(
@@ -12379,6 +12537,32 @@ mod tests {
         assert_eq!(b.argb_colormap_xid(), Some(0x104));
     }
 
+    /// T2 (Present pacing): `present_get_ust_msc` returns the
+    /// most-recently retired pageflip's `(msc, ust)` for the CRTC,
+    /// or `(0, ZERO)` before the first flip. Xorg counterpart:
+    /// `present_screen_info::get_ust_msc`. Window argument is the
+    /// future T7 hook for the geometry-based CRTC pick; for T2 the
+    /// v2 impl returns output 0 unconditionally.
+    #[test]
+    fn present_get_ust_msc_tracks_pageflip_completion() {
+        let mut b = KmsBackendV2::for_tests();
+        // Pre-first-flip: zero values (matches Xorg pre-scanout).
+        assert_eq!(b.present_get_ust_msc(0x100), (0, std::time::Duration::ZERO));
+
+        b.note_page_flip_complete_for_tests(0, 42, std::time::Duration::from_micros(123_456));
+        assert_eq!(
+            b.present_get_ust_msc(0x100),
+            (42, std::time::Duration::from_micros(123_456))
+        );
+
+        // Subsequent flip overwrites — MSC strictly advances.
+        b.note_page_flip_complete_for_tests(0, 43, std::time::Duration::from_micros(140_000));
+        assert_eq!(
+            b.present_get_ust_msc(0x100),
+            (43, std::time::Duration::from_micros(140_000))
+        );
+    }
+
     /// Spec: "the first paint op produces a logged 'v2 not yet
     /// implemented' gap." Verify dedup — same op logs once even
     /// when called multiple times.
@@ -12423,6 +12607,7 @@ mod tests {
                 dst_host_xid: 0x1001,
                 options: 0,
                 wake: yserver_core::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
+                target_msc: 0,
             },
             0x1001,
         );

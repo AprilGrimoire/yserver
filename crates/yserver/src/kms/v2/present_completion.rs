@@ -95,6 +95,7 @@ mod tests {
             wake: PresentWake::Pixmap {
                 idle_fence_xid: 0xCC,
             },
+            target_msc: 0,
         };
         assert_eq!(event.serial, 42);
     }
