@@ -568,6 +568,21 @@ impl DrawableImage {
         }
     }
 
+    /// Borrow the retained dma-buf fd for an `Imported` backing, so the
+    /// implicit-sync bridge can `EXPORT_SYNC_FILE` against it per-copy
+    /// (see `kms::vk::dmabuf_sync`). `None` for `ServerOwned` backings
+    /// (no client dma-buf, hence no implicit producer fence to honor).
+    /// The fd's lifetime is owned by the `Imported` variant and is
+    /// closed on `DrawableImage::drop`.
+    #[must_use]
+    pub fn dma_buf_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        use std::os::fd::AsFd as _;
+        match &self.backing {
+            ImageBacking::ServerOwned { .. } => None,
+            ImageBacking::Imported { dma_buf_fd, .. } => Some(dma_buf_fd.as_fd()),
+        }
+    }
+
     /// Image view to bind when this BGRA mirror is sampled as a
     /// *source* for a picture format with no alpha mask (depth-24
     /// r8g8b8 / x8r8g8b8 pictures). The X RENDER spec says missing

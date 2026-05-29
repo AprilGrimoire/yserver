@@ -1500,6 +1500,16 @@ impl PlatformBackend {
 
     // ── Phase A: SubmitGroup API ─────────────────────────────────
 
+    /// Implicit dma-buf sync: queue a binary WAIT semaphore onto the
+    /// open submit group so the next `flush_submit_group`'s
+    /// `vkQueueSubmit2` waits on it before reading the imported source.
+    /// Caller (`RenderEngine::close_open_frame`) is responsible for
+    /// keeping the owning `Arc<OwnedSemaphore>` alive until the
+    /// submission retires — this takes the raw handle only.
+    pub(crate) fn add_submit_group_wait(&mut self, semaphore: vk::Semaphore) {
+        self.submit_group.add_wait(semaphore);
+    }
+
     /// Phase A: count of CBs pending in the open submit group. Tests
     /// + telemetry consult this; 0 when the group is empty.
     pub(crate) fn submit_group_size(&self) -> usize {
@@ -1568,7 +1578,7 @@ impl PlatformBackend {
             self.last_flush_outcome = Some(outcome);
             return Ok(outcome);
         }
-        let (entries, ticket) = self.submit_group.take();
+        let (entries, ticket, wait_semaphores) = self.submit_group.take();
         let n = entries.len();
         // entries is guaranteed non-empty here (early-returned above).
         let Some(vk) = self.vk.as_ref() else {
@@ -1606,13 +1616,29 @@ impl PlatformBackend {
                 })
             })
             .collect();
+        // Implicit dma-buf sync (read side): wait on each imported
+        // source buffer's producer fence before any CB in this submit
+        // reads it. Binary sync_file semaphores → single-use, one wait
+        // per submit (the open-frame accumulator already deduped by
+        // source). Wait at ALL_COMMANDS so both transfer copies and
+        // shader composites are gated.
+        let wait_infos: Vec<vk::SemaphoreSubmitInfo<'_>> = wait_semaphores
+            .iter()
+            .map(|s| {
+                vk::SemaphoreSubmitInfo::default()
+                    .semaphore(*s)
+                    .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            })
+            .collect();
         let submit = [{
-            let s = vk::SubmitInfo2::default().command_buffer_infos(&cb_infos);
-            if sig_infos.is_empty() {
-                s
-            } else {
-                s.signal_semaphore_infos(&sig_infos)
+            let mut s = vk::SubmitInfo2::default().command_buffer_infos(&cb_infos);
+            if !sig_infos.is_empty() {
+                s = s.signal_semaphore_infos(&sig_infos);
             }
+            if !wait_infos.is_empty() {
+                s = s.wait_semaphore_infos(&wait_infos);
+            }
+            s
         }];
         crate::vk_count!(queue_submit2);
         match unsafe {

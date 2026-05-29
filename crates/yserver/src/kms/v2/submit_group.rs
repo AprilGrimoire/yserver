@@ -52,6 +52,15 @@ pub(crate) struct SubmitGroup {
     /// `MaxSize` flush. Phase B Invariant M1: default 1 for the
     /// duration of B.1–B.4; recovers at B.5.
     max_size: usize,
+    /// Implicit dma-buf sync: WAIT semaphores threaded into the
+    /// eventual `vkQueueSubmit2`'s `wait_semaphore_infos`. Each is a
+    /// binary semaphore imported from a producer's `EXPORT_SYNC_FILE`
+    /// fence (see `kms::vk::dmabuf_sync`). The engine's per-open-frame
+    /// wait accumulator deposits the raw handles here at frame close,
+    /// just before `flush`; `take()` drains them so each submit waits
+    /// exactly once. The owning `Arc<OwnedSemaphore>`s are pinned on
+    /// the frame's retirement record — these are raw handles only.
+    pending_waits: Vec<vk::Semaphore>,
 }
 
 impl SubmitGroup {
@@ -69,7 +78,21 @@ impl SubmitGroup {
             entries: Vec::new(),
             ticket: None,
             max_size: 1,
+            pending_waits: Vec::new(),
         }
+    }
+
+    /// Implicit dma-buf sync: queue a binary WAIT semaphore for the
+    /// next flush's `vkQueueSubmit2`. Deposited by the engine's
+    /// per-open-frame wait accumulator at frame close. Drained by
+    /// [`Self::take`].
+    pub(crate) fn add_wait(&mut self, semaphore: vk::Semaphore) {
+        self.pending_waits.push(semaphore);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_wait_count(&self) -> usize {
+        self.pending_waits.len()
     }
 
     /// Test helper: override the cap. Production-side cap is bumped
@@ -119,11 +142,16 @@ impl SubmitGroup {
         self.entries.push(GroupEntry { cb, signal });
     }
 
-    /// Take all buffered entries + the shared ticket, leaving the
-    /// group empty. Caller (PlatformBackend::flush_submit_group)
-    /// performs the `vkQueueSubmit2` against the returned data.
-    pub(crate) fn take(&mut self) -> (Vec<GroupEntry>, Option<FenceTicket>) {
-        (std::mem::take(&mut self.entries), self.ticket.take())
+    /// Take all buffered entries + the shared ticket + the queued WAIT
+    /// semaphores, leaving the group empty. Caller
+    /// (`PlatformBackend::flush_submit_group`) performs the
+    /// `vkQueueSubmit2` against the returned data.
+    pub(crate) fn take(&mut self) -> (Vec<GroupEntry>, Option<FenceTicket>, Vec<vk::Semaphore>) {
+        (
+            std::mem::take(&mut self.entries),
+            self.ticket.take(),
+            std::mem::take(&mut self.pending_waits),
+        )
     }
 }
 
@@ -176,11 +204,26 @@ mod tests {
         let mut g = SubmitGroup::new();
         g.append(fake_cb(1), None);
         g.append(fake_cb(2), Some(fake_sem(7)));
-        let (entries, ticket) = g.take();
+        let (entries, ticket, waits) = g.take();
         assert_eq!(entries.len(), 2);
         assert!(ticket.is_none(), "no ticket was seeded in this fixture");
+        assert!(waits.is_empty(), "no waits queued in this fixture");
         assert_eq!(g.size(), 0);
         assert!(!g.is_open());
+    }
+
+    #[test]
+    fn add_wait_queues_semaphores_drained_by_take() {
+        let mut g = SubmitGroup::new();
+        g.append(fake_cb(1), None);
+        g.add_wait(fake_sem(0x5e1));
+        g.add_wait(fake_sem(0x5e2));
+        assert_eq!(g.pending_wait_count(), 2);
+        let (_, _, waits) = g.take();
+        assert_eq!(waits.len(), 2);
+        assert_eq!(waits[0], fake_sem(0x5e1));
+        assert_eq!(waits[1], fake_sem(0x5e2));
+        assert_eq!(g.pending_wait_count(), 0, "take drains the wait queue");
     }
 
     #[test]
@@ -188,7 +231,7 @@ mod tests {
         let mut g = SubmitGroup::new();
         g.append(fake_cb(1), None);
         g.append(fake_cb(2), Some(fake_sem(42)));
-        let (entries, _) = g.take();
+        let (entries, _, _) = g.take();
         assert_eq!(entries[0].signal, None);
         assert_eq!(entries[1].signal, Some(fake_sem(42)));
     }

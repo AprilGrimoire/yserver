@@ -1678,6 +1678,18 @@ impl RenderEngine {
             });
         }
 
+        // Implicit dma-buf sync (read-side gate): thread this frame's
+        // accumulated producer-fence WAIT semaphores into the submit so
+        // the GPU waits for each imported source's outstanding writes
+        // before reading it. Deposit raw handles now (just before
+        // flush); the owning Arcs are pinned on the FrameSubmittedRecord
+        // below so they outlive the GPU submission. One import per
+        // source (deduped in the accumulator); the single submit waits
+        // on each once.
+        for sem in open_frame.dmabuf_read_waits.values() {
+            platform.add_submit_group_wait(sem.semaphore());
+        }
+
         // Drive the actual vkQueueSubmit2 via engine's flush_submit_group wrapper.
         let flush_outcome =
             self.flush_submit_group(platform, super::submit_group::FlushReason::FrameBuilder);
@@ -1749,6 +1761,13 @@ impl RenderEngine {
                             ticket: frame_ticket.clone(),
                             pins: std::mem::take(&mut open_frame.pins),
                             frame_seq,
+                            // Implicit dma-buf sync: pin the producer-fence WAIT
+                            // semaphores until this frame's ticket signals. The
+                            // GPU references them until then; OwnedSemaphore::drop
+                            // (on record drop in poll_retired) destroys each.
+                            dmabuf_read_waits: std::mem::take(&mut open_frame.dmabuf_read_waits)
+                                .into_values()
+                                .collect(),
                         });
                     commit_close_success(
                         inner,
@@ -3059,7 +3078,84 @@ impl RenderEngine {
                 layout_updates,
             );
         }
+        // Implicit dma-buf sync (read-side gate): if the SOURCE drawable
+        // is a DRI3-imported dma-buf, the producer (e.g. Firefox's GPU)
+        // uses IMPLICIT sync — there is no explicit X11 wait_fence. We
+        // must bridge the buffer's current implicit fence into a WAIT
+        // semaphore on THIS frame's submit, or we read while the
+        // producer is still writing → intermittent blank/torn frames.
+        self.accumulate_dmabuf_read_wait(store, src);
         Ok(())
+    }
+
+    /// Implicit dma-buf sync read-side gate. If `src` is a
+    /// DRI3-imported dma-buf and we have not already exported its
+    /// producer fence in the current open frame, `EXPORT_SYNC_FILE`
+    /// the buffer's implicit READ fence, import it as a binary
+    /// `VkSemaphore`, and deposit it in the open frame's
+    /// `dmabuf_read_waits` accumulator keyed by `src`.
+    ///
+    /// Dedup-by-source is the load-bearing rule: a sync_file binary
+    /// semaphore is single-use and the frame's one `vkQueueSubmit2`
+    /// waits on it once before all sub-rect CBs — re-exporting per
+    /// sub-rect would be wrong (see `OpenFrame::dmabuf_read_waits`).
+    ///
+    /// Buffer-idle (`EXPORT_SYNC_FILE` yields no fence) → skip, nothing
+    /// to wait on. ioctl/import failure → warn + skip (degrade to the
+    /// pre-fix behavior rather than dropping the copy); the worst case
+    /// is the same intermittent blank we are fixing, never a crash.
+    fn accumulate_dmabuf_read_wait(&mut self, store: &DrawableStore, src: DrawableId) {
+        let Some(inner) = self.inner.as_mut() else {
+            return;
+        };
+        // Dedup: first sub-rect of this source per frame does the work.
+        if inner
+            .frame_builder
+            .open
+            .as_ref()
+            .expect("open")
+            .dmabuf_read_waits
+            .contains_key(&src)
+        {
+            return;
+        }
+        let Some(dmabuf_fd) = store.get(src).and_then(|d| d.storage.imported_dma_buf_fd()) else {
+            // Not a DRI3 import — server-owned source has no implicit
+            // producer fence.
+            return;
+        };
+        let sync_fd = match crate::kms::vk::dmabuf_sync::export_read_sync_file(dmabuf_fd) {
+            Ok(Some(fd)) => fd,
+            Ok(None) => return, // buffer idle — nothing to wait on
+            Err(e) => {
+                log::warn!(
+                    "dma-buf implicit-sync: EXPORT_SYNC_FILE(READ) failed for src={src:?}: {e}; \
+                     proceeding without producer-fence wait"
+                );
+                return;
+            }
+        };
+        let semaphore = match crate::kms::vk::sync::import_sync_file(&inner.vk, sync_fd) {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!(
+                    "dma-buf implicit-sync: import_sync_file failed for src={src:?}: {e:?}; \
+                     proceeding without producer-fence wait"
+                );
+                return;
+            }
+        };
+        let owned = Arc::new(super::owned_semaphore::OwnedSemaphore::new(
+            inner.vk.clone(),
+            semaphore,
+        ));
+        inner
+            .frame_builder
+            .open
+            .as_mut()
+            .expect("open")
+            .dmabuf_read_waits
+            .insert(src, owned);
     }
 
     // ── Op: cow_copy_area (Stage 5 Task 3 POC) ──────────────────

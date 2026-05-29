@@ -194,6 +194,17 @@ impl Storage {
         }
     }
 
+    /// Borrow the retained dma-buf fd when this storage is a DRI3
+    /// import. Returns `None` for server-owned / pooled storage.
+    /// Used by the implicit-sync read-side gate
+    /// (`RenderEngine::copy_area`) to `EXPORT_SYNC_FILE` the producer's
+    /// fence before reading the imported buffer.
+    pub(crate) fn imported_dma_buf_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        self.imported_drawable
+            .as_ref()
+            .and_then(crate::kms::vk::target::DrawableImage::dma_buf_fd)
+    }
+
     /// Stage 3f.10: pool-take constructor. Reuses a recycled
     /// `PooledPixmapImage` triple (image + memory + view) +
     /// inherits the pool entry's tracked layout so subsequent

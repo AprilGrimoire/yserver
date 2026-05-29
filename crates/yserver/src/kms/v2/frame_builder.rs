@@ -203,6 +203,7 @@ impl FrameBuilder {
             close_reason_on_open: None,
             opened_at: Instant::now(),
             pending_present_completions: Vec::new(), // NEW (B.3 N10)
+            dmabuf_read_waits: std::collections::HashMap::new(),
         }));
     }
 
@@ -348,6 +349,24 @@ pub(crate) struct OpenFrame {
                   before Task 4's atomic cow_copy_area rewrite."
     )]
     pub(crate) pending_present_completions: Vec<super::present_completion::PendingPresentEntry>,
+    /// Implicit dma-buf sync (read-side gate). Per-open-frame WAIT
+    /// accumulator keyed by the SOURCE imported-dma-buf drawable. The
+    /// FIRST `engine.copy_area` reading a given imported source in this
+    /// frame does `EXPORT_SYNC_FILE(READ)` + `import_sync_file` ONCE and
+    /// inserts the binary `Arc<OwnedSemaphore>` here; later sub-rects of
+    /// the same source reuse it (no re-export).
+    ///
+    /// LOAD-BEARING INVARIANT (codex-verified): **one open frame == one
+    /// `vkQueueSubmit2`** (`close_open_frame → flush_submit_group`;
+    /// `copy_area` never submits itself). A sync_file binary semaphore
+    /// is SINGLE-USE — the one submit waits on it once before all CBs
+    /// run, which correctly gates every sub-rect copy of that source.
+    /// Sharing one import across all sub-rects is correct ONLY under
+    /// this invariant. If a future change splits one open frame across
+    /// multiple submits, re-export per submit (or switch to a timeline
+    /// semaphore). See `docs/plans/2026-05-29-dri3-implicit-dmabuf-sync.md`.
+    pub(crate) dmabuf_read_waits:
+        std::collections::HashMap<DrawableId, Arc<super::owned_semaphore::OwnedSemaphore>>,
 }
 
 #[cfg(test)]
@@ -1636,6 +1655,7 @@ mod open_frame_tests {
             close_reason_on_open: None,
             opened_at: std::time::Instant::now(),
             pending_present_completions: Vec::new(),
+            dmabuf_read_waits: std::collections::HashMap::new(),
         };
         assert!(frame.ops.is_empty());
         assert_eq!(frame.pins.len(), 0);
@@ -1746,6 +1766,19 @@ pub(crate) struct FrameSubmittedRecord {
         reason = "B.2+ telemetry attribution; B.1 doesn't consume the per-record sequence number"
     )]
     pub(crate) frame_seq: u64,
+    /// Implicit dma-buf sync: the binary WAIT semaphores this frame's
+    /// `vkQueueSubmit2` waited on, pinned here until the frame's
+    /// `FenceTicket` signals. The GPU still references them after
+    /// submit returns; dropping them earlier is a use-after-free.
+    /// `poll_retired` / `drain_all` drop this record once the ticket
+    /// retires, and each `OwnedSemaphore::drop` then destroys its
+    /// `VkSemaphore`.
+    #[allow(
+        dead_code,
+        reason = "Drop-only ownership: pins the imported producer-fence semaphores until \
+                  the frame ticket signals (poll_retired drops the record)."
+    )]
+    pub(crate) dmabuf_read_waits: Vec<Arc<super::owned_semaphore::OwnedSemaphore>>,
 }
 
 /// Telemetry event published by `RenderEngine::close_open_frame` and

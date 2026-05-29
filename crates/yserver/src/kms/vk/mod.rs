@@ -10,6 +10,7 @@ pub mod call_stats;
 pub mod compositor;
 pub mod copy_scratch;
 pub mod device;
+pub mod dmabuf_sync;
 pub mod dri3;
 pub mod dst_readback;
 pub mod glyph;
