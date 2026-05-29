@@ -1686,6 +1686,31 @@ impl RenderEngine {
         // below so they outlive the GPU submission. One import per
         // source (deduped in the accumulator); the single submit waits
         // on each once.
+        //
+        // LOAD-BEARING INVARIANT (one frame == one submit): a sync_file
+        // binary VkSemaphore payload is single-use — the first wait
+        // consumes it, and a second wait on the same payload would block
+        // forever (or be UB). We import each producer fence ONCE per
+        // source per frame and rely on the whole frame collapsing into a
+        // SINGLE vkQueueSubmit2. If a future refactor split a frame's
+        // sub-rect copies across multiple submits, only the last submit
+        // (the one this flush drives) would carry these waits — earlier
+        // submits would read the imported dma-buf UNSYNCHRONIZED. The
+        // frame's lone CB was just appended to the SubmitGroup above, so
+        // the group MUST hold exactly that one entry here; anything else
+        // means the group was flushed mid-frame (split submit). The
+        // debug_assert trips a test instead of silently double-waiting /
+        // under-syncing in that case.
+        debug_assert_eq!(
+            platform.submit_group_size(),
+            1,
+            "dma-buf read-wait deposit assumes one frame == one vkQueueSubmit2: \
+             SubmitGroup must hold exactly the frame's single CB at deposit, \
+             but holds {} — a frame was split across multiple submits, which \
+             would leave earlier submits reading imported dma-bufs unsynced \
+             (the single-use binary sync_file semaphore only gates this submit)",
+            platform.submit_group_size(),
+        );
         for sem in open_frame.dmabuf_read_waits.values() {
             platform.add_submit_group_wait(sem.semaphore());
         }
