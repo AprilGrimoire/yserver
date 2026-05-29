@@ -5238,6 +5238,46 @@ fn handle_present_request(
                 const PRESENT_OPTION_ASYNC_MAY_TEAR: u32 = 0x8;
                 req.options & !PRESENT_OPTION_ASYNC_MAY_TEAR
             };
+            // INSTRUMENTATION (2026-05-29, wait_fence hypothesis check): on a
+            // BLANK Firefox run, do content-sized presents even arrive, and is
+            // the wait_fence un-triggered when we copy? Logs src kind+SIZE,
+            // wait_fence + our server-side triggered bit (caveat: that bit is
+            // set by SYNC TriggerFence; Mesa may trigger the xshmfence
+            // out-of-band, so `wait_triggered` reflects only what the server
+            // observed, not the true GPU/xshmfence state). Grep "PRESENT-INSTR".
+            {
+                let (src_kind, sw, sh) = match &src {
+                    Some(crate::resources::HostDrawableTarget::Pixmap {
+                        width,
+                        height,
+                        ..
+                    }) => ("pixmap", *width, *height),
+                    Some(_) => ("non-pixmap", 0, 0),
+                    None => ("unresolved", 0, 0),
+                };
+                let wait_triggered = if req.wait_fence == 0 {
+                    "no-fence".to_string()
+                } else {
+                    match state.sync_fences.get(&req.wait_fence) {
+                        Some(f) => format!("{}", f.triggered),
+                        None => "unknown-fence".to_string(),
+                    }
+                };
+                log::info!(
+                    "PRESENT-INSTR client {} #{} Pixmap serial={} src={} {}x{} \
+                     window=0x{:x} wait_fence=0x{:x} wait_triggered={} idle_fence=0x{:x}",
+                    client_id.0,
+                    sequence.0,
+                    req.serial,
+                    src_kind,
+                    sw,
+                    sh,
+                    req.window,
+                    req.wait_fence,
+                    wait_triggered,
+                    req.idle_fence,
+                );
+            }
             // Diagnostic: the copy below is gated on the source resolving to
             // a usable host pixmap and the window resolving to a host target.
             // The pixmap/window resource-existence checks already ran above
@@ -5513,6 +5553,38 @@ fn handle_present_request(
                     req.pixmap,
                     u16::from(header.data),
                     PRESENT_MAJOR_OPCODE,
+                );
+            }
+            // INSTRUMENTATION (2026-05-29): synced variant uses acquire_syncobj
+            // (explicit-sync timeline) as its wait. Log src kind+SIZE + the
+            // acquire/release syncobj so a blank run shows whether content-sized
+            // synced presents arrive and what sync points they carry.
+            // Grep "PRESENT-INSTR".
+            {
+                let (src_kind, sw, sh) = match &src {
+                    Some(crate::resources::HostDrawableTarget::Pixmap {
+                        width,
+                        height,
+                        ..
+                    }) => ("pixmap", *width, *height),
+                    Some(_) => ("non-pixmap", 0, 0),
+                    None => ("unresolved", 0, 0),
+                };
+                log::info!(
+                    "PRESENT-INSTR client {} #{} PixmapSynced serial={} src={} {}x{} \
+                     window=0x{:x} acquire_syncobj=0x{:x} acquire_value={} \
+                     release_syncobj=0x{:x} release_value={}",
+                    client_id.0,
+                    sequence.0,
+                    req.serial,
+                    src_kind,
+                    sw,
+                    sh,
+                    req.window,
+                    req.acquire_syncobj,
+                    req.acquire_value,
+                    req.release_syncobj,
+                    req.release_value,
                 );
             }
             // Same silent-drop diagnostic as the Present::Pixmap path: if the
