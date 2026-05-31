@@ -113,6 +113,28 @@ pub(crate) struct PaintTarget {
     pub(crate) offset: (i32, i32),
 }
 
+/// Test-only capture of the most recent `render_composite` dispatch
+/// to [`RenderEngine::render_composite`]. Populated unconditionally
+/// (always present) from `Backend::render_composite` right before
+/// the engine call, so tests can assert on the post-resolve
+/// `(src_id, src_x, src_y, dst_id, dst_x, dst_y)` tuple without
+/// needing a live Vk fixture. Mirrors the existing
+/// `clear_window_area_calls` / `engine_copy_area_calls` pattern:
+/// production paths don't observe it, but the bookkeeping write is
+/// branchless and cheap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RecordedCompositeArgs {
+    pub(crate) src_id: Option<crate::kms::v2::store::DrawableId>,
+    pub(crate) mask_id: Option<crate::kms::v2::store::DrawableId>,
+    pub(crate) dst_id: crate::kms::v2::store::DrawableId,
+    pub(crate) src_x: i32,
+    pub(crate) src_y: i32,
+    pub(crate) mask_x: i32,
+    pub(crate) mask_y: i32,
+    pub(crate) dst_x: i32,
+    pub(crate) dst_y: i32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TopLevelStackHint {
     Bottom,
@@ -215,6 +237,14 @@ pub struct KmsBackendV2 {
     /// empty and the loop never runs (counter = 0); post-fix the
     /// counter increments at least once.
     pub(crate) engine_copy_area_calls: u32,
+
+    /// Test-only capture of the most recent
+    /// `Backend::render_composite` dispatch — see
+    /// [`RecordedCompositeArgs`]. Populated unconditionally so the
+    /// systray-applet-redirect regression tests can assert on the
+    /// post-resolve `(src_id, src_x, src_y, …)` tuple without
+    /// needing a live Vk fixture. Production paths don't observe it.
+    pub(crate) last_render_composite_args: Option<RecordedCompositeArgs>,
 
     /// Diagnostic ring of recent `PRESENT::Pixmap` source xids
     /// targeted at COW. Captured via `note_present_pixmap` and
@@ -555,6 +585,7 @@ impl KmsBackendV2 {
             kms_outputs_active: true,
             clear_window_area_calls: 0,
             engine_copy_area_calls: 0,
+            last_render_composite_args: None,
             present_to_cow_sources: std::collections::VecDeque::with_capacity(16),
             recent_present_pixmaps: std::collections::VecDeque::with_capacity(32),
             dri3_xshmfences: HashMap::new(),
@@ -674,6 +705,7 @@ impl KmsBackendV2 {
             kms_outputs_active: true,
             clear_window_area_calls: 0,
             engine_copy_area_calls: 0,
+            last_render_composite_args: None,
             present_to_cow_sources: std::collections::VecDeque::with_capacity(16),
             recent_present_pixmaps: std::collections::VecDeque::with_capacity(32),
             dri3_xshmfences: HashMap::new(),
@@ -1233,6 +1265,7 @@ impl KmsBackendV2 {
             kms_outputs_active: true,
             clear_window_area_calls: 0,
             engine_copy_area_calls: 0,
+            last_render_composite_args: None,
             present_to_cow_sources: std::collections::VecDeque::with_capacity(16),
             recent_present_pixmaps: std::collections::VecDeque::with_capacity(32),
             dri3_xshmfences: HashMap::new(),
@@ -1388,12 +1421,6 @@ impl KmsBackendV2 {
         clippy::type_complexity,
         reason = "tuple shape mirrors resolve_picture_for_render plus a redirect offset; \
                   one-shot helper, not worth a named struct"
-    )]
-    #[allow(
-        dead_code,
-        reason = "introduced by Task 1.1 of the systray-applet redirect fix; \
-                  call sites in render_composite / render_fill_rectangles are \
-                  wired by subsequent tasks in the same plan"
     )]
     pub(crate) fn resolve_source_picture(
         &self,
@@ -9938,21 +9965,37 @@ impl Backend for KmsBackendV2 {
         if width == 0 || height == 0 {
             return Ok(());
         }
-        let Some((src_resolved, src_repeat, src_transform, _src_ca)) =
-            resolve_picture_for_render(&self.core, &self.store, host_src)
+        // Systray-applet fix (2026-05-31): use `resolve_source_picture`
+        // so source/mask pictures wrapping windows walk COMPOSITE
+        // redirect routing. For an unredirected drawable the offset is
+        // `(0, 0)` and behaviour matches the prior
+        // `resolve_picture_for_render` call; for a descendant of a
+        // redirected ancestor we sample the ANCESTOR's backing and pick
+        // up the descendant's offset within that backing.
+        let Some((src_resolved, src_repeat, src_transform, _src_ca, src_offset)) =
+            self.resolve_source_picture(host_src)
         else {
             log::debug!("v2 render_composite gap: host_src 0x{host_src:x} not resolvable");
             return Ok(());
         };
-        let (mask_resolved, mask_repeat, mask_transform, mask_component_alpha) = if host_mask == 0 {
-            (ResolvedSource::None, Repeat::None, None, false)
-        } else {
-            let Some(t) = resolve_picture_for_render(&self.core, &self.store, host_mask) else {
-                log::debug!("v2 render_composite gap: host_mask 0x{host_mask:x} not resolvable");
-                return Ok(());
+        let (mask_resolved, mask_repeat, mask_transform, mask_component_alpha, mask_offset) =
+            if host_mask == 0 {
+                (
+                    ResolvedSource::None,
+                    Repeat::None,
+                    None,
+                    false,
+                    (0_i32, 0_i32),
+                )
+            } else {
+                let Some(t) = self.resolve_source_picture(host_mask) else {
+                    log::debug!(
+                        "v2 render_composite gap: host_mask 0x{host_mask:x} not resolvable"
+                    );
+                    return Ok(());
+                };
+                t
             };
-            t
-        };
         let Some((dst_host_xid, dst_clip)) = resolve_dst_picture_for_render(&self.core, host_dst)
         else {
             log::debug!("v2 render_composite gap: host_dst 0x{host_dst:x} not a Drawable picture");
@@ -10006,16 +10049,45 @@ impl Backend for KmsBackendV2 {
             mask_translation,
         );
 
+        // Sample-coord translation: when src/mask wraps a descendant of
+        // a redirected ancestor, `src_offset` is the descendant's
+        // position within the ancestor's backing — add it to the
+        // client-provided sample origin so the engine reads the right
+        // sub-region. Dst offset already accounts for redirect via
+        // `dst_target.offset`. NOTE (per plan §Task 2.1): client-clip
+        // `src_translation` / `mask_translation` above are deliberately
+        // left untouched; Task 2.3 audits that path separately.
         let rect = crate::kms::vk::ops::render::CompositeRect {
-            src_x: i32::from(src_x),
-            src_y: i32::from(src_y),
-            mask_x: i32::from(mask_x),
-            mask_y: i32::from(mask_y),
+            src_x: i32::from(src_x) + src_offset.0,
+            src_y: i32::from(src_y) + src_offset.1,
+            mask_x: i32::from(mask_x) + mask_offset.0,
+            mask_y: i32::from(mask_y) + mask_offset.1,
             dst_x: i32::from(dst_x) + dst_target.offset.0,
             dst_y: i32::from(dst_y) + dst_target.offset.1,
             width: u32::from(width),
             height: u32::from(height),
         };
+        // Test-only capture for the engine-recorder pattern (see
+        // `RecordedCompositeArgs`). Branchless write; production paths
+        // don't observe it. Captures the POST-resolve, POST-offset
+        // tuple — i.e. exactly what the engine call below sees.
+        self.last_render_composite_args = Some(RecordedCompositeArgs {
+            src_id: match src_resolved {
+                ResolvedSource::Drawable(id) => Some(id),
+                _ => None,
+            },
+            mask_id: match mask_resolved {
+                ResolvedSource::Drawable(id) => Some(id),
+                _ => None,
+            },
+            dst_id: dst_target.id,
+            src_x: rect.src_x,
+            src_y: rect.src_y,
+            mask_x: rect.mask_x,
+            mask_y: rect.mask_y,
+            dst_x: rect.dst_x,
+            dst_y: rect.dst_y,
+        });
         // Diagnostic trace (TEMP — Stage 4d "shadow only"
         // investigation). Enable with
         // `RUST_LOG=yserver::kms::v2::render=trace`.
@@ -15730,6 +15802,100 @@ mod tests {
             crate::kms::v2::engine::ResolvedSource::Solid(_)
         ));
         assert_eq!(offset, (0, 0));
+    }
+
+    /// Systray-applet redirect fix Task 2.1: `Backend::render_composite`
+    /// must translate source sample coords by the descendant→ancestor-
+    /// backing offset when the source picture wraps a redirected
+    /// window's descendant. Pre-fix, `render_composite` resolved the
+    /// source via the un-walked `resolve_picture_for_render`, so a
+    /// picture on a leaf window sampled the leaf storage (empty under
+    /// Manual redirect). Post-fix, the helper that walks COMPOSITE
+    /// routing reports the BACKING id plus the descendant's offset and
+    /// the rect's `src_x`/`src_y` pick that offset up before the
+    /// engine call.
+    #[test]
+    fn render_composite_src_picture_on_redirected_window_translates_sample_coords() {
+        use crate::kms::v2::store::{DrawableKind, Storage};
+        use yserver_core::backend::Backend;
+
+        let mut b = KmsBackendV2::for_tests();
+        // Outer 0x100 → backing 0x900. Child 0x200 at (10, 20) under
+        // outer; the source picture wraps this child.
+        let w_id = seed_window(&mut b, 0x100, None, 0, 0);
+        let _c_id = seed_window(&mut b, 0x200, Some(0x100), 10, 20);
+        let backing_id = b
+            .store
+            .allocate(
+                0x900,
+                DrawableKind::RedirectedBacking,
+                32,
+                false,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 100,
+                        height: 100,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("backing allocate");
+        b.store.set_redirected_target(w_id, Some(backing_id));
+
+        // Src picture wraps the child (descendant of redirected outer).
+        b.core.pictures.insert(
+            0xA000,
+            PictureRecord::drawable_default(0x200, /* pict_format */ 0),
+        );
+        // Dst picture wraps an unrelated pixmap so the dst path stays
+        // identity (offset == (0, 0)) — the assertion below verifies
+        // that the dst-side coords are NOT spuriously translated by
+        // the source's offset.
+        let dst_pix_id = b
+            .store
+            .allocate(
+                0xB000,
+                DrawableKind::Pixmap,
+                32,
+                false,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 100,
+                        height: 100,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("dst pixmap allocate");
+        b.core.pictures.insert(
+            0xA001,
+            PictureRecord::drawable_default(0xB000, /* pict_format */ 0),
+        );
+
+        // Composite Over: read src at (3, 4), write dst at (0, 0), 5×6.
+        // The engine call returns `NoVk` on the stub fixture — the
+        // backend swallows that error — but the
+        // `last_render_composite_args` capture happens BEFORE the
+        // engine call, so it's populated regardless of Vk availability.
+        let _ = b.render_composite(
+            None, /* op = Over */ 3, /* host_src */ 0xA000, /* host_mask */ 0,
+            /* host_dst */ 0xA001, /* src_x */ 3, /* src_y */ 4,
+            /* mask_x */ 0, /* mask_y */ 0, /* dst_x */ 0, /* dst_y */ 0,
+            /* width */ 5, /* height */ 6,
+        );
+
+        let recorded = b
+            .last_render_composite_args
+            .expect("render_composite must record its post-resolve dispatch args");
+        // Source must sample from the BACKING with the child's
+        // offset applied: src_xy = (3 + 10, 4 + 20) = (13, 24).
+        assert_eq!(recorded.src_id, Some(backing_id));
+        assert_eq!(recorded.src_x, 13);
+        assert_eq!(recorded.src_y, 24);
+        // Dst unchanged (pixmap, no redirect).
+        assert_eq!(recorded.dst_id, dst_pix_id);
+        assert_eq!(recorded.dst_x, 0);
+        assert_eq!(recorded.dst_y, 0);
     }
 
     /// Descendant paint accumulates `(x, y)` offsets up the
