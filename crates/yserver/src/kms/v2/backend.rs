@@ -15640,6 +15640,57 @@ mod tests {
         assert_eq!(offset, (0, 0));
     }
 
+    /// Source-picture descendant case: a `PictureRecord::Drawable`
+    /// wrapping a grandchild whose ancestor is redirected must
+    /// resolve to the ancestor's backing with the accumulated child
+    /// offsets summed along the walk. Outer W redirected to B;
+    /// child C at (10, 20) under W; grandchild G at (3, 4) under C.
+    /// A picture on G's host xid resolves to `(B, (13, 24))` — the
+    /// `resolve_paint_target` ancestor walk exercised via the new
+    /// `resolve_source_picture` wrapper.
+    #[test]
+    fn resolve_source_picture_descendant_picks_up_ancestor_backing_with_offset() {
+        use crate::kms::v2::store::{DrawableKind, Storage};
+        let mut b = KmsBackendV2::for_tests();
+        // Outer 0x100 redirected to backing 0x900; child 0x200 at
+        // (10, 20) under outer; grandchild 0x300 at (3, 4) under
+        // child.
+        let w_id = seed_window(&mut b, 0x100, None, 0, 0);
+        let _c_id = seed_window(&mut b, 0x200, Some(0x100), 10, 20);
+        let _g_id = seed_window(&mut b, 0x300, Some(0x200), 3, 4);
+        let backing_id = b
+            .store
+            .allocate(
+                0x900,
+                DrawableKind::RedirectedBacking,
+                32,
+                false,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 200,
+                        height: 200,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("backing allocate");
+        b.store.set_redirected_target(w_id, Some(backing_id));
+        // Picture wraps the grandchild's host xid; the resolver
+        // must walk parents until it hits the redirected ancestor
+        // and report the backing id with the accumulated offset.
+        b.core.pictures.insert(
+            0xA000,
+            PictureRecord::drawable_default(0x300, /* pict_format */ 0),
+        );
+
+        let (resolved, _, _, _, offset) = b.resolve_source_picture(0xA000).expect("resolve");
+        assert!(matches!(
+            resolved,
+            crate::kms::v2::engine::ResolvedSource::Drawable(id) if id == backing_id
+        ));
+        assert_eq!(offset, (13, 24));
+    }
+
     /// Descendant paint accumulates `(x, y)` offsets up the
     /// ancestor chain. W at root with redirect to B; child C at
     /// (10, 20) under W; grandchild G at (3, 4) under C. Paint on
