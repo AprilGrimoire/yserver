@@ -15709,6 +15709,29 @@ mod tests {
         assert_eq!(offset, (0, 0));
     }
 
+    /// Non-Drawable source variants (SolidFill / Gradient) carry no
+    /// backing drawable, so `resolve_source_picture` must fall
+    /// through to `resolve_picture_for_render` and report a zero
+    /// offset — there is nothing to translate from.
+    #[test]
+    fn resolve_source_picture_solid_returns_zero_offset() {
+        let mut b = KmsBackendV2::for_tests();
+        b.core.pictures.insert(
+            0xA000,
+            PictureRecord::SolidFill {
+                premul: [1.0, 0.5, 0.25, 1.0],
+                repeat: crate::kms::cpu_types::Repeat::None,
+                component_alpha: false,
+            },
+        );
+        let (resolved, _, _, _, offset) = b.resolve_source_picture(0xA000).expect("resolve");
+        assert!(matches!(
+            resolved,
+            crate::kms::v2::engine::ResolvedSource::Solid(_)
+        ));
+        assert_eq!(offset, (0, 0));
+    }
+
     /// Descendant paint accumulates `(x, y)` offsets up the
     /// ancestor chain. W at root with redirect to B; child C at
     /// (10, 20) under W; grandchild G at (3, 4) under C. Paint on
