@@ -15898,6 +15898,123 @@ mod tests {
         assert_eq!(recorded.dst_y, 0);
     }
 
+    /// Systray-applet redirect fix Task 2.2: mirror of the source-
+    /// side coverage above, but with the MASK picture wrapping a
+    /// redirected-window descendant. The mask-side resolution in
+    /// `render_composite` must walk COMPOSITE routing and apply the
+    /// descendant→ancestor-backing offset to `mask_x`/`mask_y`,
+    /// while the source and dst paths (plain pixmaps here) stay
+    /// identity — i.e. the mask offset must NOT leak into them.
+    #[test]
+    fn render_composite_mask_picture_on_redirected_window_translates_sample_coords() {
+        use crate::kms::v2::store::{DrawableKind, Storage};
+        use yserver_core::backend::Backend;
+
+        let mut b = KmsBackendV2::for_tests();
+        // Outer 0x100 → backing 0x900. Child 0x200 at (10, 20) under
+        // outer; the MASK picture wraps this child.
+        let w_id = seed_window(&mut b, 0x100, None, 0, 0);
+        let _c_id = seed_window(&mut b, 0x200, Some(0x100), 10, 20);
+        let backing_id = b
+            .store
+            .allocate(
+                0x900,
+                DrawableKind::RedirectedBacking,
+                32,
+                false,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 100,
+                        height: 100,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("backing allocate");
+        b.store.set_redirected_target(w_id, Some(backing_id));
+
+        // Source picture wraps a plain pixmap so the source path
+        // stays identity — verifies the mask's offset doesn't leak
+        // into src_x/src_y.
+        let src_pix_id = b
+            .store
+            .allocate(
+                0xB000,
+                DrawableKind::Pixmap,
+                32,
+                false,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 100,
+                        height: 100,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("src pixmap allocate");
+        b.core.pictures.insert(
+            0xA001,
+            PictureRecord::drawable_default(0xB000, /* pict_format */ 0),
+        );
+
+        // MASK picture wraps the child (descendant of redirected outer).
+        b.core.pictures.insert(
+            0xA000,
+            PictureRecord::drawable_default(0x200, /* pict_format */ 0),
+        );
+
+        // Dst picture wraps another plain pixmap so the dst path
+        // also stays identity.
+        let dst_pix_id = b
+            .store
+            .allocate(
+                0xC000,
+                DrawableKind::Pixmap,
+                32,
+                false,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 100,
+                        height: 100,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("dst pixmap allocate");
+        b.core.pictures.insert(
+            0xA002,
+            PictureRecord::drawable_default(0xC000, /* pict_format */ 0),
+        );
+
+        // Composite Over: mask sample at (3, 4); after walking
+        // COMPOSITE routing for the child at (10, 20) under the
+        // redirected outer, the engine call should see mask sample
+        // at (13, 24) on the backing.
+        let _ = b.render_composite(
+            None, /* op = Over */ 3, /* host_src */ 0xA001, /* host_mask */ 0xA000,
+            /* host_dst */ 0xA002, /* src_x */ 0, /* src_y */ 0,
+            /* mask_x */ 3, /* mask_y */ 4, /* dst_x */ 0, /* dst_y */ 0,
+            /* width */ 5, /* height */ 6,
+        );
+
+        let recorded = b
+            .last_render_composite_args
+            .expect("render_composite must record its post-resolve dispatch args");
+        // Mask must sample from the BACKING with the child's
+        // offset applied: mask_xy = (3 + 10, 4 + 20) = (13, 24).
+        assert_eq!(recorded.mask_id, Some(backing_id));
+        assert_eq!(recorded.mask_x, 13);
+        assert_eq!(recorded.mask_y, 24);
+        // Source path is a plain pixmap — unmodified.
+        assert_eq!(recorded.src_id, Some(src_pix_id));
+        assert_eq!(recorded.src_x, 0);
+        assert_eq!(recorded.src_y, 0);
+        // Dst path is a plain pixmap — unmodified.
+        assert_eq!(recorded.dst_id, dst_pix_id);
+        assert_eq!(recorded.dst_x, 0);
+        assert_eq!(recorded.dst_y, 0);
+    }
+
     /// Descendant paint accumulates `(x, y)` offsets up the
     /// ancestor chain. W at root with redirect to B; child C at
     /// (10, 20) under W; grandchild G at (3, 4) under C. Paint on
