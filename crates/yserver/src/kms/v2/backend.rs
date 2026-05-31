@@ -246,6 +246,17 @@ pub struct KmsBackendV2 {
     /// needing a live Vk fixture. Production paths don't observe it.
     pub(crate) last_render_composite_args: Option<RecordedCompositeArgs>,
 
+    /// Test-only capture of the most recent computed `dst_clip` rect
+    /// set fed into `RenderEngine::render_composite` from
+    /// `Backend::render_composite`. The outer `Option` distinguishes
+    /// "no dispatch yet" (`None`) from "dispatched with no clip"
+    /// (`Some(None)`). Populated unconditionally right after
+    /// `compute_render_composite_clip` returns, so the client-clip
+    /// translation tests (Task 2.3) can assert on the post-translation
+    /// rect set without needing a live Vk fixture. Production paths
+    /// don't observe it.
+    pub(crate) last_render_composite_dst_clip: Option<Option<Vec<Rectangle16>>>,
+
     /// Diagnostic ring of recent `PRESENT::Pixmap` source xids
     /// targeted at COW. Captured via `note_present_pixmap` and
     /// consumed by `do_dump_drawables_v2` so the per-drawable
@@ -586,6 +597,7 @@ impl KmsBackendV2 {
             clear_window_area_calls: 0,
             engine_copy_area_calls: 0,
             last_render_composite_args: None,
+            last_render_composite_dst_clip: None,
             present_to_cow_sources: std::collections::VecDeque::with_capacity(16),
             recent_present_pixmaps: std::collections::VecDeque::with_capacity(32),
             dri3_xshmfences: HashMap::new(),
@@ -706,6 +718,7 @@ impl KmsBackendV2 {
             clear_window_area_calls: 0,
             engine_copy_area_calls: 0,
             last_render_composite_args: None,
+            last_render_composite_dst_clip: None,
             present_to_cow_sources: std::collections::VecDeque::with_capacity(16),
             recent_present_pixmaps: std::collections::VecDeque::with_capacity(32),
             dri3_xshmfences: HashMap::new(),
@@ -1266,6 +1279,7 @@ impl KmsBackendV2 {
             clear_window_area_calls: 0,
             engine_copy_area_calls: 0,
             last_render_composite_args: None,
+            last_render_composite_dst_clip: None,
             present_to_cow_sources: std::collections::VecDeque::with_capacity(16),
             recent_present_pixmaps: std::collections::VecDeque::with_capacity(32),
             dri3_xshmfences: HashMap::new(),
@@ -10048,6 +10062,12 @@ impl Backend for KmsBackendV2 {
             mask_clip.as_deref(),
             mask_translation,
         );
+        // Test-only capture for the engine-recorder pattern (see
+        // `last_render_composite_dst_clip`). Branchless write;
+        // production paths don't observe it. Captures the
+        // POST-translation, POST-intersection rect set — i.e. exactly
+        // what the engine call below sees.
+        self.last_render_composite_dst_clip = Some(dst_clip.clone());
 
         // Sample-coord translation: when src/mask wraps a descendant of
         // a redirected ancestor, `src_offset` is the descendant's
@@ -16013,6 +16033,152 @@ mod tests {
         assert_eq!(recorded.dst_id, dst_pix_id);
         assert_eq!(recorded.dst_x, 0);
         assert_eq!(recorded.dst_y, 0);
+    }
+
+    /// Systray-applet redirect fix Task 2.3: source-picture client
+    /// clips are interpreted in PICTURE-LOCAL coords. When the source
+    /// wraps a descendant of a redirected ancestor, the engine's
+    /// sample origin already accounts for the descendant→backing
+    /// offset (Task 2.1) — but the `src_translation` that folds the
+    /// client clip into the dst-space composite region must keep
+    /// using the UN-offset `src_x` / `src_y`.
+    ///
+    /// Why: `src_translation = dst_origin - src_origin` maps
+    /// picture-local-to-dst-space. The picture's local coords are
+    /// what the client set the clip in (picture xid = child window
+    /// xid, so picture-local (0, 0) is the child's top-left, NOT the
+    /// backing's). The engine call separately adds the descendant
+    /// offset to its sample origin so the right backing pixels are
+    /// read — those two translations are independent and folding the
+    /// offset into `src_translation` would double-shift the clip.
+    ///
+    /// Setup mirrors Task 2.1: outer 0x100 → backing 0x900; child
+    /// 0x200 at (10, 20) under outer; source picture wraps the child.
+    /// Apply a source-picture client clip of `(2, 3 2x2)` in
+    /// picture-local coords. Composite Over with src at (0, 0) into
+    /// a dst pixmap at (0, 0), 5×5. Assert the engine-bound
+    /// `dst_clip` is exactly the un-shifted `(2, 3 2x2)` — i.e. the
+    /// existing un-folded translation math holds for redirected
+    /// sources.
+    #[test]
+    fn render_composite_src_picture_client_clip_on_redirected_window_clips_correctly() {
+        use crate::kms::v2::store::{DrawableKind, Storage};
+        use yserver_core::backend::Backend;
+
+        let mut b = KmsBackendV2::for_tests();
+        // Outer 0x100 → backing 0x900. Child 0x200 at (10, 20) under
+        // outer; the source picture wraps this child.
+        let w_id = seed_window(&mut b, 0x100, None, 0, 0);
+        let _c_id = seed_window(&mut b, 0x200, Some(0x100), 10, 20);
+        let _backing_id = b
+            .store
+            .allocate(
+                0x900,
+                DrawableKind::RedirectedBacking,
+                32,
+                false,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 100,
+                        height: 100,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("backing allocate");
+        b.store.set_redirected_target(w_id, Some(_backing_id));
+
+        // Src picture wraps the child (descendant of redirected outer).
+        let src_pic_xid = 0xA000_u32;
+        b.core.pictures.insert(
+            src_pic_xid,
+            PictureRecord::drawable_default(0x200, /* pict_format */ 0),
+        );
+
+        // Dst picture wraps an unrelated pixmap so the dst path stays
+        // identity (offset == (0, 0)).
+        let _dst_pix_id = b
+            .store
+            .allocate(
+                0xB000,
+                DrawableKind::Pixmap,
+                32,
+                false,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 100,
+                        height: 100,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("dst pixmap allocate");
+        let dst_pic_xid = 0xA001_u32;
+        b.core.pictures.insert(
+            dst_pic_xid,
+            PictureRecord::drawable_default(0xB000, /* pict_format */ 0),
+        );
+
+        // Install a `(2, 3 2x2)` source-picture client clip in
+        // picture-local coords via the production
+        // SetPictureClipRectangles request path (clip-origin = (0, 0)
+        // so stored rects == request rects).
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(&src_pic_xid.to_le_bytes());
+        body.extend_from_slice(&0_i16.to_le_bytes()); // x_origin
+        body.extend_from_slice(&0_i16.to_le_bytes()); // y_origin
+        body.extend_from_slice(&2_i16.to_le_bytes()); // x
+        body.extend_from_slice(&3_i16.to_le_bytes()); // y
+        body.extend_from_slice(&2_u16.to_le_bytes()); // w
+        body.extend_from_slice(&2_u16.to_le_bytes()); // h
+        b.render_set_picture_clip_rectangles(None, src_pic_xid, &body)
+            .expect("set src picture clip");
+
+        // Composite Over: read src at (0, 0), write dst at (0, 0), 5×5.
+        // The engine call returns NoVk on the stub fixture — swallowed —
+        // but `last_render_composite_dst_clip` is populated BEFORE the
+        // engine call, so the post-translation clip is observable.
+        let _ = b.render_composite(
+            None,
+            /* op = Over */ 3,
+            /* host_src */ src_pic_xid,
+            /* host_mask */ 0,
+            /* host_dst */ dst_pic_xid,
+            /* src_x */ 0,
+            /* src_y */ 0,
+            /* mask_x */ 0,
+            /* mask_y */ 0,
+            /* dst_x */ 0,
+            /* dst_y */ 0,
+            /* width */ 5,
+            /* height */ 5,
+        );
+
+        let dst_clip = b
+            .last_render_composite_dst_clip
+            .as_ref()
+            .expect("render_composite must record its post-translation dst_clip")
+            .as_deref()
+            .expect("source picture had a client clip — composite must inherit it");
+        // The client clip is picture-local `(2, 3 2x2)`. With the
+        // existing `src_translation = (0 - 0, 0 - 0) = (0, 0)` it
+        // lands at dst `(2, 3 2x2)`. If the production code were
+        // (incorrectly) folding the descendant offset into the
+        // translation, the rect would land at `(2 - 10, 3 - 20 2x2)`
+        // = `(-8, -17 2x2)` — outside the 5×5 paint, the clip would
+        // be empty, and dst writes would be skipped entirely.
+        assert_eq!(dst_clip.len(), 1, "got {dst_clip:?}");
+        assert_eq!(
+            (
+                dst_clip[0].x,
+                dst_clip[0].y,
+                dst_clip[0].width,
+                dst_clip[0].height,
+            ),
+            (2, 3, 2, 2),
+            "picture-local source clip must map identity into dst space \
+             — `src_translation` must NOT fold the redirect offset",
+        );
     }
 
     /// Descendant paint accumulates `(x, y)` offsets up the
