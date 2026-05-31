@@ -78,6 +78,23 @@ pub fn accumulate_damage_to_state(
     if width == 0 || height == 0 {
         return Vec::new();
     }
+    // TEMP DIAG (round 3): gated on `YSERVER_DAMAGE_BACKTRACE=1`.
+    // After removing the configure-damage emit, the
+    // notification-area-applet loop is only 15% quieter — there's
+    // a second emitter on the same tray-socket xids. REMOVE after
+    // the second emitter is identified.
+    if std::env::var_os("YSERVER_DAMAGE_BACKTRACE").is_some() {
+        let bt = std::backtrace::Backtrace::force_capture();
+        log::info!(
+            "DIAG accumulate_damage: drawable=0x{:x} rect=({},{} {}x{})\n{}",
+            drawable.0,
+            x,
+            y,
+            width,
+            height,
+            bt,
+        );
+    }
     let timestamp = state.timestamp_now();
     let mut pending: Vec<PendingNotify> = Vec::new();
 

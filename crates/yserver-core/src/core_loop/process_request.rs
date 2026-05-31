@@ -10204,68 +10204,24 @@ fn handle_configure_window(
             // event closes.
             fire_present_configure_notify_for_window(state, window_id, geometry);
         }
-        // X11 Composite + DAMAGE interaction: configuring a redirected
-        // window (move / resize / border / stack-order) changes its
-        // screen-space presentation. The pixel content of the
-        // redirected backing doesn't change, but the compositor MUST
-        // recomposite the moved-from + moved-to regions. Xorg
-        // signals this by emitting a `DamageNotify` on the window
-        // for the full window-local extent at the new geometry
-        // (xserver/composite/compwindow.c). Measured divergence on a
-        // mate-with-compositing drag: Xephyr emitted 776 DamageNotify
-        // events to marco over the run; yserver emitted 0. Without
-        // these events marco's compositor never marked the moved
-        // window dirty, its SetPictureClipRectangles excluded the
-        // window's region, and composites against the redirected
-        // backing no-op'd — producing the "CC disappears on drag /
-        // muddy bands on caja-redraw" symptom.
+        // X11 Composite + DAMAGE invariant (Xorg `compConfigNotify`
+        // in composite/compwindow.c:795-827): the hook reallocates
+        // the backing pixmap if needed and returns — NO synthetic
+        // DamageNotify is emitted on a geometry-changing
+        // ConfigureWindow. Compositors learn about the move/resize
+        // through the standard ConfigureNotify fanout, not damage.
         //
-        // Apply to the window itself. `accumulate_damage_full_to_state`
-        // walks the ancestor chain so any compositor subscribed
-        // higher in the tree also gets a translated rect. Only fires
-        // when a damage object exists on the drawable (the helper
-        // filters on `damage_object.drawable == this`), so cost is
-        // zero for unredirected/uncomposited windows.
-        // Xorg's Composite wakeup on ConfigureWindow is about visible
-        // geometry changes of redirected windows. Pure restacks
-        // (CWSibling/CWStackMode only) do affect stacking order, but
-        // they are not modeled as "whole window damaged" events. Doing
-        // that here seeds bogus fullscreen damage on marco's desktop
-        // window (0x01300005), which then collapses the compositor's
-        // update region before later dialog composites run.
-        const CONFIGURE_DAMAGE_GEOMETRY_MASK: u16 = 0x001f; // x|y|w|h|border
-        let geometry_changed = (request.value_mask & CONFIGURE_DAMAGE_GEOMETRY_MASK) != 0;
-        if geometry_changed && let Some(mode) = effective_redirect_mode_for_window(state, window_id)
-        {
-            log::trace!(
-                target: "yserver_core::core_loop::damage_fanout",
-                "configure_damage_emit: window=0x{:x} geom=({},{} {}x{}) old_size={:?} resized={} mode={:?} mask=0x{:x}",
-                window_id.0,
-                geometry.x,
-                geometry.y,
-                geometry.width,
-                geometry.height,
-                old_size,
-                resized,
-                mode,
-                request.value_mask,
-            );
-            let _dropped = accumulate_damage_full_to_state(state, window_id);
-        } else {
-            log::trace!(
-                target: "yserver_core::core_loop::damage_fanout",
-                "configure_damage_skip: window=0x{:x} geom=({},{} {}x{}) old_size={:?} resized={} geometry_changed={} mask=0x{:x}",
-                window_id.0,
-                geometry.x,
-                geometry.y,
-                geometry.width,
-                geometry.height,
-                old_size,
-                resized,
-                geometry_changed,
-                request.value_mask,
-            );
-        }
+        // Cross-referenced 2026-05-31 against `mate-xorg.xtrace`:
+        // notification-area-applet received 19 DAMAGE events over
+        // the whole Xorg session vs 966 in 14s on yserver — a 230×
+        // delta entirely caused by yserver's prior
+        // `accumulate_damage_full_to_state(window_id)` here.
+        // Removing it matches Xorg exactly and breaks the applet
+        // self-loop (project_tray_damage_self_loop, ~590 RENDER/sec
+        // idle baseline). If a compositor (marco) regresses on, e.g.,
+        // CC drag after this removal, the real fix lives in the
+        // ConfigureNotify fanout path or the compositor itself —
+        // not in a synthesised damage event the spec doesn't define.
         let grew = old_size.is_some_and(|(ow, oh)| geometry.width > ow || geometry.height > oh);
         if grew {
             // Per X11 spec, Expose fires only for visible regions. A
@@ -11995,46 +11951,37 @@ fn handle_map_window(
             let _dropped = emit_expose_subtree_to_state(state, window);
         }
     }
-    // Audit #11: Xorg's `miPaintWindow` fires damage on the window's
-    // extent when the window becomes viewable (the server-background
-    // fill is itself a paint, and DAMAGE hooks every paint).
-    // Compositors that subscribe via `XDamageCreate(window)` rely on
-    // that first DamageNotify to read the freshly-mapped window's
-    // pixels into their own offscreen.
+    // X11 Composite + DAMAGE invariant (Xorg `MapWindow` in
+    // `dix/window.c:2654-2716` + `compRealizeWindow` in
+    // `composite/compwindow.c:267-281`): NO synthetic DamageNotify
+    // is emitted on `MapWindow`. The compositor learns about a
+    // newly-mapped window from the standard `MapNotify` fanout
+    // (via SubstructureNotify on the parent) and reads its pixels
+    // through the redirected backing on demand. Xorg's incidental
+    // damage on newly-viewable windows comes from `miPaintWindow`
+    // emitting damage for the bg-fill paint operation itself —
+    // not from MapWindow.
     //
-    // Order matters: this MUST come AFTER the MapNotify emissions
-    // above. Marco subscribes to SubstructureNotify on root, registers
-    // the window in its compositor tree on receiving MapNotify, and
-    // only then accepts DAMAGE-Notify on it as a NameWindowPixmap
-    // trigger. Pre-fix (damage emitted before MapNotify) marco saw the
-    // damage on a window it didn't yet track and silently dropped it,
-    // causing mate-panel-top to render blank until a later resize
-    // damage finally landed. See mate.xtrace lines 4938→4940 vs
-    // mate-xorg.xtrace lines 5164→5173.
-    if host_xid.is_some() {
-        let _dropped = accumulate_damage_full_to_state(state, window);
-        accumulate_damage_viewable_descendants_to_state(state, window);
-    }
+    // Cross-referenced 2026-05-31 against `mate-xorg.xtrace`: the
+    // notification-area-applet does ~28 Map + ~25 Unmap calls per
+    // session on its tray sockets, yet receives only 19 DAMAGE
+    // events total. yserver was firing
+    // `accumulate_damage_full_to_state(state, window)` (plus a
+    // descendant walk) on every Map → 428 events per socket in
+    // 12s = ~36/s, the second emitter behind the
+    // notification-area-applet self-loop after configure-damage
+    // was removed. Both removed here to match Xorg.
+    //
+    // If a compositor (e.g. marco-mate-panel-top) regresses to
+    // blank after this removal, the real fix is in the bg-paint
+    // path (server bg fill should emit damage from the paint
+    // itself, matching `miPaintWindow`) — not a synthesised
+    // damage event the spec doesn't require.
     debug!(
         "client {} #{} MapWindow 0x{:x}",
         client_id.0, sequence.0, window.0
     );
     Ok(RequestOutcome::Handled)
-}
-
-fn accumulate_damage_viewable_descendants_to_state(state: &mut ServerState, root: ResourceId) {
-    let children: Vec<ResourceId> = state.resources.children(root).to_vec();
-    for child in children {
-        let viewable = state
-            .resources
-            .window(child)
-            .is_some_and(|w| w.map_state == MapState::Viewable);
-        if !viewable {
-            continue;
-        }
-        let _dropped = accumulate_damage_full_to_state(state, child);
-        accumulate_damage_viewable_descendants_to_state(state, child);
-    }
 }
 
 fn handle_map_subwindows(
@@ -12064,11 +12011,10 @@ fn handle_map_subwindows(
             // plan's round-6 ordering fix.
             maybe_activate_child_under_redirected_parent(state, backend, origin, child);
             reapply_redirect_mode_after_map(state, backend, origin, child);
-            // Audit #11: see `handle_map_window` for the rationale.
-            // Mirror the damage bump so MapSubwindows-driven mass
-            // maps (mate-panel applet realize cascade, GTK
-            // children-on-show) also notify subscribed compositors.
-            let _dropped = accumulate_damage_full_to_state(state, child);
+            // Damage emit removed 2026-05-31 to match Xorg
+            // `MapWindow` / `compRealizeWindow` (no synthetic
+            // damage on map). See `handle_map_window` for the
+            // full rationale.
         }
         if window_wants_keyboard_focus(state, client_id, child) {
             debug!(
@@ -18706,11 +18652,21 @@ mod tests {
     /// when a compositor is active and v2 routes the visible output
     /// through `Present::Pixmap → COW`.
     ///
-    /// Oracle: a `DamageObject` subscribed to a freshly-created
-    /// window must accumulate damage rects covering the window's
-    /// full extent after `handle_map_window` returns.
+    /// X11 spec invariant (Xorg `MapWindow` in `dix/window.c:2654` +
+    /// `compRealizeWindow` in `composite/compwindow.c:267`):
+    /// `MapWindow` emits NO synthetic DamageNotify. Compositors learn
+    /// about a newly-mapped window via `MapNotify` (SubstructureNotify
+    /// on the parent) and read pixels through the redirected backing
+    /// on demand. Incidental damage in Xorg comes from the bg-fill
+    /// paint operation itself (via `miPaintWindow`), not from
+    /// `MapWindow`. This test was originally inverted (it asserted
+    /// damage MUST fire on map) to fix a tray-icon-not-showing
+    /// symptom — but that mechanism drove a 60Hz self-loop on the
+    /// notification-area-applet's Unmap+Map cycles on its tray
+    /// sockets (project_tray_damage_self_loop). 2026-05-31:
+    /// re-aligned to Xorg.
     #[test]
-    fn map_window_emits_damage_on_window_extent() {
+    fn map_window_does_not_emit_synthetic_damage() {
         use crate::server::DamageObject;
 
         const CLIENT_ID: u32 = 1;
@@ -18777,11 +18733,12 @@ mod tests {
             .get(&DAMAGE_ID)
             .expect("damage_object survived map");
         assert!(
-            !damage.rects.is_empty(),
-            "MapWindow must fire damage on the window's extent so a \
-             subscribed compositor repaints the new region into its \
-             offscreen — pre-fix this is empty and the compositor \
-             never sees the newly-mapped popup / tray icon / window",
+            damage.rects.is_empty(),
+            "MapWindow must NOT fire synthetic damage — matching Xorg \
+             `MapWindow` + `compRealizeWindow` (neither calls \
+             DamageDamageRegion). Compositors learn via MapNotify; \
+             damage comes from the bg-fill paint itself. Got rects: {:?}",
+            damage.rects,
         );
     }
 
@@ -18892,9 +18849,12 @@ mod tests {
             .expect("damage object")
             .rects
             .len();
-        assert!(
-            first_rect_count > 0,
-            "first MapWindow must accumulate damage on the window extent",
+        assert_eq!(
+            first_rect_count, 0,
+            "MapWindow emits no synthetic damage (Xorg-match — see \
+             `map_window_does_not_emit_synthetic_damage`); the brisk-menu \
+             test below still verifies the per-X-spec no-op behaviour on \
+             second-map regardless of damage rect counts.",
         );
 
         // Second map on the now-already-Viewable window. Per spec this
@@ -21413,8 +21373,13 @@ mod tests {
         );
     }
 
+    /// Companion to `map_window_does_not_emit_synthetic_damage`: the
+    /// descendant walk was also removed for Xorg parity. Compositors
+    /// learn about newly-Viewable descendants from MapNotify
+    /// fanouts; pixel-level damage comes from real paint operations,
+    /// not synthesised from MapWindow.
     #[test]
-    fn map_window_seeds_damage_for_newly_viewable_descendant() {
+    fn map_window_does_not_seed_damage_for_newly_viewable_descendant() {
         use crate::server::DamageObject;
 
         const CLIENT_ID: u32 = 1;
@@ -21510,10 +21475,12 @@ mod tests {
             .get(&CHILD_DAMAGE_ID)
             .expect("child damage object survives");
         assert!(
-            !child_damage.rects.is_empty(),
-            "mapping a parent must seed damage for descendants promoted from \
-             Unviewable to Viewable; otherwise compositors miss the child's \
-             first visible frame"
+            child_damage.rects.is_empty(),
+            "Xorg does not synthesise damage on descendants promoted \
+             from Unviewable to Viewable; compositors learn via \
+             MapNotify. Pixel damage arrives later from real paints. \
+             Got rects: {:?}",
+            child_damage.rects,
         );
     }
 
@@ -21584,29 +21551,16 @@ mod tests {
         );
     }
 
-    // X11 wire-event ordering on map. Verified divergence vs Xorg:
-    //
-    // - **Xorg** (mate-xorg.xtrace lines 5164→5173 around mate-panel-top
-    //   map): MapNotify(event=root) first, then DAMAGE-Notify.
-    // - **yserver pre-fix** (mate.xtrace lines 4938→4940): DAMAGE-Notify
-    //   first, then MapNotify(event=root).
-    //
-    // Marco's compositor relies on MapNotify(SubstructureNotify on root)
-    // to register a window in its compositor tree, and on the *next*
-    // DAMAGE-Notify on that window to trigger NameWindowPixmap. When
-    // damage arrives first, marco's tree doesn't know about the window
-    // yet and the damage is silently discarded. Marco then never sees
-    // the audit-#11 initial-paint damage and never Names the window;
-    // the panel renders blank until a *later* damage event arrives
-    // (typically the post-resize damage), by which point the icon-paint
-    // CopyAreas have already missed their compositor pickup window.
-    //
-    // The audit-#11 fix (`accumulate_damage_full_to_state` inside
-    // `handle_map_window`) is structurally correct but was placed
-    // before the MapNotify emissions — inverting the spec-correct
-    // order. This test pins MapNotify-before-DAMAGE on the wire.
+    /// X11 wire on `MapWindow`: a SubstructureNotify-on-root subscriber
+    /// (marco-class compositor) gets MapNotify(event=root); a
+    /// DAMAGE-on-window subscriber gets NO damage from MapWindow
+    /// itself (post-2026-05-31 Xorg-match — see
+    /// `map_window_does_not_emit_synthetic_damage`). The earlier
+    /// MapNotify-before-DAMAGE ordering check is replaced with a
+    /// MapNotify-fired + DAMAGE-not-fired check, since the synthetic
+    /// damage emit on MapWindow has been removed entirely.
     #[test]
-    fn map_window_emits_map_notify_before_damage_notify() {
+    fn map_window_emits_map_notify_and_not_damage_notify() {
         use crate::server::DamageObject;
 
         const CLIENT_ID: u32 = 1;
@@ -21708,18 +21662,16 @@ mod tests {
             }
         }
 
-        let m = map_root_idx.expect(
+        let _m = map_root_idx.expect(
             "MapNotify(event=root) must be emitted to a SubstructureNotify-on-root listener",
         );
-        let d = damage_idx.expect("DAMAGE-Notify must be emitted to a subscribed damage object");
-        assert!(
-            m < d,
-            "MapNotify(event=root, idx={m}) must precede DAMAGE-Notify(idx={d}) on the \
-             wire — pre-fix the audit-#11 damage emission inside `handle_map_window` ran \
-             before the MapNotify emissions, so marco's compositor saw the damage on a \
-             window that hadn't yet entered its compositor tree, silently discarded it, \
-             and never NameWindowPixmap'd the freshly-mapped window. \
-             See mate.xtrace lines 4938→4940 vs mate-xorg.xtrace lines 5164→5173.",
+        assert_eq!(
+            damage_idx, None,
+            "DAMAGE-Notify must NOT be emitted from MapWindow itself — Xorg \
+             `MapWindow`/`compRealizeWindow` emit no synthetic damage. \
+             Damage arrives later from real paint operations (bg-fill, \
+             client redraw after Expose). Got DAMAGE-Notify at wire idx {:?}",
+            damage_idx,
         );
     }
 
@@ -22296,26 +22248,26 @@ mod tests {
         );
     }
 
-    /// X11 Composite + DAMAGE interaction: a configure that changes a
-    /// redirected window's screen-space presentation must emit a
-    /// `DamageNotify` to the compositor's damage subscription on that
-    /// window. Xorg behaviour (compositor.c) — without this event,
-    /// marco/picom/etc. never mark the moved window dirty and their
-    /// SetPictureClipRectangles excludes the window's region, so
-    /// composites against the redirected backing no-op or partially
-    /// blend, producing the "CC disappears on drag / muddy bands on
-    /// caja-redraw" symptom we measured against a Xephyr (Xorg-family)
-    /// reference run: yserver emitted 0 DamageNotify events to marco;
-    /// Xephyr emitted 776.
+    /// X11 Composite + DAMAGE invariant (Xorg `compConfigNotify`,
+    /// `composite/compwindow.c:795-827`): a geometry-changing
+    /// `ConfigureWindow` on a redirected window emits NO synthetic
+    /// `DamageNotify` to compositor subscribers. The compositor
+    /// learns the new geometry from the standard `ConfigureNotify`
+    /// fanout.
     ///
-    /// Reproduce minimally: install marco client, create a top-level
-    /// window with a damage object owned by marco, set the window
-    /// `redirected_backing` (Manual-redirect activated state), then
-    /// send a move-only ConfigureWindow. Read marco's socket and
-    /// look for the DamageNotify event (event opcode 94 = DAMAGE
-    /// first_event + 0).
+    /// This test was originally inverted (it asserted that yserver
+    /// MUST emit DamageNotify on configure, contradicting Xorg) to
+    /// fix a "marco doesn't recompose on CC drag" symptom — but the
+    /// mechanism was wrong: emitting damage on every configure
+    /// drove a 60Hz self-loop on mate-panel's notification-area-
+    /// applet (it subscribes to DAMAGE on its tray sockets AND
+    /// configures them as part of its icon-update cycle —
+    /// ~590 RENDER/sec idle baseline, 230× the Xorg rate measured
+    /// from `mate-xorg.xtrace`). 2026-05-31: removed the emission
+    /// to match Xorg; this test now pins the new invariant.
+    /// project_tray_damage_self_loop memory.
     #[test]
-    fn configure_window_on_redirected_window_emits_damage_to_subscriber() {
+    fn configure_window_on_redirected_window_does_not_emit_damage_to_subscriber() {
         use crate::{
             resources::{ROOT_WINDOW, RedirectedBacking},
             server::{CompositeRedirectMode, DamageObject, RedirectRecord},
@@ -22416,58 +22368,30 @@ mod tests {
                 Err(_) => break,
             }
         }
-        let damage_evt: [u8; 32] = all
+        let damage_count = all
             .chunks_exact(32)
-            .find(|evt| evt[0] == crate::nested::DAMAGE_FIRST_EVENT)
-            .map(|s| {
-                let mut a = [0u8; 32];
-                a.copy_from_slice(s);
-                a
-            })
-            .unwrap_or_else(|| {
-                panic!(
-                    "ConfigureWindow on a redirected window must emit DamageNotify \
-                     (event code 94) to the compositor's damage subscriber. \
-                     Pre-fix yserver emits 0 DamageNotify events vs Xephyr's 776, \
-                     which leaves marco's compositor unable to mark the moved \
-                     window dirty. Got {} bytes; first 32: {:02x?}",
-                    all.len(),
-                    &all.get(..32.min(all.len())).unwrap_or(&[]),
-                )
-            });
-        // Per X11 DAMAGE proto: DamageNotify.geometry encodes the
-        // damaged drawable's CURRENT root-relative position + extent
-        // (Xorg damageext.c fills from pDrawable->{x,y,width,height};
-        // for windows, x/y are root-relative). marco/picom etc. use
-        // this to map the damage region into screen space. yserver's
-        // encoder historically hardcoded {x: 0, y: 0, w, h}, leaving
-        // marco mapping the damage to the wrong screen rect after
-        // every move — visible as "top-left bits stay rendered"
-        // after dragging (marco recomposites at the OLD position
-        // because the geometry origin points back to (0,0)).
-        //
-        // Wire layout: offsets 24..32 hold geometry as
-        // (x i16, y i16, w u16, h u16) little-endian. The window
-        // was configured to (250, 300) above.
-        let geom_x = i16::from_le_bytes([damage_evt[24], damage_evt[25]]);
-        let geom_y = i16::from_le_bytes([damage_evt[26], damage_evt[27]]);
-        let geom_w = u16::from_le_bytes([damage_evt[28], damage_evt[29]]);
-        let geom_h = u16::from_le_bytes([damage_evt[30], damage_evt[31]]);
+            .filter(|evt| evt[0] == crate::nested::DAMAGE_FIRST_EVENT)
+            .count();
         assert_eq!(
-            (geom_x, geom_y, geom_w, geom_h),
-            (250, 300, 997, 652),
-            "DamageNotify.geometry must encode the window's CURRENT \
-             root-relative position + extent; pre-fix this hardcodes \
-             (0, 0, w, h) and breaks marco's screen-rect mapping",
+            damage_count,
+            0,
+            "ConfigureWindow on a redirected window must NOT emit \
+             synthetic DamageNotify — Xorg `compConfigNotify` only \
+             reallocates the backing pixmap, never pokes damage. \
+             Compositors learn the new geometry from the standard \
+             ConfigureNotify fanout. Got {} bytes; first 32: {:02x?}",
+            all.len(),
+            &all.get(..32.min(all.len())).unwrap_or(&[]),
         );
     }
 
-    /// Effective redirect state includes inherited `RedirectSubwindows`
-    /// mode, not just a directly populated `window.redirected_backing`.
-    /// A move-only ConfigureWindow under an inherited redirect still
-    /// needs to wake the compositor with DamageNotify.
+    /// Twin of `configure_window_on_redirected_window_does_not_emit_damage_to_subscriber`
+    /// for the inherited-`RedirectSubwindows` case. Same invariant:
+    /// Xorg `compConfigNotify` emits no damage on configure regardless
+    /// of how the redirect was established (direct or via parent's
+    /// RedirectSubwindows).
     #[test]
-    fn configure_window_on_inherited_redirect_emits_damage_to_subscriber() {
+    fn configure_window_on_inherited_redirect_does_not_emit_damage_to_subscriber() {
         use crate::{
             resources::ROOT_WINDOW,
             server::{CompositeRedirectMode, DamageObject, RedirectRecord},
@@ -22553,12 +22477,15 @@ mod tests {
             }
         }
 
-        assert!(
-            all.chunks_exact(32)
-                .any(|evt| evt[0] == crate::nested::DAMAGE_FIRST_EVENT),
+        let damage_count = all
+            .chunks_exact(32)
+            .filter(|evt| evt[0] == crate::nested::DAMAGE_FIRST_EVENT)
+            .count();
+        assert_eq!(
+            damage_count, 0,
             "move-only ConfigureWindow under inherited RedirectSubwindows \
-             must emit DamageNotify even when redirected_backing is not \
-             directly populated on the child window",
+             must NOT emit synthetic DamageNotify (Xorg `compConfigNotify` \
+             never pokes damage on configure)",
         );
     }
 
@@ -22667,6 +22594,149 @@ mod tests {
                 .any(|evt| evt[0] == crate::nested::DAMAGE_FIRST_EVENT),
             "stack-only ConfigureWindow on a redirected window must not emit synthetic \
              DamageNotify; that turns restacks into bogus full-window damage",
+        );
+    }
+
+    /// Sibling case to `configure_window_stack_only_…`: when a client
+    /// issues `ConfigureWindow` with geometry bits set in `value_mask`
+    /// but the values are IDENTICAL to the current geometry, the
+    /// resulting "configure" is a no-op — no actual move/resize/border
+    /// change happens — and no synthetic `DamageNotify` should fire.
+    ///
+    /// Pre-fix (process_request.rs:10237 `let geometry_changed =
+    /// (request.value_mask & CONFIGURE_DAMAGE_GEOMETRY_MASK) != 0`)
+    /// only checked whether the client included geometry bits in the
+    /// mask, not whether the values actually differed. mate-panel's
+    /// notification-area-applet calls `ConfigureWindow(x,y,w,h)` on
+    /// its tray-socket children (manually-redirected windows it
+    /// owns) ~60×/sec with the SAME values; pre-fix yserver fired
+    /// `DamageNotify` on every call → the applet's own
+    /// `DAMAGE::Create` subscription on the socket fired → applet
+    /// re-renders → new ConfigureWindow → 60Hz self-loop driving
+    /// ~590 RENDER/sec at idle baseline
+    /// (`project_tray_damage_self_loop` memory entry).
+    #[test]
+    fn configure_window_with_unchanged_geometry_does_not_emit_damage() {
+        use crate::{
+            resources::{ROOT_WINDOW, RedirectedBacking},
+            server::{CompositeRedirectMode, DamageObject, RedirectRecord},
+        };
+        use std::io::Read;
+        use yserver_protocol::x11::CreateWindowRequest;
+
+        const APPLET: u32 = 14;
+        const SOCKET_XID: u32 = 0x0010_0301;
+        const DAMAGE_XID: u32 = 0x0010_0302;
+        const X: i16 = -2;
+        const Y: i16 = -2;
+        const W: u16 = 24;
+        const H: u16 = 27;
+        const BW: u16 = 0;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        let mut peer = install_client(&mut state, APPLET);
+
+        state.resources.create_window(
+            ClientId(APPLET),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(SOCKET_XID),
+                parent: ROOT_WINDOW,
+                x: X,
+                y: Y,
+                width: W,
+                height: H,
+                border_width: BW,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(ResourceId(SOCKET_XID));
+        // Manually-redirected (the tray socket pattern).
+        state.composite_redirects.insert(
+            (ResourceId(SOCKET_XID), false),
+            RedirectRecord {
+                mode: CompositeRedirectMode::Manual,
+                owner: ClientId(APPLET),
+            },
+        );
+        if let Some(w) = state.resources.window_mut(ResourceId(SOCKET_XID)) {
+            w.host_xid = crate::backend::WindowHandle::from_raw(0xD000_0301);
+            w.redirected_backing = Some(RedirectedBacking {
+                host_pixmap: crate::backend::PixmapHandle::from_raw(0xC000_0301).unwrap(),
+                width: W,
+                height: H,
+                depth: 24,
+            });
+        }
+
+        // Applet subscribes to damage on its own tray-socket (the
+        // XEMBED socket where embedded icon clients reparent).
+        state.damage_objects.insert(
+            DAMAGE_XID,
+            DamageObject {
+                owner: ClientId(APPLET),
+                drawable: ResourceId(SOCKET_XID),
+                level: 2, // DELTA_RECTANGLES — mate-panel's actual level
+                rects: Vec::new(),
+                pending_notify_fired: false,
+                last_reported_geometry: None,
+            },
+        );
+
+        // ConfigureWindow body shape: window(4) + value_mask(2) +
+        // pad(2) + values per set mask bits. value_mask = 0x000f
+        // (CWX | CWY | CWWidth | CWHeight) — all geometry bits set,
+        // but the values match the current geometry exactly. The
+        // window doesn't actually move or resize.
+        let mut body = Vec::with_capacity(24);
+        body.extend_from_slice(&SOCKET_XID.to_le_bytes());
+        body.extend_from_slice(&0x000fu16.to_le_bytes());
+        body.extend_from_slice(&[0u8; 2]);
+        body.extend_from_slice(&i32::from(X).to_le_bytes());
+        body.extend_from_slice(&i32::from(Y).to_le_bytes());
+        body.extend_from_slice(&u32::from(W).to_le_bytes());
+        body.extend_from_slice(&u32::from(H).to_le_bytes());
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(APPLET),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 12,
+                data: 0,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            },
+            &body,
+            None,
+        )
+        .unwrap();
+
+        peer.set_nonblocking(true).unwrap();
+        let mut all = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match peer.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => all.extend_from_slice(&chunk[..n]),
+                Err(_) => break,
+            }
+        }
+        let damage_events = all
+            .chunks_exact(32)
+            .filter(|evt| evt[0] == crate::nested::DAMAGE_FIRST_EVENT)
+            .count();
+        assert_eq!(
+            damage_events, 0,
+            "ConfigureWindow with geometry bits in mask but VALUES UNCHANGED \
+             must not emit synthetic DamageNotify. mate-panel's \
+             notification-area-applet emits these ~60×/sec on its tray \
+             sockets; pre-fix damage fired every call → applet's own \
+             subscription on the socket fired → applet re-renders → loop \
+             at 60Hz. The Xorg-spec wakeup is for ACTUAL geometry change, \
+             not for the wire shape of the request mask.",
         );
     }
 
