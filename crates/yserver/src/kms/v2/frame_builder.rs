@@ -722,6 +722,13 @@ pub(crate) struct RecordedRenderTrapsOrTris {
     pub(crate) clip_scissors: Vec<vk::Rect2D>,
     // Pinned resources.
     pub(crate) vertex_pool_pin: PinnedStagingIdx,
+    /// Task 3.1 (2026-05-31): source-side redirect offset, set from
+    /// the `src_offset` reported by
+    /// `KmsBackendV2::resolve_source_picture`. Drives the composite
+    /// phase's `CompositeRect::src_x / src_y` so a redirected-window
+    /// source samples the descendant's sub-region of the backing.
+    pub(crate) src_offset_x: i32,
+    pub(crate) src_offset_y: i32,
 }
 
 /// Reserved for future ops that need an explicit cross-frame layout
@@ -1253,6 +1260,8 @@ mod op_tests {
             instance_count: 0,
             clip_scissors: Vec::new(),
             vertex_pool_pin: PinnedStagingIdx(0),
+            src_offset_x: 0,
+            src_offset_y: 0,
         }));
         assert_eq!(render_traps.dst_id(), Some(id7));
     }

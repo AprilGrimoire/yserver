@@ -135,6 +135,37 @@ pub(crate) struct RecordedCompositeArgs {
     pub(crate) dst_y: i32,
 }
 
+/// Test-only capture of the most recent `render_trapezoids` dispatch
+/// to [`RenderEngine::render_traps_or_tris`]. Populated unconditionally
+/// (always present) from `Backend::render_trapezoids` right before the
+/// engine call, so the systray-applet-redirect regression tests
+/// (Task 3.1) can assert on the post-resolve `(src_id, dst_id,
+/// dst_offset, bbox, …)` tuple without needing a live Vk fixture.
+/// Mirrors the [`RecordedCompositeArgs`] pattern: production paths
+/// don't observe it, but the bookkeeping write is branchless and
+/// cheap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RecordedTrapsOrTrisArgs {
+    pub(crate) src_id: Option<crate::kms::v2::store::DrawableId>,
+    pub(crate) dst_id: crate::kms::v2::store::DrawableId,
+    /// Redirect offset folded into the trap coordinates' dst-side
+    /// translation (i.e. the value used to shift `decoded[*].top` …
+    /// into backing-pixmap coordinates at backend.rs site
+    /// "trap dx/dy shift").
+    pub(crate) dst_offset: (i32, i32),
+    /// Source-side redirect offset reported by
+    /// `resolve_source_picture`. Task 3.1 Step 5 thread-through: the
+    /// engine's `CompositeRect::src_x / src_y` for the trap path are
+    /// driven from this so a redirected-window source samples the
+    /// correct sub-region of the backing.
+    pub(crate) src_offset: (i32, i32),
+    /// Trap bbox the engine receives — `(x, y, w, h)` in destination
+    /// (backing-pixmap) pixel coords. Used by Task 3.1's bbox-based
+    /// behavioural assertion when no readback path is available.
+    pub(crate) bbox: (i32, i32, u32, u32),
+    pub(crate) instance_count: u32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TopLevelStackHint {
     Bottom,
@@ -256,6 +287,15 @@ pub struct KmsBackendV2 {
     /// rect set without needing a live Vk fixture. Production paths
     /// don't observe it.
     pub(crate) last_render_composite_dst_clip: Option<Option<Vec<Rectangle16>>>,
+
+    /// Test-only capture of the most recent
+    /// `Backend::render_trapezoids` dispatch — see
+    /// [`RecordedTrapsOrTrisArgs`]. Populated unconditionally so the
+    /// systray-applet-redirect regression tests (Task 3.1) can assert
+    /// on the post-resolve `(src_id, dst_id, dst_offset, bbox, …)`
+    /// tuple without needing a live Vk fixture. Production paths
+    /// don't observe it.
+    pub(crate) last_render_trapezoids_args: Option<RecordedTrapsOrTrisArgs>,
 
     /// Diagnostic ring of recent `PRESENT::Pixmap` source xids
     /// targeted at COW. Captured via `note_present_pixmap` and
@@ -598,6 +638,7 @@ impl KmsBackendV2 {
             engine_copy_area_calls: 0,
             last_render_composite_args: None,
             last_render_composite_dst_clip: None,
+            last_render_trapezoids_args: None,
             present_to_cow_sources: std::collections::VecDeque::with_capacity(16),
             recent_present_pixmaps: std::collections::VecDeque::with_capacity(32),
             dri3_xshmfences: HashMap::new(),
@@ -719,6 +760,7 @@ impl KmsBackendV2 {
             engine_copy_area_calls: 0,
             last_render_composite_args: None,
             last_render_composite_dst_clip: None,
+            last_render_trapezoids_args: None,
             present_to_cow_sources: std::collections::VecDeque::with_capacity(16),
             recent_present_pixmaps: std::collections::VecDeque::with_capacity(32),
             dri3_xshmfences: HashMap::new(),
@@ -1280,6 +1322,7 @@ impl KmsBackendV2 {
             engine_copy_area_calls: 0,
             last_render_composite_args: None,
             last_render_composite_dst_clip: None,
+            last_render_trapezoids_args: None,
             present_to_cow_sources: std::collections::VecDeque::with_capacity(16),
             recent_present_pixmaps: std::collections::VecDeque::with_capacity(32),
             dri3_xshmfences: HashMap::new(),
@@ -2921,6 +2964,7 @@ impl KmsBackendV2 {
                 None,
                 0,
                 0,
+                (0, 0), // src_offset — Solid has no redirect.
             )
             .map(|_| ())
             .map_err(|e| {
@@ -3011,6 +3055,7 @@ impl KmsBackendV2 {
                 None,
                 0,
                 0,
+                (0, 0), // src_offset — Gradient has no redirect.
             )
             .map(|_| ())
             .map_err(|e| {
@@ -10757,8 +10802,16 @@ impl Backend for KmsBackendV2 {
         // Resolve src + dst via the same helpers render_composite
         // uses. The trap path doesn't read GC clip — picture clip
         // (from dst) is what scopes the draw (plan §4).
-        let Some((src_resolved, src_repeat, src_transform, _src_ca)) =
-            resolve_picture_for_render(&self.core, &self.store, host_src)
+        //
+        // Task 3.1: route through `resolve_source_picture` so a
+        // source picture wrapping a redirected window resolves to
+        // the BACKING's `DrawableId` (with the descendant's offset
+        // captured in `src_offset` for the composite phase below).
+        // For an unredirected drawable the offset is `(0, 0)` and
+        // behaviour matches the prior `resolve_picture_for_render`
+        // call.
+        let Some((src_resolved, src_repeat, src_transform, _src_ca, src_offset)) =
+            self.resolve_source_picture(host_src)
         else {
             log::debug!("v2 render_trapezoids gap: src 0x{host_src:x} not resolvable");
             return Ok(());
@@ -10822,6 +10875,24 @@ impl Backend for KmsBackendV2 {
         // xRGB32 sources must pin α=ONE on the sample view.
         let src_pict_format = picture_pict_format(&self.core, host_src);
         let dst_pict_format = picture_pict_format(&self.core, host_dst);
+        // Test-only capture for the engine-recorder pattern (see
+        // `RecordedTrapsOrTrisArgs`). Branchless write; production
+        // paths don't observe it. Captures the POST-resolve,
+        // POST-shift tuple — i.e. exactly what the engine call below
+        // sees.
+        #[allow(clippy::cast_possible_truncation)]
+        let inst_count_u32 = decoded.len() as u32;
+        self.last_render_trapezoids_args = Some(RecordedTrapsOrTrisArgs {
+            src_id: match src_resolved {
+                crate::kms::v2::engine::ResolvedSource::Drawable(id) => Some(id),
+                _ => None,
+            },
+            dst_id: dst_target.id,
+            dst_offset: dst_target.offset,
+            src_offset,
+            bbox: (bx, by, bw, bh),
+            instance_count: inst_count_u32,
+        });
         let stats = self.engine.render_traps_or_tris(
             &mut self.store,
             &mut self.platform,
@@ -10830,16 +10901,14 @@ impl Backend for KmsBackendV2 {
             dst_target.id,
             TrapPrimKind::Trapezoid,
             &instance_bytes,
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                decoded.len() as u32
-            },
+            inst_count_u32,
             (bx, by, bw, bh),
             dst_clip.as_deref(),
             src_repeat,
             src_transform,
             src_pict_format,
             dst_pict_format,
+            src_offset,
         );
         self.sync_descriptor_pool_telemetry();
         let src_class = self.picture_src_class_by_xid(host_src);
@@ -11022,6 +11091,11 @@ impl Backend for KmsBackendV2 {
             src_transform,
             src_pict_format,
             dst_pict_format,
+            // Triangles still use `resolve_picture_for_render` (no
+            // redirect-offset support yet); Task 3.1 scope was
+            // trapezoids only. Out-of-task follow-up: thread
+            // `resolve_source_picture` into render_triangles_op too.
+            (0, 0),
         );
         self.sync_descriptor_pool_telemetry();
         let src_class = self.picture_src_class_by_xid(host_src);
@@ -16179,6 +16253,213 @@ mod tests {
             "picture-local source clip must map identity into dst space \
              — `src_translation` must NOT fold the redirect offset",
         );
+    }
+
+    /// Pack a single trapezoid into the 40-byte wire format the
+    /// `Backend::render_trapezoids` decoder expects. Coords are
+    /// in 16.16 fixed-point. Helper for Task 3.1 tests below.
+    fn pack_single_trapezoid(top: i32, bottom: i32, left: i32, right: i32) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(40);
+        let push = |buf: &mut Vec<u8>, v: i32| buf.extend_from_slice(&v.to_le_bytes());
+        // Fixed-point conversion: integer pixel * 65536.
+        let fx = |p: i32| p << 16;
+        push(&mut buf, fx(top));
+        push(&mut buf, fx(bottom));
+        // left_p1, left_p2
+        push(&mut buf, fx(left));
+        push(&mut buf, fx(top));
+        push(&mut buf, fx(left));
+        push(&mut buf, fx(bottom));
+        // right_p1, right_p2
+        push(&mut buf, fx(right));
+        push(&mut buf, fx(top));
+        push(&mut buf, fx(right));
+        push(&mut buf, fx(bottom));
+        debug_assert_eq!(buf.len(), 40);
+        buf
+    }
+
+    /// Systray-applet redirect fix Task 3.1: mirror of Task 2.1
+    /// (`render_composite_src_picture_on_redirected_window_translates_sample_coords`)
+    /// but covering the `Backend::render_trapezoids` path. The trap
+    /// `render_traps_or_tris` engine entry has no `src_x` / `src_y`
+    /// parameter, so the assertion is narrower than Task 2.1: the
+    /// engine must receive the BACKING's `DrawableId` as the source,
+    /// not the leaf child id.
+    ///
+    /// Pre-fix the trap path resolves through
+    /// `resolve_picture_for_render`, which returns the LEAF id; this
+    /// test fails. Step 4's swap to `self.resolve_source_picture`
+    /// makes it pass.
+    #[test]
+    fn render_trapezoids_src_picture_on_redirected_window_resolves_to_backing() {
+        use crate::kms::v2::store::{DrawableKind, Storage};
+        use yserver_core::backend::Backend;
+
+        let mut b = KmsBackendV2::for_tests();
+        // Outer 0x100 → backing 0x900. Child 0x200 at (10, 20) under
+        // outer; the source picture wraps this child.
+        let w_id = seed_window(&mut b, 0x100, None, 0, 0);
+        let _c_id = seed_window(&mut b, 0x200, Some(0x100), 10, 20);
+        let backing_id = b
+            .store
+            .allocate(
+                0x900,
+                DrawableKind::RedirectedBacking,
+                32,
+                false,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 100,
+                        height: 100,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("backing allocate");
+        b.store.set_redirected_target(w_id, Some(backing_id));
+
+        // Source picture wraps the child (descendant of redirected
+        // outer).
+        b.core.pictures.insert(
+            0xA000,
+            PictureRecord::drawable_default(0x200, /* pict_format */ 0),
+        );
+        // Dst picture wraps a plain pixmap — identity (no redirect).
+        let dst_pix_id = b
+            .store
+            .allocate(
+                0xB000,
+                DrawableKind::Pixmap,
+                32,
+                false,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 100,
+                        height: 100,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("dst pixmap allocate");
+        b.core.pictures.insert(
+            0xA001,
+            PictureRecord::drawable_default(0xB000, /* pict_format */ 0),
+        );
+
+        // Single unit-square trapezoid at (2, 3, 6, 8). The shape is
+        // irrelevant to the assertion — the test only inspects the
+        // engine-receive args via the recorder.
+        let traps = pack_single_trapezoid(
+            /* top */ 3, /* bottom */ 8, /* left */ 2, /* right */ 6,
+        );
+
+        // Issue. The engine call returns `NoVk` on the stub fixture
+        // — backend swallows it — but the recorder write happens
+        // BEFORE the engine call.
+        let _ = b.render_trapezoids(
+            None, /* op = Over */ 3, /* host_src */ 0xA000, /* host_dst */ 0xA001,
+            /* host_mask_format */ 0, /* src_x */ 0, /* src_y */ 0, &traps,
+            /* x_off */ 0, /* y_off */ 0,
+        );
+
+        let recorded = b
+            .last_render_trapezoids_args
+            .expect("render_trapezoids must record its post-resolve dispatch args");
+        // Source must resolve to the BACKING, not the leaf child id.
+        assert_eq!(recorded.src_id, Some(backing_id));
+        // Dst unchanged (plain pixmap, no redirect).
+        assert_eq!(recorded.dst_id, dst_pix_id);
+        assert_eq!(recorded.dst_offset, (0, 0));
+    }
+
+    /// Task 3.1 Step 5 — exploratory test: bbox-based behavioural
+    /// assertion that the source-side descendant offset is threaded
+    /// into the engine's `CompositeRect::src_x / src_y`. The trap
+    /// path has no readback fixture in this lib's test harness, so
+    /// we capture the offset the recorder picked up from
+    /// `resolve_source_picture` and assert it equals the descendant
+    /// child's position within the backing.
+    ///
+    /// Why this matters: at the composite phase, the shader samples
+    /// the source picture at `src_origin + v_dst_offset`. The trap
+    /// path passes `src_x = 0, src_y = 0` to the engine for the
+    /// rect's `src_origin`. If the picture wraps a redirected
+    /// descendant, the descendant's pixels live at a `(off_x,
+    /// off_y)` sub-region of the backing — sampling at `(0, 0)`
+    /// reads the wrong pixels. The fix: thread `src_offset` into
+    /// `CompositeRect::src_x / src_y`. This test pins the offset
+    /// observation contract; the engine-side thread-through is
+    /// covered by `render_trapezoids_threads_src_offset_to_engine`
+    /// once the seam is implemented.
+    #[test]
+    fn render_trapezoids_src_picture_on_redirected_window_captures_src_offset() {
+        use crate::kms::v2::store::{DrawableKind, Storage};
+        use yserver_core::backend::Backend;
+
+        let mut b = KmsBackendV2::for_tests();
+        let w_id = seed_window(&mut b, 0x100, None, 0, 0);
+        let _c_id = seed_window(&mut b, 0x200, Some(0x100), 10, 20);
+        let _backing_id = b
+            .store
+            .allocate(
+                0x900,
+                DrawableKind::RedirectedBacking,
+                32,
+                false,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 100,
+                        height: 100,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("backing allocate");
+        b.store.set_redirected_target(w_id, Some(_backing_id));
+
+        b.core.pictures.insert(
+            0xA000,
+            PictureRecord::drawable_default(0x200, /* pict_format */ 0),
+        );
+        let _dst_pix_id = b
+            .store
+            .allocate(
+                0xB000,
+                DrawableKind::Pixmap,
+                32,
+                false,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 100,
+                        height: 100,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("dst pixmap allocate");
+        b.core.pictures.insert(
+            0xA001,
+            PictureRecord::drawable_default(0xB000, /* pict_format */ 0),
+        );
+
+        let traps = pack_single_trapezoid(
+            /* top */ 3, /* bottom */ 8, /* left */ 2, /* right */ 6,
+        );
+        let _ = b.render_trapezoids(
+            None, /* op = Over */ 3, /* host_src */ 0xA000, /* host_dst */ 0xA001,
+            /* host_mask_format */ 0, /* src_x */ 0, /* src_y */ 0, &traps,
+            /* x_off */ 0, /* y_off */ 0,
+        );
+
+        let recorded = b
+            .last_render_trapezoids_args
+            .expect("render_trapezoids must record its post-resolve dispatch args");
+        // The descendant child is at (10, 20) within the backing —
+        // `resolve_source_picture` reports this as the source-side
+        // offset that the composite phase needs to apply when
+        // sampling the source picture.
+        assert_eq!(recorded.src_offset, (10, 20));
     }
 
     /// Descendant paint accumulates `(x, y)` offsets up the

@@ -6755,6 +6755,17 @@ impl RenderEngine {
         // #4 closed the trap/tri path that was originally missed).
         src_pict_format: u32,
         dst_pict_format: u32,
+        // Task 3.1 (2026-05-31): source-side redirect offset. When
+        // the source picture wraps a descendant of a redirected
+        // ancestor, this is the descendant's position within the
+        // ancestor's backing (i.e. the `src_offset` reported by
+        // `KmsBackendV2::resolve_source_picture`). The composite
+        // phase folds it into `CompositeRect::src_x / src_y` so the
+        // shader's `src_origin + v_dst_offset` sample lands in the
+        // descendant's sub-region of the backing. `(0, 0)` for
+        // unredirected drawables / Solid / Gradient — matches the
+        // pre-task behaviour.
+        src_offset: (i32, i32),
     ) -> Result<CompositeStats, RenderError> {
         use crate::kms::vk::render_pipeline::StdPictOp;
 
@@ -7171,6 +7182,8 @@ impl RenderEngine {
             instance_count,
             clip_scissors,
             vertex_pool_pin,
+            src_offset_x: src_offset.0,
+            src_offset_y: src_offset.1,
         });
         {
             let inner = self.inner.as_mut().expect("inner");
@@ -9051,9 +9064,17 @@ fn emit_recorded_render_traps_or_tris_into_cb(
         mask_xform: vk_render::AffineXform::IDENTITY,
     };
 
+    // Task 3.1 (2026-05-31): thread the source-side redirect offset
+    // into the composite phase's `src_x / src_y`. When the source
+    // picture wraps a descendant of a redirected ancestor, the
+    // ancestor's backing is bound as the sampler and the descendant
+    // lives at `(src_offset_x, src_offset_y)` within it; the shader
+    // samples at `src_origin + v_dst_offset`, so seeding
+    // `src_origin = src_offset` lands the read in the descendant's
+    // sub-region instead of the backing's top-left.
     let rects = [vk_render::CompositeRect {
-        src_x: 0,
-        src_y: 0,
+        src_x: rt.src_offset_x,
+        src_y: rt.src_offset_y,
         mask_x: mask_off_x,
         mask_y: mask_off_y,
         dst_x: render_dst_x,
