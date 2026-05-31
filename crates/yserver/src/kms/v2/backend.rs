@@ -11018,8 +11018,15 @@ impl Backend for KmsBackendV2 {
         if tris.is_empty() {
             return Ok(());
         }
-        let Some((src_resolved, src_repeat, src_transform, _src_ca)) =
-            resolve_picture_for_render(&self.core, &self.store, host_src)
+        // Task 3.2: mirror Task 3.1's trap-path resolve swap. Route
+        // through `resolve_source_picture` so a source picture wrapping
+        // a redirected window resolves to the BACKING's `DrawableId`
+        // (with the descendant's offset captured in `src_offset` for
+        // the composite-phase sampling below). For an unredirected
+        // drawable the offset is `(0, 0)` and behaviour matches the
+        // prior `resolve_picture_for_render` call.
+        let Some((src_resolved, src_repeat, src_transform, _src_ca, src_offset)) =
+            self.resolve_source_picture(host_src)
         else {
             log::debug!("v2 render_triangles gap: src 0x{host_src:x} not resolvable");
             return Ok(());
@@ -11073,6 +11080,28 @@ impl Backend for KmsBackendV2 {
         // the trapezoid path; see that call site for rationale.
         let src_pict_format = picture_pict_format(&self.core, host_src);
         let dst_pict_format = picture_pict_format(&self.core, host_dst);
+        // Test-only capture, mirroring the trapezoid path's recorder
+        // write (see `RecordedTrapsOrTrisArgs` and the trapezoid call
+        // site at "self.last_render_trapezoids_args ="). The field is
+        // shape-agnostic to trap vs triangle — both share
+        // `RenderEngine::render_traps_or_tris` — so the triangle path
+        // writes into the SAME slot. Branchless write; production
+        // paths don't observe it. Captures the POST-resolve,
+        // POST-shift tuple — i.e. exactly what the engine call below
+        // sees.
+        #[allow(clippy::cast_possible_truncation)]
+        let inst_count_u32 = tris.len() as u32;
+        self.last_render_trapezoids_args = Some(RecordedTrapsOrTrisArgs {
+            src_id: match src_resolved {
+                crate::kms::v2::engine::ResolvedSource::Drawable(id) => Some(id),
+                _ => None,
+            },
+            dst_id: dst_target.id,
+            dst_offset: dst_target.offset,
+            src_offset,
+            bbox: (bx, by, bw, bh),
+            instance_count: inst_count_u32,
+        });
         let stats = self.engine.render_traps_or_tris(
             &mut self.store,
             &mut self.platform,
@@ -11081,21 +11110,14 @@ impl Backend for KmsBackendV2 {
             dst_target.id,
             TrapPrimKind::Triangle,
             &instance_bytes,
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                tris.len() as u32
-            },
+            inst_count_u32,
             (bx, by, bw, bh),
             dst_clip.as_deref(),
             src_repeat,
             src_transform,
             src_pict_format,
             dst_pict_format,
-            // Triangles still use `resolve_picture_for_render` (no
-            // redirect-offset support yet); Task 3.1 scope was
-            // trapezoids only. Out-of-task follow-up: thread
-            // `resolve_source_picture` into render_triangles_op too.
-            (0, 0),
+            src_offset,
         );
         self.sync_descriptor_pool_telemetry();
         let src_class = self.picture_src_class_by_xid(host_src);
@@ -16455,6 +16477,198 @@ mod tests {
         let recorded = b
             .last_render_trapezoids_args
             .expect("render_trapezoids must record its post-resolve dispatch args");
+        // The descendant child is at (10, 20) within the backing —
+        // `resolve_source_picture` reports this as the source-side
+        // offset that the composite phase needs to apply when
+        // sampling the source picture.
+        assert_eq!(recorded.src_offset, (10, 20));
+    }
+
+    /// Pack a single triangle into the 24-byte wire format the
+    /// `Backend::render_triangles_op` decoder expects for minor = 11
+    /// (`Triangles`). Each XPointFixed is `(i32 x, i32 y)` in 16.16
+    /// fixed-point — 8 bytes per point × 3 points = 24 bytes.
+    /// Helper for Task 3.2 tests below.
+    fn pack_single_triangle(p1: (i32, i32), p2: (i32, i32), p3: (i32, i32)) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(24);
+        let push = |buf: &mut Vec<u8>, v: i32| buf.extend_from_slice(&v.to_le_bytes());
+        let fx = |p: i32| p << 16;
+        push(&mut buf, fx(p1.0));
+        push(&mut buf, fx(p1.1));
+        push(&mut buf, fx(p2.0));
+        push(&mut buf, fx(p2.1));
+        push(&mut buf, fx(p3.0));
+        push(&mut buf, fx(p3.1));
+        debug_assert_eq!(buf.len(), 24);
+        buf
+    }
+
+    /// Systray-applet redirect fix Task 3.2: mirror of Task 3.1
+    /// (`render_trapezoids_src_picture_on_redirected_window_resolves_to_backing`)
+    /// but covering the `Backend::render_triangles_op` path. Triangles
+    /// share `RenderEngine::render_traps_or_tris` with trapezoids — the
+    /// engine entrypoint is the same — so the source-side resolve
+    /// requirement is identical: a picture wrapping a redirected
+    /// window must surface the BACKING's `DrawableId` to the engine,
+    /// not the leaf child id.
+    ///
+    /// Pre-fix the triangle path resolves through
+    /// `resolve_picture_for_render`, which returns the LEAF id; this
+    /// test fails (and also fails because the recorder doesn't fire
+    /// at all on the triangle path pre-fix). Step 4's swap to
+    /// `self.resolve_source_picture` plus the new recorder write
+    /// inside `render_triangles_op` makes it pass.
+    #[test]
+    fn render_triangles_src_picture_on_redirected_window_resolves_to_backing() {
+        use crate::kms::v2::store::{DrawableKind, Storage};
+        use yserver_core::backend::Backend;
+
+        let mut b = KmsBackendV2::for_tests();
+        // Outer 0x100 → backing 0x900. Child 0x200 at (10, 20) under
+        // outer; the source picture wraps this child.
+        let w_id = seed_window(&mut b, 0x100, None, 0, 0);
+        let _c_id = seed_window(&mut b, 0x200, Some(0x100), 10, 20);
+        let backing_id = b
+            .store
+            .allocate(
+                0x900,
+                DrawableKind::RedirectedBacking,
+                32,
+                false,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 100,
+                        height: 100,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("backing allocate");
+        b.store.set_redirected_target(w_id, Some(backing_id));
+
+        // Source picture wraps the child (descendant of redirected
+        // outer).
+        b.core.pictures.insert(
+            0xA000,
+            PictureRecord::drawable_default(0x200, /* pict_format */ 0),
+        );
+        // Dst picture wraps a plain pixmap — identity (no redirect).
+        let dst_pix_id = b
+            .store
+            .allocate(
+                0xB000,
+                DrawableKind::Pixmap,
+                32,
+                false,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 100,
+                        height: 100,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("dst pixmap allocate");
+        b.core.pictures.insert(
+            0xA001,
+            PictureRecord::drawable_default(0xB000, /* pict_format */ 0),
+        );
+
+        // Single triangle at (2,3)-(6,3)-(2,8). Shape is irrelevant
+        // to the assertion — the test only inspects the engine-receive
+        // args via the recorder.
+        let tris = pack_single_triangle((2, 3), (6, 3), (2, 8));
+
+        // Issue via the Backend trait. Use minor = 11 (Triangles).
+        // The engine call returns `NoVk` on the stub fixture —
+        // backend swallows it — but the recorder write happens
+        // BEFORE the engine call.
+        let _ = b.render_triangles_op(
+            None, /* minor */ 11, /* op = Over */ 3, /* host_src */ 0xA000,
+            /* host_dst */ 0xA001, /* host_mask_format */ 0, /* src_x */ 0,
+            /* src_y */ 0, &tris, /* x_off */ 0, /* y_off */ 0,
+        );
+
+        let recorded = b
+            .last_render_trapezoids_args
+            .expect("render_triangles_op must record its post-resolve dispatch args");
+        // Source must resolve to the BACKING, not the leaf child id.
+        assert_eq!(recorded.src_id, Some(backing_id));
+        // Dst unchanged (plain pixmap, no redirect).
+        assert_eq!(recorded.dst_id, dst_pix_id);
+        assert_eq!(recorded.dst_offset, (0, 0));
+    }
+
+    /// Task 3.2 Step 5 — mirror of Task 3.1's
+    /// `render_trapezoids_src_picture_on_redirected_window_captures_src_offset`
+    /// for the triangle path. Asserts that the captured `src_offset`
+    /// matches the descendant's position within the backing, proving
+    /// the (0, 0) stub at the engine call site is replaced with the
+    /// real offset reported by `resolve_source_picture`.
+    ///
+    /// See the trapezoid sibling test's docstring for the broader
+    /// rationale around `CompositeRect::src_x / src_y` sampling.
+    #[test]
+    fn render_triangles_src_picture_on_redirected_window_captures_src_offset() {
+        use crate::kms::v2::store::{DrawableKind, Storage};
+        use yserver_core::backend::Backend;
+
+        let mut b = KmsBackendV2::for_tests();
+        let w_id = seed_window(&mut b, 0x100, None, 0, 0);
+        let _c_id = seed_window(&mut b, 0x200, Some(0x100), 10, 20);
+        let _backing_id = b
+            .store
+            .allocate(
+                0x900,
+                DrawableKind::RedirectedBacking,
+                32,
+                false,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 100,
+                        height: 100,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("backing allocate");
+        b.store.set_redirected_target(w_id, Some(_backing_id));
+
+        b.core.pictures.insert(
+            0xA000,
+            PictureRecord::drawable_default(0x200, /* pict_format */ 0),
+        );
+        let _dst_pix_id = b
+            .store
+            .allocate(
+                0xB000,
+                DrawableKind::Pixmap,
+                32,
+                false,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 100,
+                        height: 100,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("dst pixmap allocate");
+        b.core.pictures.insert(
+            0xA001,
+            PictureRecord::drawable_default(0xB000, /* pict_format */ 0),
+        );
+
+        let tris = pack_single_triangle((2, 3), (6, 3), (2, 8));
+        let _ = b.render_triangles_op(
+            None, /* minor */ 11, /* op = Over */ 3, /* host_src */ 0xA000,
+            /* host_dst */ 0xA001, /* host_mask_format */ 0, /* src_x */ 0,
+            /* src_y */ 0, &tris, /* x_off */ 0, /* y_off */ 0,
+        );
+
+        let recorded = b
+            .last_render_trapezoids_args
+            .expect("render_triangles_op must record its post-resolve dispatch args");
         // The descendant child is at (10, 20) within the backing —
         // `resolve_source_picture` reports this as the source-side
         // offset that the composite phase needs to apply when
