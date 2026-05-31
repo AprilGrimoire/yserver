@@ -1365,6 +1365,75 @@ impl KmsBackendV2 {
         result
     }
 
+    /// Source-picture analogue of `resolve_paint_target`. Returns the
+    /// `ResolvedSource` already walked through COMPOSITE redirect: for
+    /// a `PictureRecord::Drawable` whose `host_xid` identifies a
+    /// window with an effective redirected ancestor backing, the
+    /// `Drawable(id)` is the BACKING's id and the returned offset is
+    /// the descendant's offset within the backing. Callers must add
+    /// that offset to the picture's `src_x` / `src_y` before passing
+    /// the rect to the engine, so the sample position lands on the
+    /// right sub-region of the backing.
+    ///
+    /// For `Solid` / `Gradient` / `None` picture variants, no redirect
+    /// walk applies and the offset is `(0, 0)`.
+    ///
+    /// Mirrors Xorg's `pPicture->pDrawable` redirection: in Xorg a
+    /// redirected window's `pDrawable` points at the backing pixmap
+    /// (`xserver/composite/compwindow.c:121-152`), so the picture
+    /// already samples backing content. v2 retains the leaf `host_xid`
+    /// in `PictureRecord::Drawable`, so the walk happens at sample
+    /// time via this helper.
+    #[allow(
+        clippy::type_complexity,
+        reason = "tuple shape mirrors resolve_picture_for_render plus a redirect offset; \
+                  one-shot helper, not worth a named struct"
+    )]
+    #[allow(
+        dead_code,
+        reason = "introduced by Task 1.1 of the systray-applet redirect fix; \
+                  call sites in render_composite / render_fill_rectangles are \
+                  wired by subsequent tasks in the same plan"
+    )]
+    pub(crate) fn resolve_source_picture(
+        &self,
+        host_pic: u32,
+    ) -> Option<(
+        crate::kms::v2::engine::ResolvedSource,
+        crate::kms::cpu_types::Repeat,
+        Option<PictTransform>,
+        bool,
+        (i32, i32),
+    )> {
+        use crate::kms::v2::engine::ResolvedSource;
+        let record = self.core.pictures.get(&host_pic)?;
+        match record {
+            PictureRecord::Drawable {
+                host_xid,
+                repeat,
+                transform,
+                component_alpha,
+                ..
+            } => {
+                let target = self.resolve_paint_target(*host_xid)?;
+                Some((
+                    ResolvedSource::Drawable(target.id),
+                    *repeat,
+                    *transform,
+                    *component_alpha,
+                    target.offset,
+                ))
+            }
+            _ => {
+                // Non-Drawable picture variants — fall through to the
+                // existing resolution path; offset = (0, 0).
+                let (resolved, repeat, transform, ca) =
+                    resolve_picture_for_render(&self.core, &self.store, host_pic)?;
+                Some((resolved, repeat, transform, ca, (0, 0)))
+            }
+        }
+    }
+
     /// Lazy COW scene registration. Called from every paint method
     /// after `resolve_paint_target` succeeds: if the resolved target
     /// is the Composite Overlay Window storage and the scene has
@@ -15516,6 +15585,59 @@ mod tests {
                 offset: (0, 0)
             }
         );
+    }
+
+    /// Source-picture analogue: a `PictureRecord::Drawable` wrapping
+    /// a redirected window's `host_xid` must resolve through the
+    /// redirect walk, returning the backing's `DrawableId` (not the
+    /// leaf window's id) with a zero offset for the redirected node
+    /// itself. Regression test for the systray-applet asymmetric-gap
+    /// bug: source pictures bypassed `resolve_paint_target` and
+    /// sampled empty leaf content.
+    #[test]
+    fn resolve_source_picture_redirected_window_routes_to_backing() {
+        use crate::kms::v2::store::{DrawableKind, Storage};
+        let mut b = KmsBackendV2::for_tests();
+        // Window 0x100 at root, redirected to backing 0x900.
+        let w_id = seed_window(&mut b, 0x100, None, 0, 0);
+        let backing_id = b
+            .store
+            .allocate(
+                0x900,
+                DrawableKind::RedirectedBacking,
+                32,
+                false,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 100,
+                        height: 100,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("backing allocate");
+        b.store.set_redirected_target(w_id, Some(backing_id));
+        // Register a Drawable picture wrapping the window's host xid.
+        // `PictureRecord::drawable_default` is the canonical Drawable
+        // constructor (see kms/core.rs:578) — it sets host_xid +
+        // pict_format and leaves all optional fields at their X
+        // RENDER protocol defaults: repeat = Repeat::None,
+        // transform = None, component_alpha = false.
+        b.core.pictures.insert(
+            0xA000,
+            PictureRecord::drawable_default(0x100, /* pict_format */ 0),
+        );
+
+        let (resolved, repeat, transform, ca, offset) =
+            b.resolve_source_picture(0xA000).expect("resolve");
+        assert!(matches!(
+            resolved,
+            crate::kms::v2::engine::ResolvedSource::Drawable(id) if id == backing_id
+        ));
+        assert!(matches!(repeat, crate::kms::cpu_types::Repeat::None));
+        assert_eq!(transform, None);
+        assert!(!ca);
+        assert_eq!(offset, (0, 0));
     }
 
     /// Descendant paint accumulates `(x, y)` offsets up the
