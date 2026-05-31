@@ -16277,6 +16277,228 @@ mod tests {
         );
     }
 
+    /// Systray-applet redirect fix Task 4.1: full integration test
+    /// exercising the **tray-applet pattern** end-to-end through the
+    /// `Backend::*` API surface. This is the load-bearing regression
+    /// test that catches any future refactor silently breaking
+    /// source-side redirect routing.
+    ///
+    /// Stages the systray-applet shape (mate-panel/notification-area-
+    /// applet style):
+    ///   1. Proxy window `0x100` (24×27) at root, manually redirected
+    ///      to backing `0x900`. This is the applet's tray proxy that
+    ///      reparents external tray-icon clients into itself.
+    ///   2. Embedded icon window `0x200` (24×27) reparented as child
+    ///      of `0x100` at `(0, 0)` — the external tray-icon client's
+    ///      top-level window.
+    ///   3. Icon-client write at `(5, 5)` sized `(3, 3)` via
+    ///      `Backend::render_fill_rectangles` against a picture
+    ///      wrapping the icon's host xid. Must route through
+    ///      `resolve_paint_target(icon)` → backing `0x900` so the
+    ///      pixels actually land in the proxy's backing storage.
+    ///   4. Applet composite from `picture(proxy)` into a scratch dst
+    ///      pixmap via `Backend::render_composite`. Must route the
+    ///      source through `resolve_source_picture(proxy)` → backing
+    ///      `0x900` so the read SAMPLES the same storage the icon
+    ///      just wrote.
+    ///
+    /// Without the Phase 1-3 fix, step 4's source resolves to the
+    /// proxy's leaf storage (empty under Manual redirect — the icon's
+    /// write went to the backing but the composite read goes to the
+    /// leaf), and the dst stays cleared. With the fix, source and
+    /// dst-side paint both resolve to the same backing and the icon
+    /// contribution is visible.
+    ///
+    /// Implementation note: the v2 engine returns `NoVk` on the
+    /// `Storage::for_tests_null` fixture so a full pixel readback
+    /// isn't available. We assert the strongest behavior the
+    /// `last_render_composite_args` recorder + `resolve_paint_target`
+    /// can express:
+    ///   - `recorded.src_id == Some(backing_id)` — proves the
+    ///     composite's source resolved to the BACKING, not the proxy's
+    ///     leaf id. This is the load-bearing source-side redirect
+    ///     routing that Phases 1-3 added.
+    ///   - `resolve_paint_target(icon_xid).id == backing_id` — proves
+    ///     the icon-client write lands on the SAME backing the
+    ///     composite read samples (the two halves of the systray
+    ///     pattern share storage).
+    ///   - `recorded.dst_id == dst_pix_id` — confirms the dst stays
+    ///     identity; the source's redirect doesn't leak into dst.
+    #[test]
+    fn tray_pattern_composite_from_redirected_proxy_reads_child_pixels() {
+        use crate::kms::v2::store::{DrawableKind, Storage};
+        use yserver_core::backend::Backend;
+
+        let mut b = KmsBackendV2::for_tests();
+
+        // Step 1: proxy window 0x100 (24×27) at root, manually
+        // redirected to backing 0x900. Use the standard seed helper
+        // (which allocates 100×100 storage — fine, the proxy's
+        // geometry only matters for the paint coords below).
+        let proxy_id = seed_window(&mut b, 0x100, None, 0, 0);
+
+        // Step 2: icon window 0x200 (24×27) as child of proxy at
+        // (0, 0). The icon is the external tray-icon client's top-
+        // level, reparented into the applet's proxy.
+        let _icon_id = seed_window(&mut b, 0x200, Some(0x100), 0, 0);
+
+        // Allocate the manual-redirect backing for the proxy.
+        let backing_id = b
+            .store
+            .allocate(
+                0x900,
+                DrawableKind::RedirectedBacking,
+                32,
+                false,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 100,
+                        height: 100,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("backing allocate");
+        b.store.set_redirected_target(proxy_id, Some(backing_id));
+
+        // Picture wrapping the icon child — the icon-client paints
+        // against this on the wire.
+        let icon_pic_xid = 0xA000_u32;
+        b.core.pictures.insert(
+            icon_pic_xid,
+            PictureRecord::drawable_default(0x200, /* pict_format */ 0),
+        );
+
+        // Picture wrapping the proxy — the applet composites from
+        // this to display the embedded icon.
+        let proxy_pic_xid = 0xA001_u32;
+        b.core.pictures.insert(
+            proxy_pic_xid,
+            PictureRecord::drawable_default(0x100, /* pict_format */ 0),
+        );
+
+        // Scratch destination pixmap + picture (the applet's local
+        // offscreen the composite writes into). Plain pixmap → dst
+        // path stays identity so we can verify the source's redirect
+        // doesn't leak into dst.
+        let dst_pix_id = b
+            .store
+            .allocate(
+                0xB000,
+                DrawableKind::Pixmap,
+                32,
+                false,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 100,
+                        height: 100,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("dst pixmap allocate");
+        let dst_pic_xid = 0xA002_u32;
+        b.core.pictures.insert(
+            dst_pic_xid,
+            PictureRecord::drawable_default(0xB000, /* pict_format */ 0),
+        );
+
+        // Step 3: icon-client write at (5, 5) sized (3, 3). Use
+        // `Backend::render_fill_rectangles` against the picture
+        // wrapping the icon — exactly the request path an external
+        // tray-icon client (e.g. an XEmbed-style applet icon) drives.
+        // The wire format is `[x:i16, y:i16, w:u16, h:u16]` LE per
+        // RenderFillRectangles' xRectangle stream.
+        let mut icon_rects: Vec<u8> = Vec::with_capacity(8);
+        icon_rects.extend_from_slice(&5_i16.to_le_bytes()); // x
+        icon_rects.extend_from_slice(&5_i16.to_le_bytes()); // y
+        icon_rects.extend_from_slice(&3_u16.to_le_bytes()); // w
+        icon_rects.extend_from_slice(&3_u16.to_le_bytes()); // h
+        // Wire-premultiplied RGBA (XRenderColor: r/g/b/a as u16 LE).
+        // Solid opaque white — the actual color doesn't matter for the
+        // routing assertion below, only that the write touches the
+        // backing storage.
+        let icon_color: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+        b.render_fill_rectangles(
+            None,
+            icon_pic_xid,
+            /* op = Src */ 1,
+            icon_color,
+            &icon_rects,
+            /* x_off */ 0,
+            /* y_off */ 0,
+        )
+        .expect("icon-client render_fill_rectangles");
+
+        // Confirm the icon-client write routes through `resolve_paint_target`
+        // to the proxy's BACKING — i.e. the two halves of the tray
+        // pattern share storage. Without redirect routing on the
+        // dst side, the write would go to the icon's leaf storage
+        // and the composite below would read empty pixels even if
+        // its source-side resolution were correct.
+        let icon_paint_target = b
+            .resolve_paint_target(0x200)
+            .expect("icon resolve_paint_target");
+        assert_eq!(
+            icon_paint_target.id, backing_id,
+            "icon-client write must land in the proxy's backing (Manual redirect)",
+        );
+        assert_eq!(
+            icon_paint_target.offset,
+            (0, 0),
+            "icon is at (0, 0) under the proxy — offset must be zero",
+        );
+
+        // Step 4: applet composite from picture(proxy) → scratch
+        // dst at (0, 0) sized 24×27. The engine call returns NoVk
+        // on the stub fixture (swallowed by the backend), but
+        // `last_render_composite_args` captures the POST-resolve
+        // tuple BEFORE the engine dispatch, so the source's
+        // resolution is observable regardless of Vk availability.
+        let _ = b.render_composite(
+            None,
+            /* op = Over */ 3,
+            /* host_src */ proxy_pic_xid,
+            /* host_mask */ 0,
+            /* host_dst */ dst_pic_xid,
+            /* src_x */ 0,
+            /* src_y */ 0,
+            /* mask_x */ 0,
+            /* mask_y */ 0,
+            /* dst_x */ 0,
+            /* dst_y */ 0,
+            /* width */ 24,
+            /* height */ 27,
+        );
+
+        let recorded = b
+            .last_render_composite_args
+            .expect("render_composite must record its post-resolve dispatch args");
+        // Load-bearing assertion: source resolved to the BACKING.
+        // Pre-Phase-2, `render_composite` used `resolve_picture_for_render`
+        // which returns the leaf (the proxy's own drawable id),
+        // and this assertion would fail. Post-Phase-2 it uses
+        // `resolve_source_picture` which walks COMPOSITE routing
+        // and reports the backing id.
+        assert_eq!(
+            recorded.src_id,
+            Some(backing_id),
+            "composite source must sample the proxy's BACKING (where the icon-client \
+             write actually landed), not the proxy's leaf storage — this is the \
+             load-bearing source-side redirect routing the tray-applet relies on",
+        );
+        // The proxy itself is the redirected node (not a descendant),
+        // so the descendant offset is zero — the composite samples
+        // the backing at the requested (0, 0) without translation.
+        assert_eq!(recorded.src_x, 0);
+        assert_eq!(recorded.src_y, 0);
+        // Dst stays identity: the source's redirect must NOT leak
+        // into dst coords.
+        assert_eq!(recorded.dst_id, dst_pix_id);
+        assert_eq!(recorded.dst_x, 0);
+        assert_eq!(recorded.dst_y, 0);
+    }
+
     /// Pack a single trapezoid into the 40-byte wire format the
     /// `Backend::render_trapezoids` decoder expects. Coords are
     /// in 16.16 fixed-point. Helper for Task 3.1 tests below.
