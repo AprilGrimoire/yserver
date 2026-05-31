@@ -15691,6 +15691,24 @@ mod tests {
         assert_eq!(offset, (13, 24));
     }
 
+    /// Source-picture identity case: a `PictureRecord::Drawable`
+    /// wrapping a window that has no redirected ancestor must
+    /// resolve with a zero offset. `resolve_source_picture`
+    /// delegates to `resolve_paint_target`, which falls through to
+    /// identity `(0, 0)` for unredirected windows — no backing
+    /// rewrite, no offset accumulation.
+    #[test]
+    fn resolve_source_picture_unredirected_drawable_returns_identity() {
+        let mut b = KmsBackendV2::for_tests();
+        let _w_id = seed_window(&mut b, 0x100, None, 0, 0);
+        b.core.pictures.insert(
+            0xA000,
+            PictureRecord::drawable_default(0x100, /* pict_format */ 0),
+        );
+        let (_, _, _, _, offset) = b.resolve_source_picture(0xA000).expect("resolve");
+        assert_eq!(offset, (0, 0));
+    }
+
     /// Descendant paint accumulates `(x, y)` offsets up the
     /// ancestor chain. W at root with redirect to B; child C at
     /// (10, 20) under W; grandchild G at (3, 4) under C. Paint on
