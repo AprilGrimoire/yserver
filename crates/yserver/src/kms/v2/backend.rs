@@ -2529,21 +2529,21 @@ impl KmsBackendV2 {
         self.armed_vblank_targets.remove(&crtc);
     }
 
-    /// T4: remove the armed-target entry for one specific CRTC.
-    /// Called from `on_crtc_sequence_event` (unconditional clear-arm
-    /// before validating) and any code path that drops a queued
-    /// sequence for a single output (output removal, per-CRTC DPMS).
-    /// Production callers land in Tasks 5 and 8; allow dead_code until then.
+    /// Test-only helper to clear a single CRTC's armed-target entry.
+    /// Production paths inline `self.armed_vblank_targets.remove(&handle)`
+    /// directly at the clear-arm sites (`record_crtc_ust_msc`,
+    /// `on_crtc_sequence_event`); this helper exists for unit tests
+    /// that need to mutate the map without going through those paths.
     #[allow(dead_code)]
     pub(crate) fn clear_armed_vblank_target(&mut self, crtc: ::drm::control::crtc::Handle) {
         self.armed_vblank_targets.remove(&crtc);
     }
 
-    /// T4: clear the entire armed-target map.
-    /// Called from master-loss / suspend paths where all queued
-    /// kernel sequences are implicitly cancelled.
-    /// The production path inlines this via `armed_vblank_targets.clear()`;
-    /// kept for the regression test that proves clearing semantics.
+    /// Test-only helper to clear the entire armed-target map.
+    /// Production paths inline `self.armed_vblank_targets.clear()`
+    /// directly (e.g. inside `arm_idle_vblanks_with` when scanout is
+    /// disallowed); this helper exists for unit tests that need to
+    /// reset the map without going through those paths.
     #[allow(dead_code)]
     pub(crate) fn clear_all_armed_vblank_targets(&mut self) {
         self.armed_vblank_targets.clear();
@@ -6790,10 +6790,15 @@ impl Backend for KmsBackendV2 {
         // or flush_submit_group runs. In Direct mode this is always false
         // → no behaviour change.
         if !self.scanout_allowed() {
-            // We discard the page-flip retires (no DRM master → don't touch scanout
-            // state) but MUST still run the sequence handler so the armed-target
-            // map clears its entries — leaving a stuck entry across suspend is
-            // exactly the failure mode this plan is exiting.
+            // We discard the page-flip retires (no DRM master → don't touch
+            // scanout state) but MUST still run the sequence handler so the
+            // armed-target map clears its entries — leaving a stuck entry
+            // across suspend is exactly the failure mode this plan is exiting.
+            //
+            // The sequence handler will call record_crtc_ust_msc, which pushes
+            // to recent_page_flips. That's safe: a sequence event we receive
+            // after losing DRM master was emitted before the master loss, so
+            // its (msc, ust) is a legitimate kernel-reported timestamp.
             if let Ok((_flips, sequences)) = self.platform.drain_page_flip_events() {
                 for seq in sequences {
                     self.on_crtc_sequence_event(seq.crtc_id_raw, seq.time_ns, seq.sequence);
@@ -12094,14 +12099,15 @@ impl Backend for KmsBackendV2 {
         };
 
         let result = self.arm_idle_vblanks_with(&normalized, |crtc_id, relative, sequence| {
-            let (rel, seq) = if fallback {
-                (true, 1)
-            } else {
-                (relative, sequence)
-            };
+            // In fallback mode, `normalized` already forced target_msc=0
+            // (one entry per CRTC), which arm_idle_vblanks_with maps to
+            // (relative=true, sequence=1). In normal mode, (relative, sequence)
+            // is whatever arm_idle_vblanks_with derived from the input target.
+            // Either way, just pass through.
             let user_data = u64::from(crtc_id);
-            match crate::drm::page_flip::queue_crtc_sequence(&device, crtc_id, rel, seq, user_data)
-            {
+            match crate::drm::page_flip::queue_crtc_sequence(
+                &device, crtc_id, relative, sequence, user_data,
+            ) {
                 Ok(_) => Ok(()),
                 Err(e)
                     if e.raw_os_error() == Some(libc::EOPNOTSUPP)
