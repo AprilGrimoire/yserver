@@ -22,6 +22,65 @@ use crate::drm::{
     modeset::{Output, PropMap},
 };
 
+// ── DRM_IOCTL_CRTC_QUEUE_SEQUENCE plumbing ──────────────────────
+//
+// `drm` 0.15 / `drm-ffi` 0.9 do not wrap this ioctl; we issue it
+// raw. Layouts mirror `<drm/drm.h>` exactly (kernel headers, verified
+// against /usr/include/drm/drm.h on the build host). All multi-byte
+// fields are little-endian on every supported target.
+//
+// Both flags are passed in the `flags` field; combined or'd.
+// (No callers yet — Task 2 in the idle-vblank plan adds the ioctl wrapper.)
+#[allow(dead_code)]
+pub(crate) const DRM_CRTC_SEQUENCE_RELATIVE: u32 = 0x0000_0001;
+#[allow(dead_code)]
+pub(crate) const DRM_CRTC_SEQUENCE_NEXT_ON_MISS: u32 = 0x0000_0002;
+
+/// kernel `DRM_EVENT_CRTC_SEQUENCE` event type id.
+#[allow(dead_code)]
+pub(crate) const DRM_EVENT_CRTC_SEQUENCE: u32 = 0x03;
+
+#[allow(non_camel_case_types, dead_code)]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct drm_crtc_queue_sequence {
+    pub crtc_id: u32,
+    pub flags: u32,
+    /// In: target sequence. Out: actual scheduled sequence.
+    pub sequence: u64,
+    /// Echoed back verbatim in the resulting `drm_event_crtc_sequence`.
+    pub user_data: u64,
+}
+
+#[allow(non_camel_case_types, dead_code)]
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct drm_event_header {
+    pub r#type: u32,
+    pub length: u32,
+}
+
+#[allow(non_camel_case_types, dead_code)]
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct drm_event_crtc_sequence {
+    pub base: drm_event_header,
+    pub user_data: u64,
+    /// CLOCK_MONOTONIC nanoseconds. Signed per kernel header — we
+    /// must `u64::try_from` rather than `as u64`.
+    pub time_ns: i64,
+    pub sequence: u64,
+}
+
+// `_IOWR('d', 0x3C, drm_crtc_queue_sequence)` expanded inline so
+// the request code is a `const` we can also assert in a unit test.
+//   dir = 3 (RW), type = 'd' (0x64), nr = 0x3C, size = 24
+#[allow(dead_code)]
+pub(crate) const DRM_IOCTL_CRTC_QUEUE_SEQUENCE: u64 = ((3u64) << 30)
+    | ((std::mem::size_of::<drm_crtc_queue_sequence>() as u64) << 16)
+    | ((0x64u64) << 8)
+    | 0x3Cu64;
+
 pub fn submit_flip(device: &Device, output: &Output, fb_id: framebuffer::Handle) -> io::Result<()> {
     submit_flip_inner(device, output, fb_id, None, None)
 }
@@ -265,5 +324,37 @@ mod tests {
         dispatch_event(event, &mut |c, msc, t| seen.push((c, msc, t)));
 
         assert_eq!(seen, vec![(handle, 12345u64, ust)]);
+    }
+
+    #[test]
+    fn drm_crtc_queue_sequence_struct_is_24_bytes() {
+        // Header drm.h line 1064: __u32 crtc_id; __u32 flags;
+        // __u64 sequence; __u64 user_data; → 4+4+8+8 = 24 bytes.
+        assert_eq!(std::mem::size_of::<super::drm_crtc_queue_sequence>(), 24);
+        assert_eq!(std::mem::align_of::<super::drm_crtc_queue_sequence>(), 8);
+    }
+
+    #[test]
+    fn drm_event_crtc_sequence_struct_is_32_bytes() {
+        // Header drm.h line 1429: struct drm_event base (8B) +
+        // __u64 user_data + __s64 time_ns + __u64 sequence
+        // = 8 + 8 + 8 + 8 = 32. (The spec note "24 bytes" refers
+        // to the payload AFTER the 8-byte drm_event header; sizeof
+        // of the full struct including header is 32.)
+        assert_eq!(std::mem::size_of::<super::drm_event_crtc_sequence>(), 32);
+    }
+
+    #[test]
+    fn drm_crtc_queue_sequence_ioctl_request_code() {
+        // _IOWR('d' /*0x64*/, 0x3C, drm_crtc_queue_sequence).
+        // _IOC(dir=3 /*RW*/, type='d', nr=0x3C, size=24)
+        //   = (3 << 30) | (24 << 16) | (0x64 << 8) | 0x3C
+        //   = 0xC0186_43C? Compute:
+        //     (3 << 30) = 0xC0000000
+        //     (24 << 16) = 0x00180000
+        //     (0x64 << 8) = 0x00006400
+        //     0x3C = 0x3C
+        //   = 0xC018643C
+        assert_eq!(super::DRM_IOCTL_CRTC_QUEUE_SEQUENCE, 0xC018_643C);
     }
 }
