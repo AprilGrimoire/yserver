@@ -101,7 +101,23 @@ pub fn key_event_fanout_to_state(
         );
     }
 
-    match key_route(state, &event) {
+    let route = key_route(state, &event);
+    crate::core_loop::grab_debug::log(
+        state,
+        &format!(
+            "KEY {} keycode={} state=0x{:x} route={}",
+            if event.pressed { "press" } else { "release" },
+            event.keycode,
+            event.state,
+            match &route {
+                KeyRoute::Drop => "DROP".to_string(),
+                KeyRoute::PassiveGrabOwner { grab_window, .. } =>
+                    format!("PASSIVE-GRAB grab_window=0x{:x}", grab_window.0),
+                KeyRoute::Window(w) => format!("WINDOW 0x{:x}", w.0),
+            },
+        ),
+    );
+    match route {
         KeyRoute::Drop => Vec::new(),
         KeyRoute::PassiveGrabOwner {
             owner,
@@ -354,7 +370,7 @@ fn key_route(state: &mut ServerState, event: &HostKeyEvent) -> KeyRoute {
 /// Per-client `focused_window` is intended to be a global value
 /// mirrored across clients. Pick the first non-ROOT focus we see; if
 /// every client is rooted, return `ROOT_WINDOW`.
-fn current_focus(state: &ServerState) -> ResourceId {
+pub(crate) fn current_focus(state: &ServerState) -> ResourceId {
     state
         .clients
         .values()

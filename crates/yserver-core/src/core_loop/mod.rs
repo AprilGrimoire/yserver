@@ -9,6 +9,7 @@ pub mod client_io;
 pub mod client_reader;
 pub mod damage_fanout;
 pub mod fanout;
+pub mod grab_debug;
 pub mod key_fanout;
 pub mod message;
 pub mod pointer_fanout;

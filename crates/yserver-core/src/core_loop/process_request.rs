@@ -8895,6 +8895,13 @@ fn handle_xi2_request(
                 "client {} #{} XIGrabDevice window=0x{:x} deviceid={} cursor=0x{:x} -> Success",
                 client_id.0, sequence.0, grab_window, deviceid, cursor
             );
+            crate::core_loop::grab_debug::log(
+                state,
+                &format!(
+                    "XIGrabDevice client={} dev={} win=0x{grab_window:x} owner_events={owner_events}",
+                    client_id.0, deviceid
+                ),
+            );
             // Synthesised XI2 crossings on grab activation. Matches
             // Xorg `Xi/exevents.c::ActivateKeyboardGrab` /
             // `ActivatePointerGrab` (which call `DoEnterLeaveEvents`
@@ -8960,6 +8967,24 @@ fn handle_xi2_request(
             // Emit Enter/FocusIn on the new grab window.
             let xi_evtype: u16 = if deviceid == 3 { 9 } else { 7 }; // FocusIn / Enter
             emit_xi_crossing(state, xi_evtype, ResourceId(grab_window));
+            // Keyboard grab also sends the PREVIOUSLY-FOCUSED window's
+            // client a core (and XI2) FocusOut(NotifyGrab), per Xorg
+            // `ActivateKeyboardGrab` -> `DoFocusEvents(oldWin, grabWin,
+            // NotifyGrab)`. The XI_FocusIn above only reaches the grab
+            // requester; the old focus owner (muffin/mutter core) needs
+            // this to keep its grab state machine in sync. NotifyGrab = 1.
+            if deviceid == 3 {
+                let old_focus = crate::core_loop::key_fanout::current_focus(state);
+                emit_grab_focus_chain(
+                    state,
+                    old_focus,
+                    ResourceId(grab_window),
+                    1,
+                    ResourceId(grab_window),
+                    root_x,
+                    root_y,
+                );
+            }
             let mut reply = x11::fixed_reply(byte_order, sequence, 0, 0);
             reply.extend_from_slice(&[0u8; 24]);
             buf.extend_from_slice(&reply);
@@ -9042,10 +9067,33 @@ fn handle_xi2_request(
                             deviceid,
                         );
                     });
+                // Keyboard ungrab returns focus to the persistent focus
+                // window; notify ITS client with core (+XI2)
+                // FocusIn(NotifyUngrab), per Xorg `DeactivateKeyboardGrab`
+                // -> `DoFocusEvents(grabWin, focusWin, NotifyUngrab)`. The
+                // XI_FocusOut above only reaches the ungrabbing client;
+                // muffin/mutter core needs this to re-arm its grab state
+                // machine. NotifyUngrab = 2.
+                if deviceid == 3 {
+                    let restored_focus = crate::core_loop::key_fanout::current_focus(state);
+                    emit_grab_focus_chain(
+                        state,
+                        grab_window,
+                        restored_focus,
+                        2,
+                        grab_window,
+                        root_x,
+                        root_y,
+                    );
+                }
             }
             debug!(
                 "client {} #{} XIUngrabDevice deviceid={}",
                 client_id.0, sequence.0, deviceid
+            );
+            crate::core_loop::grab_debug::log(
+                state,
+                &format!("XIUngrabDevice client={} dev={deviceid}", client_id.0),
             );
             return Ok(RequestOutcome::Handled);
         }
@@ -9091,6 +9139,13 @@ fn handle_xi2_request(
             debug!(
                 "client {} #{} XIAllowEvents deviceid={} mode={}",
                 client_id.0, sequence.0, deviceid, mode
+            );
+            crate::core_loop::grab_debug::log(
+                state,
+                &format!(
+                    "XIAllowEvents client={} dev={deviceid} mode={mode} (pre-release)",
+                    client_id.0
+                ),
             );
             // AsyncDevice / ReplayDevice / paired-async modes all
             // release the grab on the requested device. The paired-
@@ -9155,6 +9210,13 @@ fn handle_xi2_request(
                     let _dropped = replay_frozen_key_to_focus(state, event);
                 }
             }
+            crate::core_loop::grab_debug::log(
+                state,
+                &format!(
+                    "XIAllowEvents client={} dev={deviceid} mode={mode} releases_grab={releases_grab} replay={replay} (post)",
+                    client_id.0
+                ),
+            );
             return Ok(RequestOutcome::Handled);
         }
         54 => {
@@ -10541,6 +10603,67 @@ fn set_focused_window_to_state(state: &mut ServerState, client_id: ClientId, win
             ptr_x,
             ptr_y,
         );
+    }
+}
+
+/// Emit the X11 focus-change event chain for a keyboard grab
+/// activation or release, mirroring Xorg `dix/events.c`
+/// (`ActivateKeyboardGrab` -> `DoFocusEvents(oldWin, grabWin,
+/// NotifyGrab)`; `DeactivateKeyboardGrab` -> `DoFocusEvents(grabWin,
+/// focusWin, NotifyUngrab)`).
+///
+/// `mode` is the X11 focus event mode: `1` = NotifyGrab, `2` =
+/// NotifyUngrab. `skip` is the grab window itself — the grab/ungrab
+/// handler already emits that endpoint's XI2 crossing to the grab
+/// requester, so we skip it here to avoid a duplicate and only fan the
+/// chain out to the *other* windows (notably the previously-focused
+/// window's client). Without the core `FocusOut(NotifyGrab)` to that
+/// old focus owner, muffin/mutter's core connection never learns a
+/// keyboard grab activated and its grab state machine desyncs — the
+/// cinnamon keyring modal stops being re-grabbed and clicks fall
+/// through the stage to the desktop.
+fn emit_grab_focus_chain(
+    state: &mut ServerState,
+    from: ResourceId,
+    to: ResourceId,
+    mode: u8,
+    skip_xi2: ResourceId,
+    ptr_x: i16,
+    ptr_y: i16,
+) {
+    // The grab window itself must get a CORE FocusIn/FocusOut(NotifyGrab)
+    // — Clutter's X11 stage tracks keyboard focus via core focus events,
+    // so without it the cinnamon shell never marks its stage focused and
+    // typed keys never reach the keyring password entry. The grab/ungrab
+    // handler already emits the grab window's XI2 focus event directly to
+    // the grab requester, so `skip_xi2` (= the grab window) suppresses
+    // only the duplicate XI2 emit here, never the core one.
+    for crossing in crate::crossings::implicit_grab_crossings(state, from, to) {
+        if crossing.window == ROOT_WINDOW {
+            continue;
+        }
+        let focus_in = matches!(crossing.kind, crate::crossings::CrossingKind::Enter);
+        let evtype: u16 = if focus_in { 9 } else { 10 };
+        let window = crossing.window;
+        let detail = crossing.detail;
+        let _dropped =
+            emit_window_event_to_state(state, window, FOCUS_CHANGE_MASK, |buf, seq, order| {
+                x11::encode_focus_event_with_mode_detail(
+                    buf, seq, order, focus_in, window, mode, detail,
+                );
+            });
+        if window != skip_xi2 {
+            let _dropped = emit_xi2_focus_event_to_state(
+                state,
+                window,
+                evtype,
+                XI2_MAJOR_OPCODE,
+                mode,
+                detail,
+                ptr_x,
+                ptr_y,
+            );
+        }
     }
 }
 
@@ -12773,6 +12896,10 @@ fn handle_set_input_focus(
             client_id.0, window.0
         );
         set_focused_window_to_state(state, client_id, window);
+        crate::core_loop::grab_debug::log(
+            state,
+            &format!("SetInputFocus client={} -> 0x{:x}", client_id.0, window.0),
+        );
     }
     debug!("client {} #{} SetInputFocus", client_id.0, sequence.0);
     Ok(RequestOutcome::Handled)
@@ -19656,6 +19783,276 @@ mod tests {
         let event_window =
             u32::from_le_bytes([crossing[24], crossing[25], crossing[26], crossing[27]]);
         assert_eq!(event_window, WINDOW_XID);
+    }
+
+    /// When a keyboard `XIGrabDevice` activates on one window while a
+    /// *different* window holds the input focus, X11 sends the
+    /// previously-focused window's client a core `FocusOut` with
+    /// `mode=NotifyGrab` (Xorg `dix/events.c::ActivateKeyboardGrab` ->
+    /// `DoFocusEvents(oldWin, grabWin, NotifyGrab)`). yserver historically
+    /// emitted XI2 crossings only to the *grabbing* client, never the
+    /// core focus-out to the old focus owner — which left
+    /// muffin/mutter's grab state machine unaware a grab happened and
+    /// wedged the cinnamon keyring modal after a few clicks.
+    #[test]
+    fn xi_keyboard_grab_sends_core_focusout_notifygrab_to_old_focus() {
+        const GRABBER: u32 = 1;
+        const FOCUS_OWNER: u32 = 2;
+        const FOCUS_WINDOW: u32 = 0x0010_0070;
+        const GRAB_WINDOW: u32 = 0x0010_0060;
+
+        let mut state = ServerState::new();
+        let _grabber_peer = install_client(&mut state, GRABBER);
+        let mut focus_peer = install_client(&mut state, FOCUS_OWNER);
+        let mut backend = RecordingBackend::new();
+
+        for (owner, xid) in [(GRABBER, GRAB_WINDOW), (FOCUS_OWNER, FOCUS_WINDOW)] {
+            state.resources.create_window(
+                yserver_protocol::x11::ClientId(owner),
+                yserver_protocol::x11::CreateWindowRequest {
+                    depth: 24,
+                    window: ResourceId(xid),
+                    parent: ROOT_WINDOW,
+                    x: 0,
+                    y: 0,
+                    width: 100,
+                    height: 100,
+                    border_width: 0,
+                    class: 1,
+                    visual: crate::resources::ROOT_VISUAL,
+                    ..Default::default()
+                },
+            );
+        }
+
+        // The focus owner holds the input focus and selects core
+        // FocusChange on its window.
+        state.clients.get_mut(&FOCUS_OWNER).unwrap().focused_window = ResourceId(FOCUS_WINDOW);
+        state
+            .clients
+            .get_mut(&FOCUS_OWNER)
+            .unwrap()
+            .event_masks
+            .insert(ResourceId(FOCUS_WINDOW), FOCUS_CHANGE_MASK);
+
+        // XIGrabDevice keyboard (deviceid=3) on GRAB_WINDOW by GRABBER.
+        let mut body = Vec::with_capacity(24);
+        body.extend_from_slice(&GRAB_WINDOW.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes()); // time
+        body.extend_from_slice(&0u32.to_le_bytes()); // cursor
+        body.extend_from_slice(&3u16.to_le_bytes()); // deviceid = keyboard
+        body.extend_from_slice(&[1, 1, 1, 0]);
+        body.extend_from_slice(&0u16.to_le_bytes()); // mask_len
+        body.extend_from_slice(&[0u8; 2]);
+        let header = yserver_protocol::x11::RequestHeader {
+            opcode: 131,
+            data: 51,
+            length_units: 7,
+        };
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(GRABBER),
+            SequenceNumber(1),
+            header,
+            &body,
+        )
+        .expect("XIGrabDevice keyboard");
+
+        // The focus owner must receive a core FocusOut (type 10) on its
+        // window with mode = NotifyGrab (1). Core focus event layout:
+        //   0:type(10), 1:detail, 2..4:seq, 4..8:window, 8:mode, ...
+        let wire = read_all_available(&mut focus_peer);
+        let found = wire.len() >= 32
+            && (0..=wire.len() - 32).any(|i| {
+                wire[i] == 10
+                    && u32::from_le_bytes([wire[i + 4], wire[i + 5], wire[i + 6], wire[i + 7]])
+                        == FOCUS_WINDOW
+                    && wire[i + 8] == 1 // NotifyGrab
+            });
+        assert!(
+            found,
+            "old focus window's client must receive core FocusOut(NotifyGrab); wire={:?}",
+            &wire[..wire.len().min(96)]
+        );
+    }
+
+    /// On keyboard-grab activation the GRAB WINDOW must itself receive a
+    /// core `FocusIn(NotifyGrab)` (Xorg `DoFocusEvents(oldWin, grabWin,
+    /// NotifyGrab)` emits FocusIn on grabWin to its FocusChange
+    /// subscribers). Clutter's X11 stage tracks keyboard focus via core
+    /// FocusIn/FocusOut; without this the cinnamon shell never marks its
+    /// stage focused and never dispatches typed keys to the keyring
+    /// password entry — "can't type in the dialog". The pre-existing
+    /// handler only sent an XI2 FocusIn to the grabbing client, never the
+    /// core event.
+    #[test]
+    fn xi_keyboard_grab_sends_core_focusin_notifygrab_to_grab_window() {
+        const GRABBER: u32 = 1;
+        const FOCUS_OWNER: u32 = 2;
+        const FOCUS_WINDOW: u32 = 0x0010_0070;
+        const GRAB_WINDOW: u32 = 0x0010_0060;
+
+        let mut state = ServerState::new();
+        let mut grabber_peer = install_client(&mut state, GRABBER);
+        let _focus_peer = install_client(&mut state, FOCUS_OWNER);
+        let mut backend = RecordingBackend::new();
+
+        for (owner, xid) in [(GRABBER, GRAB_WINDOW), (FOCUS_OWNER, FOCUS_WINDOW)] {
+            state.resources.create_window(
+                yserver_protocol::x11::ClientId(owner),
+                yserver_protocol::x11::CreateWindowRequest {
+                    depth: 24,
+                    window: ResourceId(xid),
+                    parent: ROOT_WINDOW,
+                    x: 0,
+                    y: 0,
+                    width: 100,
+                    height: 100,
+                    border_width: 0,
+                    class: 1,
+                    visual: crate::resources::ROOT_VISUAL,
+                    ..Default::default()
+                },
+            );
+        }
+        // Another window holds the focus, so the grab window is the
+        // Enter (FocusIn) endpoint of the chain.
+        state.clients.get_mut(&FOCUS_OWNER).unwrap().focused_window = ResourceId(FOCUS_WINDOW);
+        // The grabbing client selects core FocusChange on its grab window.
+        state
+            .clients
+            .get_mut(&GRABBER)
+            .unwrap()
+            .event_masks
+            .insert(ResourceId(GRAB_WINDOW), FOCUS_CHANGE_MASK);
+
+        let mut body = Vec::with_capacity(24);
+        body.extend_from_slice(&GRAB_WINDOW.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes()); // time
+        body.extend_from_slice(&0u32.to_le_bytes()); // cursor
+        body.extend_from_slice(&3u16.to_le_bytes()); // deviceid = keyboard
+        body.extend_from_slice(&[1, 1, 1, 0]);
+        body.extend_from_slice(&0u16.to_le_bytes()); // mask_len
+        body.extend_from_slice(&[0u8; 2]);
+        let header = yserver_protocol::x11::RequestHeader {
+            opcode: 131,
+            data: 51,
+            length_units: 7,
+        };
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(GRABBER),
+            SequenceNumber(1),
+            header,
+            &body,
+        )
+        .expect("XIGrabDevice keyboard");
+
+        // Grabbing client must receive a core FocusIn (type 9) on its
+        // grab window with mode = NotifyGrab (1).
+        let wire = read_all_available(&mut grabber_peer);
+        let found = wire.len() >= 32
+            && (0..=wire.len() - 32).any(|i| {
+                wire[i] == 9 // FocusIn
+                    && u32::from_le_bytes([wire[i + 4], wire[i + 5], wire[i + 6], wire[i + 7]])
+                        == GRAB_WINDOW
+                    && wire[i + 8] == 1 // NotifyGrab
+            });
+        assert!(
+            found,
+            "grab window's client must receive core FocusIn(NotifyGrab); wire={:?}",
+            &wire[..wire.len().min(96)]
+        );
+    }
+
+    /// Symmetric to the activation case: releasing a keyboard grab sends
+    /// the window the focus returns to a core `FocusIn` with
+    /// `mode=NotifyUngrab` (Xorg `DeactivateKeyboardGrab` ->
+    /// `DoFocusEvents(grabWin, focusWin, NotifyUngrab)`). muffin/mutter
+    /// needs this to re-arm its grab state machine for the next cycle.
+    #[test]
+    fn xi_keyboard_ungrab_sends_core_focusin_notifyungrab_to_restored_focus() {
+        const GRABBER: u32 = 1;
+        const FOCUS_OWNER: u32 = 2;
+        const FOCUS_WINDOW: u32 = 0x0010_0070;
+        const GRAB_WINDOW: u32 = 0x0010_0060;
+
+        let mut state = ServerState::new();
+        let _grabber_peer = install_client(&mut state, GRABBER);
+        let mut focus_peer = install_client(&mut state, FOCUS_OWNER);
+        let mut backend = RecordingBackend::new();
+
+        for (owner, xid) in [(GRABBER, GRAB_WINDOW), (FOCUS_OWNER, FOCUS_WINDOW)] {
+            state.resources.create_window(
+                yserver_protocol::x11::ClientId(owner),
+                yserver_protocol::x11::CreateWindowRequest {
+                    depth: 24,
+                    window: ResourceId(xid),
+                    parent: ROOT_WINDOW,
+                    x: 0,
+                    y: 0,
+                    width: 100,
+                    height: 100,
+                    border_width: 0,
+                    class: 1,
+                    visual: crate::resources::ROOT_VISUAL,
+                    ..Default::default()
+                },
+            );
+        }
+        state.clients.get_mut(&FOCUS_OWNER).unwrap().focused_window = ResourceId(FOCUS_WINDOW);
+        state
+            .clients
+            .get_mut(&FOCUS_OWNER)
+            .unwrap()
+            .event_masks
+            .insert(ResourceId(FOCUS_WINDOW), FOCUS_CHANGE_MASK);
+        // Keyboard grab already active on GRAB_WINDOW, held by GRABBER.
+        state.active_keyboard_grab = Some(crate::server::ActiveKeyboardGrab {
+            owner: ClientId(GRABBER),
+            grab_window: ResourceId(GRAB_WINDOW),
+            source: crate::server::ActiveKeyboardGrabSource::Explicit,
+        });
+        let _ = read_all_available(&mut focus_peer);
+
+        // XIUngrabDevice keyboard (deviceid=3): time(4)+deviceid(2)+pad(2).
+        let mut body = Vec::with_capacity(8);
+        body.extend_from_slice(&0u32.to_le_bytes()); // time
+        body.extend_from_slice(&3u16.to_le_bytes()); // deviceid = keyboard
+        body.extend_from_slice(&[0u8; 2]);
+        let header = yserver_protocol::x11::RequestHeader {
+            opcode: 131,
+            data: 52,
+            length_units: 3,
+        };
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(GRABBER),
+            SequenceNumber(2),
+            header,
+            &body,
+        )
+        .expect("XIUngrabDevice keyboard");
+
+        let wire = read_all_available(&mut focus_peer);
+        let found = wire.len() >= 32
+            && (0..=wire.len() - 32).any(|i| {
+                wire[i] == 9 // FocusIn
+                    && u32::from_le_bytes([wire[i + 4], wire[i + 5], wire[i + 6], wire[i + 7]])
+                        == FOCUS_WINDOW
+                    && wire[i + 8] == 2 // NotifyUngrab
+            });
+        assert!(
+            found,
+            "restored focus window's client must receive core FocusIn(NotifyUngrab); wire={:?}",
+            &wire[..wire.len().min(96)]
+        );
     }
 
     /// `XIPassiveGrabDevice` with grab_type=Button(0) installs entries

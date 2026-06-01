@@ -597,7 +597,7 @@ yserver-cinnamon-hw-trace log="debug,yserver::kms::v2::scene=trace,yserver::kms:
     rm -f cinnamon.xtrace
     bash -c '\
         xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-cinnamon.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_GRAB_DEBUG=1 target/debug/yserver > yserver-hw-cinnamon.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         x11trace -d :7 -D :8 -n -o cinnamon.xtrace &\
@@ -605,6 +605,7 @@ yserver-cinnamon-hw-trace log="debug,yserver::kms::v2::scene=trace,yserver::kms:
         sleep 1;\
         env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:8 GDK_BACKEND=x11 \
             XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
+            MUFFIN_DEBUG=window-ops MUFFIN_VERBOSE=1 \
             dbus-run-session cinnamon-session > cinnamon.log 2>&1;\
         kill -TERM $xtrace_pid $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;\

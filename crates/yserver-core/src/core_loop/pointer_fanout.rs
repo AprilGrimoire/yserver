@@ -187,6 +187,26 @@ pub fn pointer_event_fanout_to_state(
             .unwrap_or((ROOT_WINDOW, event.event_x, event.event_y))
     });
 
+    if matches!(
+        event.kind,
+        PointerEventKind::ButtonPress | PointerEventKind::ButtonRelease
+    ) {
+        crate::core_loop::grab_debug::log(
+            state,
+            &format!(
+                "BTN {:?} btn={} root=({},{}) hit_target=0x{:x} top_level=0x{:x} handle_grabs={} is_replay={}",
+                event.kind,
+                event.detail,
+                event.root_x,
+                event.root_y,
+                target.0,
+                top_level_id.0,
+                handle_grabs,
+                is_replay,
+            ),
+        );
+    }
+
     // ── Core fanout ─────────────────────────────────────────────────
     let mut handled_core_via_grab = false;
 
@@ -235,6 +255,18 @@ pub fn pointer_event_fanout_to_state(
                 grab_client,
                 owner_events,
             );
+            if matches!(
+                event.kind,
+                PointerEventKind::ButtonPress | PointerEventKind::ButtonRelease
+            ) {
+                crate::core_loop::grab_debug::log(
+                    state,
+                    &format!(
+                        "  -> route=ACTIVE-GRAB redirect to grab_window=0x{:x} client={:?}",
+                        grab_window.0, grab_client
+                    ),
+                );
+            }
             let extras = fanout_event_to_clients(state, &[grab_client], |buf, seq, order| {
                 encode_pointer_event(
                     buf,
@@ -287,6 +319,13 @@ pub fn pointer_event_fanout_to_state(
             grab.owner,
             grab.grab_window.0,
             grab.pointer_mode,
+        );
+        crate::core_loop::grab_debug::log(
+            state,
+            &format!(
+                "  -> route=PASSIVE-GRAB match owner={:?} grab_window=0x{:x} pointer_mode={}",
+                grab.owner, grab.grab_window.0, grab.pointer_mode
+            ),
         );
         // Activate the passive grab atomically with the dispatch.
         // `owner_events=true` qualifies for natural delivery when hit
@@ -363,6 +402,15 @@ pub fn pointer_event_fanout_to_state(
                 event.root_y,
                 event_x,
                 event_y,
+            );
+            crate::core_loop::grab_debug::log(
+                state,
+                &format!(
+                    "  -> route=NORMAL-PROP nested=0x{:x} child=0x{:x} core_targets={:?}",
+                    nested_id.0,
+                    propagation_child.0,
+                    core_targets.iter().map(|c| c.0).collect::<Vec<_>>(),
+                ),
             );
         }
 
