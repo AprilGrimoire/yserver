@@ -84,6 +84,8 @@ pub(crate) const DRM_IOCTL_CRTC_QUEUE_SEQUENCE: libc::c_ulong = ((3 as libc::c_u
 ///
 /// - `relative = true`  → kernel arms `current_msc + sequence`
 ///   vblanks from now; pass `sequence = 1` for "next vblank".
+///   `NEXT_ON_MISS` is set in both modes (the kernel only acts on it
+///   for absolute targets — harmless on the relative path).
 /// - `relative = false` → absolute target. **Always pair with
 ///   `NEXT_ON_MISS`** (set internally) so an already-passed target
 ///   fires at the next vblank instead of waiting a full 32-bit
@@ -92,7 +94,7 @@ pub(crate) const DRM_IOCTL_CRTC_QUEUE_SEQUENCE: libc::c_ulong = ((3 as libc::c_u
 /// `user_data` is echoed verbatim in the resulting
 /// `DRM_EVENT_CRTC_SEQUENCE` — we encode the stable `crtc_id` there
 /// (NOT `output_idx`, which is unstable across hotplug compaction
-/// at `platform.rs:2222`).
+/// in `v2/platform.rs::requery_outputs_and_modeset`).
 ///
 /// Returns the kernel-assigned scheduled sequence on success.
 ///
@@ -125,8 +127,10 @@ pub(crate) fn queue_crtc_sequence(
     };
     // SAFETY: `req` is a fully-initialised POD of the exact size the
     // kernel expects (24 bytes — pinned by the unit tests in Task 1).
-    // The device fd is held alive by `device` for the duration of the
-    // call; the kernel reads and writes `req` in place.
+    // No other reference to `req` exists across the syscall boundary
+    // (it is stack-local and only borrowed once as `&mut`). The device
+    // fd is held alive by `device` for the duration of the call; the
+    // kernel reads and writes `req` in place.
     let raw_fd = device.as_fd().as_raw_fd();
     let rc = unsafe { libc::ioctl(raw_fd, DRM_IOCTL_CRTC_QUEUE_SEQUENCE, &mut req as *mut _) };
     if rc != 0 {
