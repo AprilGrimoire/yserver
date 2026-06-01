@@ -202,14 +202,22 @@ pub struct KmsBackendV2 {
     /// window→CRTC routing layer.
     pub(crate) recent_page_flips: Vec<(u64, u64)>,
 
-    /// T6 (idle-case MSC advance): dedup gate for
-    /// `request_next_vblank_event` — true while we've already asked
-    /// the kernel for the next vblank but haven't yet received the
-    /// completion. Cleared in `record_crtc_ust_msc` (which fires for
-    /// both pageflip and vblank events). Prevents an O(notifies)
-    /// `wait_vblank` ioctl storm when the queue is non-empty across
-    /// multiple loop iterations.
-    pub(crate) vblank_request_in_flight: bool,
+    /// Per-CRTC armed absolute MSC. Replaces the single
+    /// `vblank_request_in_flight: bool` — that gate could only track one
+    /// in-flight request total, so arming CRTC A would suppress arming
+    /// CRTC B (the dual-monitor permanent-stall class). Keyed by the
+    /// stable `crtc::Handle`, value is the absolute MSC currently
+    /// armed (or `1` for the EOPNOTSUPP relative-fallback).
+    ///
+    /// **Invariant:** every code path that drops or completes an armed
+    /// sequence MUST clear the matching entry — `record_crtc_ust_msc`
+    /// (advance proof), `on_crtc_sequence_event` (unconditional
+    /// clear-arm before validating), `!scanout_allowed()` /
+    /// `apply_dpms_transition` / `run_suspend` (master loss drops queued
+    /// sequences), and output removal (the CRTC is gone). A stuck entry
+    /// = a permanent ~0 fps stall on that CRTC, which is the whole bug
+    /// class this plan is exiting.
+    pub(crate) armed_vblank_targets: std::collections::HashMap<::drm::control::crtc::Handle, u64>,
 
     /// Cached readback of the current GC clip-mask pixmap (depth-1
     /// or depth-8). Populated at `set_clip_pixmap` time by reading
@@ -583,7 +591,7 @@ impl KmsBackendV2 {
             cow_id: None,
             crtc_ust_msc: std::collections::HashMap::new(),
             recent_page_flips: Vec::new(),
-            vblank_request_in_flight: false,
+            armed_vblank_targets: std::collections::HashMap::new(),
             clip_mask_cache: None,
             kms_outputs_active: true,
             clear_window_area_calls: 0,
@@ -705,7 +713,7 @@ impl KmsBackendV2 {
             cow_id: None,
             crtc_ust_msc: std::collections::HashMap::new(),
             recent_page_flips: Vec::new(),
-            vblank_request_in_flight: false,
+            armed_vblank_targets: std::collections::HashMap::new(),
             clip_mask_cache: None,
             kms_outputs_active: true,
             clear_window_area_calls: 0,
@@ -1275,7 +1283,7 @@ impl KmsBackendV2 {
             cow_id: None,
             crtc_ust_msc: std::collections::HashMap::new(),
             recent_page_flips: Vec::new(),
-            vblank_request_in_flight: false,
+            armed_vblank_targets: std::collections::HashMap::new(),
             clip_mask_cache: None,
             kms_outputs_active: true,
             clear_window_area_calls: 0,
@@ -2505,13 +2513,36 @@ impl KmsBackendV2 {
         #[allow(clippy::cast_possible_truncation)]
         let ust_micros: u64 = ust.as_micros() as u64;
         self.recent_page_flips.push((msc, ust_micros));
-        // T6 (idle-case MSC advance): clear the dedup gate so the
-        // next iteration can request another vblank if pending
-        // notifies remain. We can't distinguish pageflip vs
-        // requested-vblank here, but that's fine — both signal
-        // "this CRTC's MSC advanced", which is exactly what
-        // `request_next_vblank_event` was waiting for.
-        self.vblank_request_in_flight = false;
+        // Advance proof: any retire on this CRTC's `crtc::Handle` clears
+        // the armed entry. The handler at the sequence-event call site
+        // resolves crtc_id → Handle and routes through here, so a single
+        // clear point covers both PageFlip/Vblank and CRTC_SEQUENCE.
+        // (Task 5 widens `record_crtc_ust_msc` to take the `crtc::Handle`
+        // explicitly so we can clear by Handle instead of having to look
+        // it up from output_idx here.)
+        // TEMP placeholder until Task 5: clear by linear scan from output_idx.
+        if let Some(layout) = self.platform.outputs.get(output_idx) {
+            self.armed_vblank_targets.remove(&layout.output.crtc);
+        }
+    }
+
+    /// T4: remove the armed-target entry for one specific CRTC.
+    /// Called from `on_crtc_sequence_event` (unconditional clear-arm
+    /// before validating) and any code path that drops a queued
+    /// sequence for a single output (output removal, per-CRTC DPMS).
+    /// Production callers land in Tasks 5 and 8; allow dead_code until then.
+    #[allow(dead_code)]
+    pub(crate) fn clear_armed_vblank_target(&mut self, crtc: ::drm::control::crtc::Handle) {
+        self.armed_vblank_targets.remove(&crtc);
+    }
+
+    /// T4: clear the entire armed-target map.
+    /// Called from master-loss / suspend paths where all queued
+    /// kernel sequences are implicitly cancelled.
+    /// Production callers land in Tasks 5 and 8; allow dead_code until then.
+    #[allow(dead_code)]
+    pub(crate) fn clear_all_armed_vblank_targets(&mut self) {
+        self.armed_vblank_targets.clear();
     }
 
     /// T2 test-only injector: write a synthetic `(msc, ust)` into
@@ -11836,7 +11867,10 @@ impl Backend for KmsBackendV2 {
         // arrives as `Event::Vblank` on the DRM fd and runs
         // through the same `drain_events` → `record_crtc_ust_msc`
         // pipeline that pageflips use.
-        if self.vblank_request_in_flight {
+        // Stub: the rename to `arm_idle_vblanks` lands in Task 8 with the
+        // full per-(crtc, target) dedup. For Task 4 we keep the old
+        // trait method working by treating "any armed CRTC" as "in flight".
+        if !self.armed_vblank_targets.is_empty() {
             return Ok(false);
         }
         if !self.scanout_allowed() {
@@ -11847,7 +11881,10 @@ impl Backend for KmsBackendV2 {
         }
         match crate::drm::page_flip::request_next_vblank_event(&self.platform.device, 0) {
             Ok(()) => {
-                self.vblank_request_in_flight = true;
+                // Pre-Task-8 placeholder: hardcode output 0's CRTC.
+                if let Some(layout) = self.platform.outputs.first() {
+                    self.armed_vblank_targets.insert(layout.output.crtc, 0);
+                }
                 Ok(true)
             }
             Err(e) => {
@@ -12561,6 +12598,35 @@ mod tests {
             b.present_get_ust_msc(0x100),
             (43, std::time::Duration::from_micros(140_000))
         );
+    }
+
+    /// T4 (armed-target map): starts empty after construction.
+    #[test]
+    fn armed_vblank_targets_starts_empty() {
+        let b = super::KmsBackendV2::for_tests();
+        assert!(b.armed_vblank_targets.is_empty());
+    }
+
+    /// T4: `clear_armed_vblank_target` removes the named entry.
+    #[test]
+    fn clear_armed_vblank_target_removes_entry() {
+        let mut b = super::KmsBackendV2::for_tests();
+        let h = ::drm::control::from_u32(7).unwrap();
+        b.armed_vblank_targets.insert(h, 1234);
+        b.clear_armed_vblank_target(h);
+        assert!(b.armed_vblank_targets.is_empty());
+    }
+
+    /// T4: `clear_all_armed_vblank_targets` empties the map entirely.
+    #[test]
+    fn clear_all_armed_vblank_targets_empties_map() {
+        let mut b = super::KmsBackendV2::for_tests();
+        let a = ::drm::control::from_u32(7).unwrap();
+        let c = ::drm::control::from_u32(9).unwrap();
+        b.armed_vblank_targets.insert(a, 1);
+        b.armed_vblank_targets.insert(c, 2);
+        b.clear_all_armed_vblank_targets();
+        assert!(b.armed_vblank_targets.is_empty());
     }
 
     /// Spec: "the first paint op produces a logged 'v2 not yet
