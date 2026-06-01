@@ -165,8 +165,24 @@ fn dispatch_event<F: FnMut(crtc::Handle, u64, std::time::Duration)>(
     on_page_flip: &mut F,
 ) {
     match event {
-        Event::PageFlip(ev) => on_page_flip(ev.crtc, u64::from(ev.frame), ev.duration),
-        Event::Vblank(ev) => on_page_flip(ev.crtc, u64::from(ev.frame), ev.time),
+        Event::PageFlip(ev) => {
+            log::info!(
+                "PRESENT-DBG: PageFlip event crtc={:?} msc={} dur={:?}",
+                ev.crtc,
+                ev.frame,
+                ev.duration
+            );
+            on_page_flip(ev.crtc, u64::from(ev.frame), ev.duration);
+        }
+        Event::Vblank(ev) => {
+            log::info!(
+                "PRESENT-DBG: Vblank event crtc={:?} msc={} time={:?}",
+                ev.crtc,
+                ev.frame,
+                ev.time
+            );
+            on_page_flip(ev.crtc, u64::from(ev.frame), ev.time);
+        }
         Event::Unknown(_) => {}
     }
 }

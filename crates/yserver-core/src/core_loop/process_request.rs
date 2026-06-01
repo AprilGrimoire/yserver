@@ -6447,6 +6447,23 @@ fn handle_present_request(
                         targets.push((*eid, sel.owner));
                     }
                 }
+                log::info!(
+                    "PRESENT-DBG: NotifyMSC req window=0x{:x} serial={} target_msc={} -> {} ctx(s): {:?} (all sels on win: {:?})",
+                    req.window,
+                    req.serial,
+                    req.target_msc,
+                    targets.len(),
+                    targets
+                        .iter()
+                        .map(|(e, _)| format!("0x{e:x}"))
+                        .collect::<Vec<_>>(),
+                    state
+                        .present_event_selections
+                        .iter()
+                        .filter(|(_, s)| s.window == window_rid)
+                        .map(|(e, s)| format!("eid=0x{e:x} mask=0x{:x}", s.event_mask))
+                        .collect::<Vec<_>>(),
+                );
                 for (eid, owner) in targets {
                     state
                         .pending_complete_notify
@@ -6987,11 +7004,13 @@ pub fn drain_pending_complete_notify_for_flip(state: &mut ServerState, msc: u64,
             ust_micros,
             msc,
         );
-        debug!(
-            "PRESENT CompleteNotify (deferred) -> client {} eid=0x{:x} msc={msc} ust={ust_micros} ({} bytes)",
+        log::info!(
+            "PRESENT-DBG: FIRE CompleteNotify kind={} -> client {} eid=0x{:x} window=0x{:x} serial={} msc={msc} ust={ust_micros}",
+            entry.kind,
             entry.client_id.0,
             entry.eid,
-            ev.len()
+            entry.window.0,
+            entry.serial,
         );
         let _ = write_to_client(client, entry.client_id, &ev);
     }

@@ -758,7 +758,15 @@ fn drain_present_completions(state: &mut ServerState, backend: &mut dyn Backend)
         crate::core_loop::process_request::fire_present_completion_events(state, &entry);
     }
     if backend.has_vblank_pacing() {
-        for (msc, ust_micros) in backend.drain_recent_page_flips() {
+        let flips = backend.drain_recent_page_flips();
+        if !flips.is_empty() {
+            log::info!(
+                "PRESENT-DBG: drained {} pageflip retire(s) {flips:?} (pending_complete={})",
+                flips.len(),
+                state.pending_complete_notify.len()
+            );
+        }
+        for (msc, ust_micros) in flips {
             crate::core_loop::process_request::drain_pending_complete_notify_for_flip(
                 state, msc, ust_micros,
             );
@@ -772,10 +780,16 @@ fn drain_present_completions(state: &mut ServerState, backend: &mut dyn Backend)
         // / `NotifyMSC`. The backend dedups against an in-flight
         // request internally, so calling this every iteration is
         // safe.
-        if !state.pending_complete_notify.is_empty()
-            && let Err(e) = backend.request_next_vblank_event()
-        {
-            log::debug!("run: request_next_vblank_event failed: {e}");
+        if !state.pending_complete_notify.is_empty() {
+            let pending = state.pending_complete_notify.len();
+            match backend.request_next_vblank_event() {
+                Ok(armed) => log::info!(
+                    "PRESENT-DBG: request_next_vblank_event pending={pending} -> armed={armed}"
+                ),
+                Err(e) => log::info!(
+                    "PRESENT-DBG: request_next_vblank_event pending={pending} -> ERR {e}"
+                ),
+            }
         }
     } else if !state.pending_complete_notify.is_empty() {
         crate::core_loop::process_request::drain_pending_complete_notify_for_flip(state, 0, 0);
