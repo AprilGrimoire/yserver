@@ -1,6 +1,6 @@
 # Idle-vblank MSC pacing design
 
-**Status:** Draft, 2026-06-01 (awaiting codex review).
+**Status:** Ready to implement, 2026-06-01 (revision 3 — codex review converged over 2 rounds). Round 1 folded in: absolute queueing as the primary design; `user_data` carries stable `crtc_id` not `output_idx`; CRTC-scoped completion draining; checked `time_ns`; per-CRTC armed-target map with explicit suspend/hotplug reconciliation; side-effect-free sequence-event invariant. Round 2 closed the last gap: the malformed-`time_ns`/stale-`crtc_id` drop paths clear the armed-target entry *before* returning (unconditional clear-arm for any received `CRTC_SEQUENCE` on a known CRTC), so a dropped event can't strand a CRTC. Codex verdict: "implementable as written."
 **Branch (planned):** `fix/present-vblank-msc-rebase` (completes the existing per-CRTC vblank-paced Present work in commit `698e112`; lands together with it).
 **Related:**
 - `crates/yserver/src/drm/page_flip.rs` — `request_next_vblank_event` (the broken legacy path), `dispatch_event` (the event drain).
@@ -88,12 +88,17 @@ pub fn queue_crtc_sequence(
 ) -> io::Result<u64> /* kernel-returned scheduled sequence */
 ```
 
-Issued via `rustix::ioctl` (or `nix`) with the computed request code. Two arming strategies (recommend the first):
+Issued via `rustix::ioctl` (or `nix`) with the computed request code.
 
-1. **Per-target absolute (Xorg-correct, preferred):** for each distinct pending completion `target_msc` on a CRTC, arm `queue_crtc_sequence(crtc, relative=false, sequence=target_msc, …)` once (deduped by `(crtc, target_msc)`). A `target_msc==0` ("next") arms `relative=true, sequence=1`. The kernel fires exactly when MSC reaches the target. No per-vblank wakeups.
-2. **Relative keep-alive (simpler fallback):** while any waiter is pending, keep one `relative=true, sequence=1` armed per active CRTC, re-arming on each completion. Drains whatever is due each vblank. More wakeups but trivially correct.
+**Arming is per-target ABSOLUTE — this is *the* design, matching Xorg.** This is not one of two co-equal options; the relative form is a narrow fallback (below). Xorg's modesetting Present path queues absolute MSCs (`ms_present_queue_vblank` → `MS_QUEUE_ABSOLUTE`, `present.c`) and its `ms_queue_vblank` helper *coalesces* requests and only re-arms when the wanted target differs from the one already in flight (`vblank.c`). We do the same:
 
-`request_next_vblank_event` is generalized to take the target CRTC (and, for strategy 1, the target sequence). The `vblank_request_in_flight: bool` dedup becomes per-CRTC (`HashMap<crtc, in_flight>` or per-`(crtc, target)` for strategy 1) so arming one CRTC doesn't suppress another.
+- For each pending completion with `target_msc = T` bound to CRTC `C`, arm `queue_crtc_sequence(C, relative=false, sequence=T, flags=NEXT_ON_MISS, user_data=crtc_id(C))` **once**, deduped by `(C, T)`. The kernel fires exactly when `C`'s MSC reaches `T` — no per-vblank wakeups, low idle CPU.
+- A `target_msc == 0` ("next vblank", what Cinnamon's `PresentNotifyMSC` sends) maps to `relative=true, sequence=1`.
+- `NEXT_ON_MISS` only guards the already-passed case (fire at the next vblank instead of waiting a full counter wrap). **It must be paired with the `(C, T)` dedup**: never re-issue the same `(C, T)` while one is in flight, or an already-passed absolute target re-armed every loop iteration becomes a refire storm.
+
+**Relative keep-alive is a fallback only**, used iff `DRM_IOCTL_CRTC_QUEUE_SEQUENCE` returns `EOPNOTSUPP` (pre-4.14-ish kernels): keep one `relative=1` armed per active CRTC, re-armed on each completion. Log once when taken. It is not the upstream behavior and not the low-idle-CPU path.
+
+`request_next_vblank_event` is generalized to take the target CRTC + absolute target. Replace the single `vblank_request_in_flight: bool` with a **per-CRTC armed-target map** (`HashMap<crtc::Handle, u64 /*armed target*/>` or a small set of in-flight `(C, T)`), so arming one CRTC never suppresses another and we can coalesce. See "Lifecycle & reconciliation" for how this map is cleared.
 
 ### Part B — parse the `DRM_EVENT_CRTC_SEQUENCE` completion
 
@@ -104,48 +109,64 @@ struct drm_event_crtc_sequence { base: drm_event{type_:u32,length:u32}, user_dat
 DRM_EVENT_CRTC_SEQUENCE = 3
 ```
 
-In `dispatch_event`, when `Event::Unknown(bytes)` has `bytes[0..4] as u32 == DRM_EVENT_CRTC_SEQUENCE`, decode `(sequence, time_ns, user_data)` and route to the same `on_page_flip(crtc, msc, ust)` callback Vblank uses:
+In `dispatch_event`, when `Event::Unknown(bytes)` has `bytes[0..4] as u32 == DRM_EVENT_CRTC_SEQUENCE` (and `length` matches `size_of::<drm_event_crtc_sequence>() == 24`), decode `(sequence, time_ns, user_data)` and route to the same `on_page_flip(crtc, msc, ust)` callback Vblank uses:
 
-- `msc = sequence` (widen u64; per-CRTC wrap bookkeeping already lives in the backend).
-- `ust = Duration::from_nanos(time_ns as u64)` — note this is **CLOCK_MONOTONIC ns**, the same clock as `PageFlipEvent.duration`/`VblankEvent.time`, so it composes with the existing `(msc, ust)` consumers.
-- **`crtc` must come from `user_data`** — the sequence event has **no `crtc` field** (unlike `VblankEvent`). So Part A must encode the output index / crtc id into `user_data` when queuing, and Part B decodes it. Proposed: `user_data = output_idx as u64` (small, stable, maps back to `Output`).
+- **`crtc` comes from `user_data`, which carries the raw `crtc_id` — NOT an output index.** The sequence event has **no `crtc` field** (unlike `VblankEvent`), so Part A encodes the identity into `user_data`. It must be the *stable* `crtc_id` (KMS object id), because `output_idx` is **not stable**: `platform.rs` removes outputs by compacting the `Vec` (`platform.rs:2222`) and pageflip routing derives `output_idx` from the *current* Vec position on every event (`platform.rs:1197`/`:1203`). A `CRTC_SEQUENCE` event delayed across a hotplug / VT switch / mode change would otherwise resolve a stale `output_idx` to the wrong output. At completion, resolve `crtc_id → current output_idx`; **if no output currently owns that `crtc_id`, drop the event and clear that CRTC's armed-target entry** (do not fabricate an output).
+- `msc = sequence` truncated to the hardware 32-bit counter and fed through the **existing** per-CRTC wrap bookkeeping in the backend — do not introduce a second widening of an already-widened value.
+- `ust`: `time_ns` is **`i64`** (signed, CLOCK_MONOTONIC ns — same clock as `PageFlipEvent.duration`/`VblankEvent.time`). Convert with `u64::try_from(time_ns)`; on a negative/malformed value **log + skip the `(msc, ust)` update — but FIRST clear that CRTC's armed-target entry** (the sequence event proves the clock advanced, so the arm is spent; not clearing it would strand the CRTC in the dedup map = the same permanent-stall class as the old stuck bool). Then return. Do **not** `Duration::from_nanos(time_ns as u64)` (wraps a negative into a huge bogus duration). (`recent_page_flips` already truncates to µs at `backend.rs:2505-2507`; don't stack a signedness bug on the accepted precision loss.) Equivalently: clear-arm is unconditional for any received `CRTC_SEQUENCE` event on a known CRTC, *before* the `time_ns`/`crtc_id` validity checks that may drop it.
 
-`record_crtc_ust_msc(output_idx, msc, ust)` then clears the per-CRTC in-flight flag and pushes to `recent_page_flips` exactly as a pageflip does, so `drain_present_completions` fires the queued completions unchanged.
+`record_crtc_ust_msc(output_idx, msc, ust)` then clears that CRTC's armed-target entry and pushes `(crtc/output_idx, msc, ust)` to `recent_page_flips` exactly as a pageflip does. **Invariant (black-scanout guard): the `CRTC_SEQUENCE` handler is side-effect-free except for MSC/UST accounting and clearing the armed-target entry — it must NOT touch scanout BO state, scene/BO-retire, or trigger a flip.** This keeps the new path orthogonal to the shelved deferred-present black-screen failure mode. A unit assertion guards it (see Testing).
 
 ### Part C — bind the Present waiter to one CRTC
 
-`present_get_ust_msc(_window)` currently hardcodes output 0, and `drain_pending_complete_notify_for_flip` fires every pending completion with whichever CRTC retired. For a window spanning multiple outputs this mixes counters (the 6857-offset artifact). Bind each presented window to a single CRTC:
+`present_get_ust_msc(_window)` currently hardcodes output 0, and — more dangerously — `drain_pending_complete_notify_for_flip` (`process_request.rs:6973-6999`) fires every pending completion that matches `target_msc` **regardless of which CRTC produced the flip**. With two CRTCs on independent vblank clocks (measured 6857 apart on silence), a vblank from CRTC A can satisfy, by raw numeric MSC compare, a waiter that was armed against CRTC B — firing a completion with the wrong clock's `(msc, ust)`. This is a *correctness* bug, not just the dual-monitor "artifact"; it must be fixed as part of this change. Bind each presented window to a single CRTC and make the whole path CRTC-aware:
 
-- Pick the CRTC of the output the window most covers (max-intersection-area), falling back to primary. Cache on the per-window Present record.
-- Arm idle vblanks (Part A) on that CRTC, and fire that window's completions only from that CRTC's `(msc, ust)`. This yields a monotonic MSC for the window and arms the correct pipe.
+- **Pick a CRTC** for the window: the output it most covers (max-intersection-area), falling back to primary. Compute via `crtc_id`.
+- **Store the bound CRTC on the `PendingCompleteNotify` entry itself**, not (only) a mutable per-window cache. A queued waiter must stay tied to the CRTC it was *armed against* even if the window moves/reconfigures before the delayed event returns.
+- **Carry `crtc`/`output_idx` through `recent_page_flips`** (it becomes `Vec<(crtc, msc, ust)>`) and through `drain_pending_complete_notify_for_flip(state, crtc, msc, ust)`, which fires only the pending entries **bound to that same CRTC** (then `target_msc` compare within that CRTC). `present_get_ust_msc(window)` returns the bound CRTC's `(msc, ust)`. Both call sites in `run.rs` change: the paced per-flip loop (~line 770) passes each flip's `crtc`; the non-paced fallback (`run.rs:795`, RecordingBackend/HostX11, currently `(state, 0, 0)`) passes the single notional CRTC so non-KMS backends still fire all waiters. No call site keeps the old 3-arg form.
+- Arm idle vblanks (Part A) on the bound CRTC's `crtc_id`.
 
-A single-output session collapses to "always the one CRTC" — no behavior change there, so this does not risk the common case.
+A single-output session collapses to "always the one CRTC" — no behavior change there, so this does not risk the common case, while dual-output gets a monotonic per-window MSC.
+
+### Lifecycle & reconciliation (in-flight armed-target map)
+
+The per-CRTC armed-target map must never strand a CRTC with a stuck entry (a stuck entry → no re-arm → permanent ~0fps stall after the disturbance). Reconcile it at every event that can abort an armed sequence without delivering a completion:
+
+- **`!scanout_allowed()` (VT suspend / master loss / DPMS off):** `request_next_vblank_event` must not just early-return — it must **clear the entire armed-target map** (the kernel drops queued sequences when we lose DRM master). On resume, the map is empty so `drain_present_completions` re-arms cleanly. Mirror this in the seat-suspend / DPMS-off paths so we don't depend on the next idle iteration.
+- **Output removal / hotplug / reorder:** invalidate any armed entry whose `crtc_id` is no longer owned by a live output (the same compaction site, `platform.rs:2222-2230`). Because the map is keyed by `crtc::Handle`/`crtc_id` (stable), not by `output_idx`, a reorder alone doesn't corrupt it — but a removed CRTC's entry must be dropped.
+- **Advance proof:** any `PageFlip`/`Vblank`/`CRTC_SEQUENCE` event for a CRTC clears that CRTC's armed entry (it proved the clock moved), exactly as `record_crtc_ust_msc` does today for the single bool.
 
 ## Architecture summary
 
 ```
 client PresentNotifyMSC/PresentPixmap(target_msc=T, window=W)
-  └─ enqueue PendingCompleteNotify{W, target=T, crtc = pick_crtc(W)}        (existing, + crtc binding)
+  └─ enqueue PendingCompleteNotify{W, target=T, crtc = pick_crtc(W)}        (NEW: crtc bound ON the entry)
 
 run.rs::drain_present_completions (each loop iter, has_vblank_pacing):
-  1. drain real pageflip retires → fire due completions          (existing)
-  2. for each pending completion not yet armed:
-       backend.arm_idle_vblank(crtc, target)                     (NEW: Part A/C)
-          └─ queue_crtc_sequence(device, crtc_id, abs target, user_data=output_idx)
+  1. drain real pageflip retires (crtc,msc,ust) → fire due completions BOUND TO THAT CRTC   (CRTC-scoped)
+  2. for each pending completion whose (crtc,target) is not already armed:
+       backend.arm_idle_vblank(crtc, target)                     (NEW: Part A/C, deduped by (crtc,target))
+          └─ queue_crtc_sequence(device, crtc_id, ABSOLUTE target, NEXT_ON_MISS, user_data=crtc_id)
 
 drm fd readable → drain_events → dispatch_event:
    Event::PageFlip / Event::Vblank          → on_page_flip(crtc,msc,ust)    (existing)
-   Event::Unknown(type==CRTC_SEQUENCE)      → decode → on_page_flip(crtc,msc,ust)  (NEW: Part B)
-      └─ record_crtc_ust_msc(output_idx, msc, ust) → recent_page_flips, clear in-flight
-   → next drain_present_completions fires the queued completion with real (msc,ust)
+   Event::Unknown(type==CRTC_SEQUENCE,len==24) → decode (sequence,time_ns,user_data=crtc_id)  (NEW: Part B)
+       resolve crtc_id→output_idx (drop+clear-arm if gone); ust=u64::try_from(time_ns)?
+      └─ record_crtc_ust_msc(output_idx, msc, ust) → recent_page_flips{crtc}, clear (crtc,*) arm
+         (side-effect-free: NO scanout BO / scene / flip mutation)
+   → next drain_present_completions fires the queued completion for that crtc with real (msc,ust)
 ```
 
 ## Testing
 
 ### Unit (yserver-core / yserver, no DRM)
-- `drm_event_crtc_sequence` byte-parse round-trip in `dispatch_event` (construct raw bytes, assert decoded `(crtc via user_data, msc, ust)` → callback), mirroring the existing `dispatch_event_surfaces_vblank_event` test.
+- `drm_event_crtc_sequence` byte-parse round-trip in `dispatch_event` (construct raw 24-byte event, assert decoded `(crtc_id via user_data, msc, ust)` → callback), mirroring `dispatch_event_surfaces_vblank_event`. Include a wrong-`length` / wrong-`type_` case → ignored.
+- **Negative/garbage `time_ns`** → event dropped + logged, not converted to a bogus `Duration`.
+- **Stale `crtc_id` on completion** → resolves to "no live output", event dropped, armed entry cleared (no panic, no fabricated output).
+- **CRTC-scoped drain:** a flip on CRTC A with `msc≥T` does NOT fire a `PendingCompleteNotify` bound to CRTC B (the cross-clock satisfaction bug). A flip on the bound CRTC does.
 - `pick_crtc(window)` max-coverage selection (single-output → that output; dual-output → larger intersection; off-screen → primary).
-- Per-CRTC in-flight dedup: arming CRTC A does not suppress arming CRTC B; re-arm after completion.
+- **Arming dedup / no refire storm:** an already-passed absolute `(C,T)` is armed once, not re-issued every `drain_present_completions` iteration while in flight; arming CRTC A does not suppress arming CRTC B; the entry clears on completion and on `!scanout_allowed()`.
+- **Side-effect-free `CRTC_SEQUENCE` handler:** assertion/fake that processing a sequence event mutates only MSC/UST + armed-map state, never scanout BO / scene state.
 
 ### Integration
 - Existing 518-test suite stays green; `present_get_ust_msc` per-window tests updated for the CRTC binding.
@@ -159,16 +180,18 @@ drm fd readable → drain_events → dispatch_event:
 
 ## Risks
 
-- **Black-scanout regression.** present-vblank-msc was never HW-validated; its bigger sibling `feature/deferred-present-completion` was shelved for an empty-scanout BO → black screen on bee/RADV. This fix makes the deferred path *actually fire continuously*, so it exercises that path harder. Mitigation: HW test #2 is a hard gate; keep `PRESENT-DBG` until verified.
-- **`user_data`-carries-CRTC.** Forgetting that the sequence event has no `crtc` field (encoding output_idx into `user_data`) would misroute completions. Covered by the unit round-trip test.
-- **Sequence wrap.** Kernel sequence is u64 in the event but the hardware counter is 32-bit; reuse the backend's existing per-CRTC wrap bookkeeping; do not re-widen.
-- **Raw ioctl correctness.** `_IOWR('d', 0x3C, drm_crtc_queue_sequence)` size/dir must match the kernel struct exactly; verify against `<drm/drm.h>` on the test kernel. EOPNOTSUPP on very old kernels → fall back to the legacy path (and log once) rather than failing the present.
-- **Per-CRTC in-flight state** replaces a single bool; ensure it is cleared on the `CRTC_SEQUENCE` completion AND on real pageflip retires (both advance MSC), and reset across VT suspend/resume.
+- **Black-scanout regression.** present-vblank-msc was never HW-validated; its sibling `feature/deferred-present-completion` was shelved for an empty-scanout BO → black screen on bee/RADV. This fix makes the deferred path *fire continuously*, exercising it harder. Mitigations (all in this spec): the `CRTC_SEQUENCE` handler is side-effect-free except MSC/UST + arm-clear (Part B invariant + unit assertion); arm only when `scanout_allowed()`; HW test #2 (bee/RADV) is a hard gate; keep `PRESENT-DBG` until verified.
+- **Stale-routing race (was `user_data`=output_idx).** Resolved: `user_data` carries the stable `crtc_id`; `output_idx` is resolved at completion and the event dropped if no live output owns that CRTC (Part B). A delayed event across hotplug/VT-switch can no longer hit the wrong output.
+- **Cross-clock completion satisfaction.** Resolved by the CRTC-scoped drain (Part C): a flip on CRTC A cannot fire a waiter bound to CRTC B even if MSC numbers happen to satisfy `target`.
+- **Refire storm.** An already-passed absolute target armed every loop would spin; resolved by `(crtc, target)` dedup + the armed-target map (Part A). Covered by a unit test.
+- **`time_ns` signedness.** `i64` → `u64::try_from`, drop+log negatives; never `as u64` (Part B). Sequence `u64` vs 32-bit hardware counter: reuse the backend's existing per-CRTC wrap bookkeeping, no second widening.
+- **Raw ioctl correctness.** `_IOWR('d', 0x3C, drm_crtc_queue_sequence)` (24 bytes, read+write) — codex confirmed it matches the installed headers; still assert `size_of` at the call site. Sharing the DRM fd with `receive_events()` is safe as long as it stays serialized through the main loop (it is). `EOPNOTSUPP` on old kernels → relative-keep-alive fallback, logged once.
+- **Stuck armed-target map → permanent stall.** The single-bool failure mode (stuck `true` after an aborted arm) is the whole bug class to avoid; the per-CRTC map MUST be cleared on `!scanout_allowed()`, output removal, and any advance event (see "Lifecycle & reconciliation"). Covered by unit tests.
 
 ## Rollout
 
 1. Implement Parts A–C on `fix/present-vblank-msc-rebase` (on top of `698e112`).
-2. `cargo fmt` / `cargo clippy -- -W clippy::pedantic` / `cargo test` green.
+2. `cargo +nightly fmt` / `cargo clippy` (regular) / `cargo test` green.
 3. HW smoke (all five checks above) — user-observed, per the "no commit before HW smoke" rule.
 4. Strip/demote `PRESENT-DBG` instrumentation.
 5. Squash `698e112` + the fix into a coherent "per-CRTC vblank-paced Present completion (with atomic idle-vblank pacing)" change and merge to master.
