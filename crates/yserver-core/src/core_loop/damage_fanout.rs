@@ -95,6 +95,72 @@ pub fn mapped_child_clip_rects(
         .collect()
 }
 
+/// Env-gated (`YSERVER_TRAY_DEBUG=1`) diagnostic for the intermittent
+/// systray sliver/blank bug — a timing race in COMPOSITE manual-redirect
+/// backing capture vs the notification-area's recomposite read.
+///
+/// Logs, for each ClipByChildren paint/damage on a *window with mapped
+/// children* (i.e. a tray socket holding an XEMBED plug), the socket's
+/// geometry + map-state, its `redirected_backing` state, each child's
+/// xid/geometry/class/map-state, and the requested-vs-clipped rects. A
+/// blank/sliver run can then be correlated frame-by-frame: a socket whose
+/// plug is at a stale/partial geometry at Clear time, or whose backing is
+/// absent/mismatched, is the dropped frame. `op` distinguishes the paint
+/// (`fill`) from the damage (`damage`) decision in the same Clear cycle.
+///
+/// Cheap no-op when the env var is unset. Pixmaps and childless windows
+/// are skipped (not sockets). REMOVE once the redirect-backing race is
+/// fixed.
+pub fn log_clip_by_children_debug(
+    state: &ServerState,
+    drawable: ResourceId,
+    op: &str,
+    requested: &[xfixes::RegionRect],
+    clipped: &[xfixes::RegionRect],
+) {
+    use std::fmt::Write as _;
+
+    if std::env::var_os("YSERVER_TRAY_DEBUG").is_none() {
+        return;
+    }
+    let Some(w) = state.resources.window(drawable) else {
+        return;
+    };
+    let children = state.resources.children(drawable);
+    if children.is_empty() {
+        return;
+    }
+
+    let redirect = w.redirected_backing.as_ref().map_or_else(
+        || "none".to_string(),
+        |b| format!("{}x{}d{}", b.width, b.height, b.depth),
+    );
+    let mut kids = String::new();
+    for child in children {
+        if let Some(cw) = state.resources.window(*child) {
+            let _ = write!(
+                kids,
+                " 0x{:x}[{}x{}@{},{} {:?} {:?}]",
+                child.0, cw.width, cw.height, cw.x, cw.y, cw.class, cw.map_state
+            );
+        }
+    }
+    log::info!(
+        target: "yserver_core::core_loop::tray",
+        "TRAY {op} win=0x{:x} geom={}x{}@{},{} {:?} redirect={} requested={} clipped={} children={{{}}}",
+        drawable.0,
+        w.width,
+        w.height,
+        w.x,
+        w.y,
+        w.map_state,
+        redirect,
+        format_damage_rects(requested),
+        format_damage_rects(clipped),
+        kids,
+    );
+}
+
 /// ClipByChildren-aware variant of [`accumulate_damage_full_to_state`].
 ///
 /// X.Org clips RENDER paint — and the damage it generates — to the
@@ -128,6 +194,8 @@ pub fn accumulate_damage_clip_by_children_to_state(
     } else {
         crate::nested::subtract_regions(&[full], &child_rects)
     };
+
+    log_clip_by_children_debug(state, drawable, "damage", &[full], &visible);
 
     let mut dropped: Vec<ClientId> = Vec::new();
     for rect in visible {

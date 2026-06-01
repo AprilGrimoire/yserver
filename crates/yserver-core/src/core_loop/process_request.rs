@@ -518,6 +518,14 @@ fn clip_fill_rects_by_children(
 
     let clipped = crate::nested::subtract_regions(&requested, &child_rects);
 
+    crate::core_loop::damage_fanout::log_clip_by_children_debug(
+        state,
+        dst_drawable,
+        "fill",
+        &requested,
+        &clipped,
+    );
+
     let mut out = Vec::with_capacity(clipped.len() * 8);
     for r in clipped {
         out.extend_from_slice(&r.x.to_le_bytes());
@@ -649,6 +657,19 @@ fn activate_redirect_backing_for(
                     height: w_height,
                     depth: w_depth,
                 });
+            }
+            // YSERVER_TRAY_DEBUG: capture-side timeline for the systray
+            // sliver/blank race — when each (socket) window's redirect
+            // backing is allocated, its size, and the mode. Correlate
+            // against the `TRAY fill/damage` lines (which carry the plug
+            // child geometry at Clear time). REMOVE with the rest of the
+            // tray diag once the redirect-backing race is fixed.
+            if std::env::var_os("YSERVER_TRAY_DEBUG").is_some() {
+                log::info!(
+                    target: "yserver_core::core_loop::tray",
+                    "TRAY redirect-alloc win=0x{:x} backing={w_width}x{w_height}d{w_depth} mode={mode:?}",
+                    window.0,
+                );
             }
             // Scene-participation flip. Spec §285+360 names
             // redirect-state change as a scene-structure damage
