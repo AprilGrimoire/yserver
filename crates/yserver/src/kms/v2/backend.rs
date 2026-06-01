@@ -11825,14 +11825,75 @@ impl Backend for KmsBackendV2 {
         }
     }
 
-    fn present_get_ust_msc(&self, _window: u32) -> (u64, std::time::Duration) {
-        // T2: single-output fallback — pick output 0's most-recently
-        // retired (msc, ust). T7 replaces `_window` with a real
-        // window→CRTC mapping so multi-monitor compositors get the
-        // correct CRTC's clock. Pre-first-pageflip returns
-        // (0, ZERO), matching Xorg's behavior before the first scanout.
+    fn pick_present_crtc(&self, window: u32) -> Option<u32> {
+        // T6: pick the output with maximum intersection area with the
+        // window's root rect.  Absent window (unknown XID) falls back
+        // to the primary output (index 0), matching the pre-T6 behaviour.
+        let Some(g) = self.windows_v2.get(&window) else {
+            return self
+                .platform
+                .outputs
+                .first()
+                .map(|o| u32::from(o.output.crtc));
+        };
+        let wx = i32::from(g.x);
+        let wy = i32::from(g.y);
+        let ww = i32::from(g.width);
+        let wh = i32::from(g.height);
+        let mut best: Option<(usize, i64)> = None;
+        for (idx, layout) in self.platform.outputs.iter().enumerate() {
+            let ox = layout.x;
+            let oy = layout.y;
+            let ow = i32::from(layout.width);
+            let oh = i32::from(layout.height);
+            let x1 = wx.max(ox);
+            let y1 = wy.max(oy);
+            let x2 = (wx + ww).min(ox + ow);
+            let y2 = (wy + wh).min(oy + oh);
+            let area = if x2 > x1 && y2 > y1 {
+                i64::from(x2 - x1) * i64::from(y2 - y1)
+            } else {
+                0
+            };
+            match best {
+                None => best = Some((idx, area)),
+                Some((_, ba)) if area > ba => best = Some((idx, area)),
+                _ => {}
+            }
+        }
+        // `best` is `Some` iff at least one output exists.  A max-coverage
+        // of 0 (off-screen window) collapses to the first output by
+        // enumeration order — primary — which matches the spec's tie-break.
+        best.and_then(|(idx, _)| {
+            self.platform
+                .outputs
+                .get(idx)
+                .map(|o| u32::from(o.output.crtc))
+        })
+    }
+
+    fn present_get_ust_msc(&self, window: u32) -> (u64, std::time::Duration) {
+        // T6 / Rev3 Part C: per-window CRTC binding.  Pick the same CRTC
+        // the arming path uses, then look up its (msc, ust) by resolving
+        // the crtc_id back to an output_idx (crtc_ust_msc is keyed by
+        // output_idx for historical reasons — folding that to a
+        // HashMap<crtc::Handle, _> is the rev3 follow-up).
+        let Some(crtc_id) = self.pick_present_crtc(window) else {
+            return (0, std::time::Duration::ZERO);
+        };
+        let Some(handle) = ::drm::control::from_u32(crtc_id) else {
+            return (0, std::time::Duration::ZERO);
+        };
+        let Some(output_idx) = self
+            .platform
+            .outputs
+            .iter()
+            .position(|o| o.output.crtc == handle)
+        else {
+            return (0, std::time::Duration::ZERO);
+        };
         self.crtc_ust_msc
-            .get(&0)
+            .get(&output_idx)
             .copied()
             .unwrap_or((0, std::time::Duration::ZERO))
     }
@@ -12596,6 +12657,82 @@ mod tests {
             b.present_get_ust_msc(0x100),
             (43, std::time::Duration::from_micros(140_000))
         );
+    }
+
+    /// T6: `pick_present_crtc` returns the CRTC of the single output
+    /// when a window fully covering that output is registered.
+    #[test]
+    fn pick_present_crtc_single_output_returns_that_crtc() {
+        use yserver_core::backend::Backend;
+        let mut b = super::KmsBackendV2::for_tests();
+        // Register a window covering output 0 fully.
+        b.windows_v2.insert(
+            0x100,
+            super::WindowGeometryV2 {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+                depth: 24,
+                mapped: true,
+                parent: None,
+                stack_rank: 0,
+                bg_pixel: None,
+                bg_pixmap: None,
+                cursor: None,
+            },
+        );
+        let crtc_id = b.pick_present_crtc(0x100);
+        assert!(crtc_id.is_some());
+        assert_eq!(
+            crtc_id.unwrap(),
+            u32::from(b.platform.outputs[0].output.crtc)
+        );
+    }
+
+    /// T6: `pick_present_crtc` falls back to the primary CRTC when
+    /// the requested window is not registered.
+    #[test]
+    fn pick_present_crtc_unknown_window_falls_back_to_primary() {
+        use yserver_core::backend::Backend;
+        let b = super::KmsBackendV2::for_tests();
+        // No window registered; must still return primary (output 0) CRTC.
+        let crtc_id = b.pick_present_crtc(0xDEAD);
+        assert_eq!(crtc_id, Some(u32::from(b.platform.outputs[0].output.crtc)));
+    }
+
+    /// T6: `present_get_ust_msc` uses `pick_present_crtc` to select
+    /// the right CRTC clock. Pre-flip returns (0, ZERO); post-flip
+    /// returns the injected values.
+    #[test]
+    fn present_get_ust_msc_uses_pick_present_crtc() {
+        let mut b = super::KmsBackendV2::for_tests();
+        // Register a window covering output 0.
+        b.windows_v2.insert(
+            0x100,
+            super::WindowGeometryV2 {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+                depth: 24,
+                mapped: true,
+                parent: None,
+                stack_rank: 0,
+                bg_pixel: None,
+                bg_pixmap: None,
+                cursor: None,
+            },
+        );
+        // Pre-flip: pick_present_crtc resolves to output 0 →
+        // crtc_ust_msc empty → (0, ZERO).
+        assert_eq!(b.present_get_ust_msc(0x100), (0, std::time::Duration::ZERO));
+        // Inject a retire on output 0; expect the window's (msc, ust)
+        // to track it.
+        b.note_page_flip_complete_for_tests(0, 42, std::time::Duration::from_micros(1_500));
+        let (msc, ust) = b.present_get_ust_msc(0x100);
+        assert_eq!(msc, 42);
+        assert_eq!(ust, std::time::Duration::from_micros(1_500));
     }
 
     /// T4 (armed-target map): starts empty after construction.

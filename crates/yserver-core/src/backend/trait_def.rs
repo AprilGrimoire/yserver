@@ -1497,6 +1497,21 @@ pub trait Backend: Send {
         (0, std::time::Duration::ZERO)
     }
 
+    /// Pick the CRTC that should service `window`'s Present pacing.
+    /// Returns the raw KMS `crtc_id` so callers can encode it into
+    /// the `user_data` of `DRM_IOCTL_CRTC_QUEUE_SEQUENCE` and into
+    /// `PendingCompleteNotify.crtc` for CRTC-scoped completion drain.
+    ///
+    /// `None` means "this backend has no CRTC concept" (HostX11,
+    /// Recording). In that case the run loop fires with sentinel
+    /// `crtc=0` so non-paced backends keep their pre-fix behaviour.
+    ///
+    /// v2 picks the output with maximum intersection area with the
+    /// window's root rect; ties go to the primary (output 0).
+    fn pick_present_crtc(&self, _window: u32) -> Option<u32> {
+        None
+    }
+
     /// T3/T5 (Present pacing): return + clear the per-iteration ring of
     /// page-flip retirements. Each entry is `(crtc_id, msc, ust_micros)`.
     /// `crtc_id` is the raw `u32` from `drm::control::crtc::Handle` (so
