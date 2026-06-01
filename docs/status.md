@@ -844,6 +844,77 @@ RENDER paint paths. Specifically:
    divergence was measured) as the load-bearing validation.
    yoga remains the rate-canary post-fix.
 
+## Cinnamon keyring modal freezes the shell clock — DIAGNOSED (2026-06-01)
+
+Long-standing (~2 weeks) bug: the gnome-keyring/polkit modal under
+Cinnamon goes inert and the panel clock stops ticking. Root cause
+**identified and timing-proven** on silence (i9/rx580/RADV); fix
+spec at
+`docs/superpowers/specs/2026-06-01-idle-vblank-msc-pacing-design.md`.
+Not yet implemented.
+
+**Symptom:** when the keyring modal appears, the whole Cinnamon
+Clutter/Cogl shell throttles to ~1 fps — panel clock freezes (seen
+stuck at a wall-clock second), dialog barely responds to
+clicks/typing. MATE+yserver works; Cinnamon+Xorg works. Cinnamon-
+specific because Cogl paces its frame clock on
+`loader_dri3_wait_for_msc`; marco/MATE don't. Screen-count-
+independent (reproduces single- and dual-monitor).
+
+**Root cause (code):** `Main.pushModal` →
+`Meta.disable_unredirect_for_display` → full-screen composite with a
+**static scene** → no client-driven damage → yserver stops
+page-flipping → Present MSC can only advance via the idle path.
+That idle path is `core_loop/run.rs::drain_present_completions` →
+`backend.request_next_vblank_event()` →
+`drm/page_flip.rs::request_next_vblank_event(device, crtc_index=0)`,
+which uses **legacy `drmWaitVBlank(Relative(1), EVENT, pipe 0)`**.
+Under amdgpu **atomic** KMS the vblank IRQ is gated when no flip
+stream is active, and legacy `drmWaitVBlank` does not reliably arm a
+one-shot at the next vblank — it lands ~1 s late. So MSC advances
+~1/sec instead of 60/sec, and Cogl's MSC-paced frame clock runs at
+~1 fps.
+
+**Timing proof** (instrumented `PRESENT-DBG`, `just
+yserver-cinnamon-hw`, direct on :7, no x11trace): armed
+`request_next_vblank_event -> armed=true`; prior Vblank
+`msc=1191533 t=19888.582571s`; the armed event lands
+`msc=1191591 t=19889.550045s` = **967 ms / +58 msc late**. A 1-second
+stall gap contains only 2 Vblank + 2 PageFlip events (not 60); the
+run loop is alive (composites throughout), so it is the kernel not
+delivering the armed vblank.
+
+**Red herrings cleared this session** (all disproven with data, do
+not re-chase): (1) a libseat `Disable`/`run_suspend` seen in one
+capture was the *user VT-switching to GNOME to report* — normal
+VT-switch behavior, not the bug; (2) a dual-monitor non-monotonic
+MSC (CRTC 63 vs 66 counters 6857 apart) is a real but **secondary**
+artifact — msc is monotonic per-CRTC and single-screen still fails;
+(3) the earlier Present-`CompleteNotify` `ust=0`/`msc`-high-bits
+theory was an x11trace mis-decode; (4) keyboard-grab focus events
+and `XIAllowEvents(ReplayDevice)` click-fallthrough to nemo-desktop
+are downstream of the ~1 fps input starvation (Clutter dispatches
+input on its frame clock).
+
+**Fix direction (3 parts, see spec):** (1) arm via
+`DRM_IOCTL_CRTC_QUEUE_SEQUENCE` (raw ioctl — `drm-sys` 0.8.1 has
+`drm_crtc_queue_sequence` + `DRM_CRTC_SEQUENCE_RELATIVE` +
+`DRM_CRTC_SEQUENCE_NEXT_ON_MISS`; the `drm` 0.15 crate has no
+high-level wrapper) on the **real crtc_id**, not pipe 0; (2) parse
+the `DRM_EVENT_CRTC_SEQUENCE` (type 3) completion ourselves — `drm`
+0.15 only decodes VBLANK/FLIP_COMPLETE, everything else becomes
+`Event::Unknown`, which `dispatch_event` currently drops; (3) bind
+the Present waiter to one stable CRTC (primary / max-coverage). This
+is the same area as the unmerged `present-vblank-msc` branch's "T6
+idle-case MSC advance" — that T6 impl *is* the broken legacy path.
+Constraints: codex-review the spec; HW-smoke before commit (verify
+clock ticks + 1-click dismiss AND MATE/normal compositing still
+renders — guard the prior deferred-present black-scanout
+regression). `PRESENT-DBG` instrumentation
+(`process_request.rs` / `run.rs` / `page_flip.rs` /
+`kms/v2/backend.rs`) is uncommitted — strip/demote after the fix is
+verified.
+
 ## v1 → v2 transition
 
 The v1 model (per-window mirrors + scanout-walk) hit a structural
