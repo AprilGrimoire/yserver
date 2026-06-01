@@ -305,6 +305,10 @@ where
             if bytes.len() < std::mem::size_of::<drm_event_header>() {
                 return;
             }
+            // SAFETY: bytes.len() >= size_of::<drm_event_header>()
+            // (guarded above); drm_event_header is #[repr(C)] Copy
+            // with no padding; bytes is a local Vec with no
+            // concurrent aliases.
             let header: drm_event_header =
                 unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const drm_event_header) };
             if header.r#type != DRM_EVENT_CRTC_SEQUENCE {
@@ -316,6 +320,11 @@ where
             if bytes.len() < std::mem::size_of::<drm_event_crtc_sequence>() {
                 return;
             }
+            // SAFETY: bytes.len() >= size_of::<drm_event_crtc_sequence>()
+            // (guarded above); drm_event_crtc_sequence is #[repr(C)]
+            // Copy with no padding (pinned by
+            // drm_event_crtc_sequence_struct_is_32_bytes); bytes is a
+            // local Vec with no concurrent aliases.
             let ev: drm_event_crtc_sequence = unsafe {
                 std::ptr::read_unaligned(bytes.as_ptr() as *const drm_event_crtc_sequence)
             };
@@ -527,12 +536,15 @@ mod tests {
     #[test]
     fn dispatch_event_ignores_wrong_length_sequence_event() {
         use super::{DRM_EVENT_CRTC_SEQUENCE, drm_event_header};
-        // Right type, wrong length → silently dropped.
+        // Right type, wrong header.length → silently dropped.
+        // Use a FULL-SIZED 32-byte buffer so guard 4 (bytes.len()
+        // < 32) cannot fire; this isolates guard 3 (header.length
+        // != size_of::<drm_event_crtc_sequence>()).
         let header = drm_event_header {
             r#type: DRM_EVENT_CRTC_SEQUENCE,
             length: 16,
         };
-        let mut bytes = vec![0u8; 16];
+        let mut bytes = vec![0u8; 32];
         bytes[..8].copy_from_slice(&unsafe { std::mem::transmute::<_, [u8; 8]>(header) });
         let event = Event::Unknown(bytes);
 
