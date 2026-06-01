@@ -470,6 +470,16 @@ pub(crate) struct PageFlipCompletion {
     pub(crate) ust: std::time::Duration,
 }
 
+/// Returned by `drain_page_flip_events` per `DRM_CRTC_SEQUENCE` event.
+/// Fields are raw kernel values; validation (time_ns sign, crtc_id
+/// resolution) happens in `on_crtc_sequence_event`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SequenceCompletion {
+    pub(crate) crtc_id_raw: u32,
+    pub(crate) time_ns: i64,
+    pub(crate) sequence: u64,
+}
+
 // ────────────────────────────────────────────────────────────────
 // FlushOutcome
 // ────────────────────────────────────────────────────────────────
@@ -1185,16 +1195,25 @@ impl PlatformBackend {
         fds
     }
 
-    pub(crate) fn drain_page_flip_events(&self) -> io::Result<Vec<PageFlipCompletion>> {
+    pub(crate) fn drain_page_flip_events(
+        &self,
+    ) -> io::Result<(Vec<PageFlipCompletion>, Vec<SequenceCompletion>)> {
         use ::drm::control::crtc;
 
         let mut flipped: Vec<(crtc::Handle, u64, std::time::Duration)> = Vec::new();
+        let mut sequenced: Vec<SequenceCompletion> = Vec::new();
         crate::drm::page_flip::drain_events(
             &self.device,
             |c, msc, ust| {
                 flipped.push((c, msc, ust));
             },
-            |_cid, _t, _s| { /* wired in Task 8 */ },
+            |crtc_id_raw, time_ns, sequence| {
+                sequenced.push(SequenceCompletion {
+                    crtc_id_raw,
+                    time_ns,
+                    sequence,
+                });
+            },
         )?;
 
         let mut completions = Vec::with_capacity(flipped.len());
@@ -1209,7 +1228,7 @@ impl PlatformBackend {
                 ust,
             });
         }
-        Ok(completions)
+        Ok((completions, sequenced))
     }
 
     /// VkContext accessor for the engine. Returns `None` on the

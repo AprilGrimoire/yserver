@@ -1543,21 +1543,28 @@ pub trait Backend: Send {
         false
     }
 
-    /// T6 (idle-case MSC advance): ask the backend to schedule a
-    /// kernel vblank event so the run loop can drain
-    /// `pending_complete_notify` even when no pageflip is in flight.
-    /// Mirrors Xorg `present_screen_info::queue_vblank`. Backends
-    /// without a real per-CRTC clock (`HostX11`, `Recording`) return
-    /// the default no-op `Ok(false)` — they flush pending notifies
-    /// synchronously via the `has_vblank_pacing == false` path in
-    /// `drain_present_completions`.
+    /// Arm one-shot kernel vblank events for each pending Present
+    /// waiter so the run loop can drain `pending_complete_notify`
+    /// when no pageflip is in flight. Mirrors Xorg `ms_present_queue_vblank`.
     ///
-    /// Returns `Ok(true)` iff a vblank request was actually
-    /// scheduled (so the caller can suppress further requests until
-    /// the resulting event arrives — dedup against the existing
-    /// in-flight request lives on the implementing backend).
-    fn request_next_vblank_event(&mut self) -> std::io::Result<bool> {
-        Ok(false)
+    /// `pending` is a list of `(crtc_id, target_msc)` taken from
+    /// `pending_complete_notify` — the backend dedups against an
+    /// internal per-CRTC armed-target map so calling this every
+    /// run-loop iteration is safe (no refire storm).
+    ///
+    /// `target_msc == 0` means "next vblank" (relative=1). Any non-zero
+    /// target is absolute with `NEXT_ON_MISS`. KMS backends should
+    /// pre-gate on scanout permission and clear the entire armed-target
+    /// map when scanout is disallowed (master loss drops queued
+    /// sequences).
+    ///
+    /// Returns the count of CRTCs newly armed. `0` includes the
+    /// "nothing pending" / "scanout disallowed" / "already armed"
+    /// cases — callers should not treat zero as an error.
+    ///
+    /// Default `Ok(0)` keeps HostX11 / Recording opted out.
+    fn arm_idle_vblanks(&mut self, _pending: &[(u32, u64)]) -> std::io::Result<usize> {
+        Ok(0)
     }
 
     /// Stage 5 Task 6.1: enqueue a deferred PRESENT completion. The

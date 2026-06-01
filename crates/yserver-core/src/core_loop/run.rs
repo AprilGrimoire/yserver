@@ -771,23 +771,23 @@ fn drain_present_completions(state: &mut ServerState, backend: &mut dyn Backend)
                 state, crtc_id, msc, ust_micros,
             );
         }
-        // T6 (idle-case MSC advance): if notifies remain after
-        // draining real pageflip events, ask the kernel for a
-        // standalone vblank event so the next vblank arrives even
-        // when no pageflip is in flight. Mirrors Xorg's
-        // `present_screen_info::queue_vblank` — a paced backend
-        // owes a future `(msc, ust)` for each queued `CompleteNotify`
-        // / `NotifyMSC`. The backend dedups against an in-flight
-        // request internally, so calling this every iteration is
-        // safe.
+        // T6 (idle-case MSC advance, post-fix): arm absolute vblanks for
+        // every pending complete-notify's (crtc, target_msc). Backend
+        // dedups against its per-CRTC armed-target map.
         if !state.pending_complete_notify.is_empty() {
-            let pending = state.pending_complete_notify.len();
-            match backend.request_next_vblank_event() {
+            let pending: Vec<(u32, u64)> = state
+                .pending_complete_notify
+                .iter()
+                .map(|e| (e.crtc, e.target_msc))
+                .collect();
+            match backend.arm_idle_vblanks(&pending) {
                 Ok(armed) => log::info!(
-                    "PRESENT-DBG: request_next_vblank_event pending={pending} -> armed={armed}"
+                    "PRESENT-DBG: arm_idle_vblanks pending={} -> armed={armed}",
+                    pending.len()
                 ),
                 Err(e) => log::info!(
-                    "PRESENT-DBG: request_next_vblank_event pending={pending} -> ERR {e}"
+                    "PRESENT-DBG: arm_idle_vblanks pending={} -> ERR {e}",
+                    pending.len()
                 ),
             }
         }

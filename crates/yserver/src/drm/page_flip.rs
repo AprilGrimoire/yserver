@@ -103,8 +103,6 @@ pub(crate) const DRM_IOCTL_CRTC_QUEUE_SEQUENCE: libc::c_ulong = ((3 as libc::c_u
 ///   to the relative-keep-alive path.
 /// - `EACCES` if we no longer hold DRM master — caller must have
 ///   pre-gated on `scanout_allowed()`.
-// Caller wired in Task 8; suppress dead_code until then.
-#[allow(dead_code)]
 pub(crate) fn queue_crtc_sequence(
     device: &Device,
     crtc_id: u32,
@@ -224,39 +222,6 @@ where
         dispatch_event(event, &mut on_advance, &mut on_sequence);
     }
     Ok(())
-}
-
-/// T6 (idle-case MSC advance): request a vblank event from the
-/// kernel so the next vblank arrives on the DRM fd even when no
-/// pageflip is in flight. Mirrors Xorg
-/// `present_screen_info::queue_vblank` semantics: ask the driver
-/// for an event at the next vblank on the given CRTC; the run loop
-/// drains the event via [`drain_events`] and uses the kernel
-/// `(msc, ust)` to fire queued `CompleteNotify` / `NotifyMSC`
-/// payloads.
-///
-/// `crtc_index` is the 0-based CRTC ordinal (0..32) — the kernel
-/// encodes this into the `_DRM_VBLANK_HIGH_CRTC_MASK` bits. Higher
-/// CRTC indices use the libdrm `high_crtc` field directly.
-///
-/// Returns the kernel-reported sequence the event was scheduled
-/// for; the actual completion arrives asynchronously as
-/// `Event::Vblank(crtc, frame, time)`.
-pub fn request_next_vblank_event(device: &Device, crtc_index: u32) -> io::Result<()> {
-    use drm::{Device as DrmDevice, VblankWaitFlags, VblankWaitTarget};
-    // Relative(1) = "the next vblank from now"; with EVENT the
-    // ioctl returns immediately and the completion lands on the
-    // DRM fd, picked up by `drain_events` on the next epoll cycle.
-    // `user_data` is opaque; we don't need it for routing because
-    // the `VblankEvent` already carries `crtc`.
-    device
-        .wait_vblank(
-            VblankWaitTarget::Relative(1),
-            VblankWaitFlags::EVENT,
-            crtc_index,
-            0,
-        )
-        .map(drop)
 }
 
 /// Dispatch a single drm event.
