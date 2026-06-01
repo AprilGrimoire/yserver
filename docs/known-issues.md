@@ -323,12 +323,38 @@ from.
       stubbed `Err` on v2 (Stage 4). Real fix is Stage 4 — the
       gaps aren't a v2 regression, but the noise complicates
       diagnosis here.
-- [ ] **MATE panel flicker on v2 (2026-05-17, open).** Reported
-      with the resize-down session above; not yet diagnosed.
-      Could share a root cause with the xeyes shrink bug (rapid
-      configure_subwindow on panel applet activity) or be its
-      own scene-damage issue. Worth capturing a focused
-      x11trace + RUST_LOG=debug session when picked up.
+- [~] **MATE panel flicker on v2 (2026-05-17).** Reported with the
+      resize-down session above. **Likely resolved 2026-06-01** by the
+      systray ClipByChildren fix below — the speculated "rapid panel
+      applet activity" cause matches the notification-area damage storm
+      (~485 FillRectangles/socket per vsync), which recomposited the
+      panel strip every frame. Re-confirm on a MATE session; if flicker
+      persists outside the tray region it's a separate scene-damage
+      issue.
+
+- [x] **Systray damage storm + invisible tray icons — FIXED
+      (2026-06-01, branch `clip-by-children`).** mate-panel's
+      notification area drove a per-vsync loop (~485 FillRectangles per
+      tray socket; 1486 DamageNotify vs Xorg's 29) and tray icons never
+      rendered, on every machine. Single root cause: yserver never
+      applied `ClipByChildren` to RENDER paint or its damage. A tray
+      socket is fully covered by its mapped XEMBED icon child, so the
+      applet's `FillRectangles op=Clear` on the socket is a no-op in
+      Xorg (empty composite clip → no paint, no damage). yserver painted
+      + damaged the full socket → wiped the icon backing (invisible
+      icons) and fired the socket's own damage object → panel
+      recomposites → clears → loop. Fixed at the RENDER FillRectangles
+      site (`process_request.rs` opcode 26): clip both the paint
+      (`clip_fill_rects_by_children`, subtract mapped InputOutput
+      children, empty → skip op) and the damage
+      (`accumulate_damage_clip_by_children_to_state`); shared
+      `mapped_child_clip_rects` helper in `damage_fanout.rs`.
+      HW-verified on silence: icons visible, loop dead, ~half the
+      session's protocol traffic eliminated. **Follow-up:** the same
+      ClipByChildren gap remains on the other RENDER paint sites
+      (Composite, CompositeGlyphs, Trapezoids/Triangles) — not
+      tray-exercised, but the same latent class. See `status.md`
+      "Systray applet loop — RESOLVED".
 
 - [ ] **Per-client GC mirroring** (Phase 3.7 task #26). The shared
       host GC creates subtle bugs when GC state leaks between clients.

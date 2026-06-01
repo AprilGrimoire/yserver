@@ -31,8 +31,8 @@ use crate::{
     core_loop::{
         client_io::{self, WriteOutcome},
         damage_fanout::{
-            accumulate_damage_full_to_state, accumulate_damage_to_state,
-            report_existing_damage_to_state,
+            accumulate_damage_clip_by_children_to_state, accumulate_damage_full_to_state,
+            accumulate_damage_to_state, report_existing_damage_to_state,
         },
         fanout::{
             client_target_id, emit_expose_subtree_to_state,
@@ -484,6 +484,48 @@ fn normalize_region_rects(
     rects: Vec<yserver_protocol::x11::xfixes::RegionRect>,
 ) -> Vec<yserver_protocol::x11::xfixes::RegionRect> {
     crate::nested::normalize_region_rects(rects)
+}
+
+/// Clip RENDER `FillRectangles` wire rects (8-byte `xRectangle`s) to a
+/// `ClipByChildren` window's effective region — i.e. subtract the
+/// window's mapped `InputOutput` children. Returns the surviving rects
+/// re-encoded as wire bytes; an empty `Vec` means the paint is a no-op
+/// (window fully covered by a child, as with a systray socket under its
+/// XEMBED icon — Xorg's empty composite clip → nothing drawn, icon
+/// preserved). For pixmaps / childless windows the rects pass through
+/// unchanged.
+fn clip_fill_rects_by_children(
+    state: &ServerState,
+    dst_drawable: ResourceId,
+    rects: &[u8],
+) -> Vec<u8> {
+    use yserver_protocol::x11::xfixes;
+
+    let child_rects = crate::core_loop::damage_fanout::mapped_child_clip_rects(state, dst_drawable);
+    if child_rects.is_empty() {
+        return rects.to_vec();
+    }
+
+    let requested: Vec<xfixes::RegionRect> = rects
+        .chunks_exact(8)
+        .map(|c| xfixes::RegionRect {
+            x: i16::from_le_bytes([c[0], c[1]]),
+            y: i16::from_le_bytes([c[2], c[3]]),
+            width: u16::from_le_bytes([c[4], c[5]]),
+            height: u16::from_le_bytes([c[6], c[7]]),
+        })
+        .collect();
+
+    let clipped = crate::nested::subtract_regions(&requested, &child_rects);
+
+    let mut out = Vec::with_capacity(clipped.len() * 8);
+    for r in clipped {
+        out.extend_from_slice(&r.x.to_le_bytes());
+        out.extend_from_slice(&r.y.to_le_bytes());
+        out.extend_from_slice(&r.width.to_le_bytes());
+        out.extend_from_slice(&r.height.to_le_bytes());
+    }
+    out
 }
 
 fn format_region_rects(rects: &[yserver_protocol::x11::xfixes::RegionRect]) -> String {
@@ -1613,13 +1655,34 @@ fn handle_render_request(
                 .picture(req.dst)
                 .map(|p| p.host_picture_xid.as_raw());
             if let Some(host_dst) = host_dst {
-                let _ = backend
-                    .render_fill_rectangles(origin, host_dst, req.op, req.color, &req.rects, 0, 0);
-                if !req.rects.is_empty()
-                    && let Some(dst_drawable) =
-                        state.resources.picture(req.dst).and_then(|p| p.drawable)
-                {
-                    let _dropped = accumulate_damage_full_to_state(state, dst_drawable);
+                // ClipByChildren: a FillRectangles op=Clear on a window
+                // fully covered by a mapped child (mate-panel systray
+                // socket under its XEMBED icon) is a no-op in Xorg —
+                // empty composite clip → nothing painted, no damage. We
+                // historically painted + damaged the full drawable, which
+                // both wiped the embedded icon's backing AND drove the
+                // per-frame tray recomposite loop. Clip the paint rects to
+                // window-minus-children; if the result is empty the whole
+                // op is skipped. Pixmaps / childless windows pass through
+                // unchanged.
+                let dst_drawable = state.resources.picture(req.dst).and_then(|p| p.drawable);
+                let painted_rects = match dst_drawable {
+                    Some(d) => clip_fill_rects_by_children(state, d, &req.rects),
+                    None => req.rects.clone(),
+                };
+                if !painted_rects.is_empty() {
+                    let _ = backend.render_fill_rectangles(
+                        origin,
+                        host_dst,
+                        req.op,
+                        req.color,
+                        &painted_rects,
+                        0,
+                        0,
+                    );
+                    if let Some(d) = dst_drawable {
+                        let _dropped = accumulate_damage_clip_by_children_to_state(state, d);
+                    }
                 }
             }
         }

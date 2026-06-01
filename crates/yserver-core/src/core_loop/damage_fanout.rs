@@ -67,6 +67,81 @@ pub fn accumulate_damage_full_to_state(
     accumulate_damage_to_state(state, drawable, 0, 0, r.width, r.height)
 }
 
+/// Mapped `InputOutput` children of `drawable`, as rects in the
+/// drawable's local coords (a child's x/y are already relative to its
+/// parent). These are the regions `ClipByChildren` subtracts from a
+/// window's effective paint/damage clip; `InputOnly` and unmapped
+/// children never clip, matching Xorg's `clipList` computation.
+/// Empty for pixmaps (no children) and for childless windows.
+pub fn mapped_child_clip_rects(
+    state: &ServerState,
+    drawable: ResourceId,
+) -> Vec<xfixes::RegionRect> {
+    state
+        .resources
+        .children(drawable)
+        .iter()
+        .filter_map(|child| state.resources.window(*child))
+        .filter(|w| {
+            w.class == crate::resources::WindowClass::InputOutput
+                && w.map_state != crate::resources::MapState::Unmapped
+        })
+        .map(|w| xfixes::RegionRect {
+            x: w.x,
+            y: w.y,
+            width: w.width,
+            height: w.height,
+        })
+        .collect()
+}
+
+/// ClipByChildren-aware variant of [`accumulate_damage_full_to_state`].
+///
+/// X.Org clips RENDER paint — and the damage it generates — to the
+/// destination window's `clipList` = its geometry MINUS its mapped
+/// children. That is the default `ClipByChildren` picture mode
+/// (`render/picture.c:719`, `render/mipict.c:117`); the damage
+/// extension then gates on a non-empty composite clip
+/// (`miext/damage/damage.c:462,474`). When a window is fully covered
+/// by a mapped child — e.g. a mate-panel systray socket fully covered
+/// by its embedded XEMBED icon — the clip is empty and Xorg emits NO
+/// damage. yserver historically damaged the full drawable regardless,
+/// which fed a self-sustaining damage → recomposite → clear loop in
+/// the notification area (~485 FillRectangles/socket per frame).
+///
+/// This emits damage only on the portion of `drawable` NOT covered by
+/// mapped `InputOutput` children. For pixmaps (no children) it is
+/// identical to [`accumulate_damage_full_to_state`].
+pub fn accumulate_damage_clip_by_children_to_state(
+    state: &mut ServerState,
+    drawable: ResourceId,
+) -> Vec<ClientId> {
+    let full = drawable_full_rect(state, drawable);
+    if full.width == 0 || full.height == 0 {
+        return Vec::new();
+    }
+
+    let child_rects = mapped_child_clip_rects(state, drawable);
+
+    let visible = if child_rects.is_empty() {
+        vec![full]
+    } else {
+        crate::nested::subtract_regions(&[full], &child_rects)
+    };
+
+    let mut dropped: Vec<ClientId> = Vec::new();
+    for rect in visible {
+        for c in
+            accumulate_damage_to_state(state, drawable, rect.x, rect.y, rect.width, rect.height)
+        {
+            if !dropped.contains(&c) {
+                dropped.push(c);
+            }
+        }
+    }
+    dropped
+}
+
 pub fn accumulate_damage_to_state(
     state: &mut ServerState,
     drawable: ResourceId,
@@ -982,5 +1057,125 @@ mod tests {
              pre-fix this would be (50, 100, 20, 30) — the small paint \
              rect — which is the bug",
         );
+    }
+
+    /// Regression gate for the mate-panel systray storm + invisible
+    /// tray icons (resolved 2026-06-01). A RENDER FillRectangles Clear
+    /// on a window fully covered by a mapped child — the systray socket
+    /// under its XEMBED icon — must emit ZERO damage (Xorg's empty
+    /// `ClipByChildren` composite clip). Pre-fix this damaged the full
+    /// socket → fired the socket's own DamageCreate → per-vsync
+    /// recompose loop. If this assertion ever flips to non-zero, the
+    /// storm is back.
+    #[test]
+    fn clip_by_children_fully_covered_socket_emits_no_damage() {
+        let mut state = ServerState::new();
+        add_client(&mut state, 1, 0x0210_0000);
+        // Socket 26×27; icon child 26×27 at (0,0) → full cover.
+        let socket = add_window(&mut state, 1, 0x0210_0018, ROOT_WINDOW, 2376, 0, 26, 27);
+        let _icon = add_window(&mut state, 1, 0x0210_0007, socket, 0, 0, 26, 27);
+        // The applet's own DamageCreate on the socket — the loop's
+        // wake source.
+        add_damage_on(&mut state, 1, 0x0210_0019, socket);
+
+        let dropped = accumulate_damage_clip_by_children_to_state(&mut state, socket);
+
+        let dmg = state
+            .damage_objects
+            .get(&0x0210_0019)
+            .expect("socket damage object");
+        assert!(
+            dmg.rects.is_empty(),
+            "fully-covered socket must emit no damage (got {} rect(s)) \
+             — the systray storm regression gate",
+            dmg.rects.len(),
+        );
+        assert!(
+            !dmg.pending_notify_fired,
+            "no DamageNotify may fire for a fully-covered socket",
+        );
+        assert!(
+            dropped.is_empty(),
+            "no clients should be targeted when the clip is empty",
+        );
+    }
+
+    /// Contrast: a partially-covered window still damages the exposed
+    /// margin. Icon 16 wide inside a 26-wide socket leaves a 10×27
+    /// strip; that strip is the only damage, not the full drawable.
+    #[test]
+    fn clip_by_children_partial_cover_damages_only_margin() {
+        let mut state = ServerState::new();
+        add_client(&mut state, 1, 0x0210_0000);
+        let socket = add_window(&mut state, 1, 0x0210_0018, ROOT_WINDOW, 0, 0, 26, 27);
+        let _icon = add_window(&mut state, 1, 0x0210_0007, socket, 0, 0, 16, 27);
+        add_damage_on(&mut state, 1, 0x0210_0019, socket);
+
+        let _ = accumulate_damage_clip_by_children_to_state(&mut state, socket);
+
+        let dmg = state
+            .damage_objects
+            .get(&0x0210_0019)
+            .expect("socket damage object");
+        assert_eq!(dmg.rects.len(), 1, "exactly the uncovered margin");
+        let r = dmg.rects[0];
+        assert_eq!(
+            (r.x, r.y, r.width, r.height),
+            (16, 0, 10, 27),
+            "damage must be the 10×27 strip the icon does not cover",
+        );
+    }
+
+    /// `InputOnly` and unmapped children never contribute to the
+    /// ClipByChildren region (matching Xorg's clipList). A socket
+    /// "covered" only by such children still damages in full.
+    #[test]
+    fn mapped_child_clip_rects_skips_inputonly_and_unmapped() {
+        let mut state = ServerState::new();
+        add_client(&mut state, 1, 0x0210_0000);
+        let socket = add_window(&mut state, 1, 0x0210_0018, ROOT_WINDOW, 0, 0, 26, 27);
+
+        // InputOnly child covering the socket — must NOT clip.
+        let input_only = ResourceId(0x0210_0007);
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 0,
+                window: input_only,
+                parent: socket,
+                x: 0,
+                y: 0,
+                width: 26,
+                height: 27,
+                border_width: 0,
+                class: 2, // InputOnly
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(input_only);
+
+        // Mapped-then-unmapped InputOutput child — must NOT clip.
+        let gone = add_window(&mut state, 1, 0x0210_0008, socket, 0, 0, 26, 27);
+        let _ = state.resources.unmap_window(gone);
+
+        assert!(
+            mapped_child_clip_rects(&state, socket).is_empty(),
+            "neither InputOnly nor unmapped children may clip",
+        );
+
+        add_damage_on(&mut state, 1, 0x0210_0019, socket);
+        let _ = accumulate_damage_clip_by_children_to_state(&mut state, socket);
+        let dmg = state
+            .damage_objects
+            .get(&0x0210_0019)
+            .expect("socket damage object");
+        assert_eq!(
+            dmg.rects.len(),
+            1,
+            "socket with no clipping children damages in full",
+        );
+        let r = dmg.rects[0];
+        assert_eq!((r.x, r.y, r.width, r.height), (0, 0, 26, 27));
     }
 }
