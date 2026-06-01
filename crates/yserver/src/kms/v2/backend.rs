@@ -2539,14 +2539,33 @@ impl KmsBackendV2 {
         self.armed_vblank_targets.remove(&crtc);
     }
 
-    /// Test-only helper to clear the entire armed-target map.
-    /// Production paths inline `self.armed_vblank_targets.clear()`
-    /// directly (e.g. inside `arm_idle_vblanks_with` when scanout is
-    /// disallowed); this helper exists for unit tests that need to
-    /// reset the map without going through those paths.
-    #[allow(dead_code)]
+    /// Clear the entire armed-target map.
+    ///
+    /// Called at lifecycle edges where the kernel has already dropped all
+    /// queued CRTC sequences: VT suspend (`run_suspend`, immediately after
+    /// `drain_all` + `reset_scanout_bos_for_suspend`) and DPMS-off
+    /// transitions (`set_dpms_power` sleep side, same position).  An
+    /// in-flight `DRM_CRTC_SEQUENCE` event will never arrive once DRM
+    /// master is released or the CRTC is disabled, so any surviving
+    /// entry would permanently stall the per-CRTC arm cycle.
     pub(crate) fn clear_all_armed_vblank_targets(&mut self) {
         self.armed_vblank_targets.clear();
+    }
+
+    /// Drop armed-target entries for CRTCs no longer owned by any live
+    /// output. Called after `requery_outputs_and_modeset` retires a
+    /// disconnected connector. (The new sequence event for a stale CRTC
+    /// is already dropped by `on_crtc_sequence_event`, but the map must
+    /// not retain dead entries — they would mis-dedup a CRTC id reused
+    /// by a later hotplug.)
+    pub(crate) fn prune_armed_targets_to_live_outputs(&mut self) {
+        let live: std::collections::HashSet<::drm::control::crtc::Handle> = self
+            .platform
+            .outputs
+            .iter()
+            .map(|o| o.output.crtc)
+            .collect();
+        self.armed_vblank_targets.retain(|h, _| live.contains(h));
     }
 
     /// Side-effect-free sequence-event handler.
@@ -3877,6 +3896,17 @@ impl KmsBackendV2 {
         //     re-renders (content marked invalidated).
         self.platform.reset_scanout_bos_for_suspend();
 
+        // 4d. Clear per-CRTC armed-vblank-target map. The kernel drops
+        //     all queued `DRM_CRTC_SEQUENCE` events when DRM master is
+        //     revoked (step 6 below). Any surviving entry in the map
+        //     would permanently block the next re-arm on resume because
+        //     the dedup gate in `arm_idle_vblanks_with` would see the
+        //     old (crtc, target_msc) as "already armed" and skip it —
+        //     producing a permanent ~0 fps stall. Clear unconditionally
+        //     here (GPU is idle, scene is drained) so resume starts
+        //     with a clean slate and re-arms on the first idle tick.
+        self.clear_all_armed_vblank_targets();
+
         // 5. Suspend libinput — closes input device fds via close_restricted
         //    → seat.close_device for each input device. MUST NOT hold a
         //    LibseatInner borrow across this call (re-entrancy contract:
@@ -3952,6 +3982,14 @@ impl KmsBackendV2 {
                     }
                     self.fire_randr_changes(state, dropped);
                 }
+                // 2b-prune. Remove armed-target entries for any CRTCs that
+                // were retired by requery (disconnected while suspended).
+                // The kernel already dropped their queued sequences; a
+                // stale entry would permanently block re-arm on that
+                // handle (or mis-dedup a reused CRTC id from a later
+                // hotplug). Safe to call even when nothing was dropped —
+                // the retain is a no-op if all entries are still live.
+                self.prune_armed_targets_to_live_outputs();
             }
             Err(e) => {
                 log::error!("kms: resume: modeset failed (card gone?): {e}; exiting");
@@ -12484,6 +12522,13 @@ impl Backend for KmsBackendV2 {
             self.scene.drain_all(&mut self.platform);
             log::info!("kms: dpms sleep — reset_scanout_bos_for_suspend");
             self.platform.reset_scanout_bos_for_suspend();
+            // Clear per-CRTC armed-vblank-target map. The kernel stops
+            // generating vblank events for disabled CRTCs, so any
+            // queued `DRM_CRTC_SEQUENCE` will never fire. Stale entries
+            // would permanently block re-arm on DPMS wake. This is a
+            // global (all-CRTC) off transition, so clear-all is correct.
+            log::info!("kms: dpms sleep — clear_all_armed_vblank_targets");
+            self.clear_all_armed_vblank_targets();
             log::info!("kms: dpms sleep — disable_output per output");
             let res = self.platform.dpms_set_outputs_active(false);
             // Only flip the cache on success. On Err, leave it where it was
@@ -18552,5 +18597,53 @@ mod tests {
             b.inject_seat_event_for_test(&mut state, true);
             assert_eq!(b.seat_state, SeatState::Active);
         }
+    }
+
+    // ── Task 9 — lifecycle reconciliation ─────────────────────────────────
+
+    /// T9: `clear_all_armed_vblank_targets` zeroes the map (the same helper
+    /// that `run_suspend` calls at the gate-closed step).
+    #[test]
+    fn run_suspend_clears_armed_targets() {
+        let mut b = super::KmsBackendV2::for_tests();
+        let crtc = b.platform.outputs[0].output.crtc;
+        b.armed_vblank_targets.insert(crtc, 1234);
+        // Drive suspend by setting state — full run_suspend needs libseat,
+        // so unit-test the clear-all helper directly. Integration coverage
+        // lives in the HW smoke gate.
+        b.seat_state = crate::seat::state::SeatState::Suspended;
+        b.clear_all_armed_vblank_targets();
+        assert!(b.armed_vblank_targets.is_empty());
+    }
+
+    /// T9: `arm_idle_vblanks` (Backend trait impl) skips a CRTC handle
+    /// that isn't in `platform.outputs` — stale handles must never be
+    /// armed after an output is removed.
+    #[test]
+    fn arm_idle_vblanks_skips_stale_crtc() {
+        use yserver_core::backend::Backend;
+        let mut b = super::KmsBackendV2::for_tests();
+        let stale = 0xDEAD; // not any real output
+        let armed = b.arm_idle_vblanks(&[(stale, 100)]).unwrap();
+        assert_eq!(armed, 0);
+        assert!(b.armed_vblank_targets.is_empty());
+    }
+
+    /// T9: `prune_armed_targets_to_live_outputs` drops entries whose CRTC
+    /// handle is no longer in `platform.outputs`, while preserving entries
+    /// that are still live.
+    #[test]
+    fn prune_armed_targets_after_output_removal() {
+        let mut b = super::KmsBackendV2::for_tests();
+        let crtc_a = b.platform.outputs[0].output.crtc;
+        // Synthesize a "stale" handle that is NOT in platform.outputs.
+        // (Mirrors the post-hotplug state where a CRTC handle survived
+        // in the armed map but the output was already removed.)
+        let stale_handle = ::drm::control::from_u32(999).unwrap();
+        b.armed_vblank_targets.insert(crtc_a, 1);
+        b.armed_vblank_targets.insert(stale_handle, 2);
+        b.prune_armed_targets_to_live_outputs();
+        assert!(b.armed_vblank_targets.contains_key(&crtc_a));
+        assert!(!b.armed_vblank_targets.contains_key(&stale_handle));
     }
 }
