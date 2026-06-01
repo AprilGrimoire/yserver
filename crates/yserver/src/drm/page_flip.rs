@@ -76,10 +76,10 @@ pub(crate) struct drm_event_crtc_sequence {
 // the request code is a `const` we can also assert in a unit test.
 //   dir = 3 (RW), type = 'd' (0x64), nr = 0x3C, size = 24
 #[allow(dead_code)]
-pub(crate) const DRM_IOCTL_CRTC_QUEUE_SEQUENCE: u64 = ((3u64) << 30)
-    | ((std::mem::size_of::<drm_crtc_queue_sequence>() as u64) << 16)
-    | ((0x64u64) << 8)
-    | 0x3Cu64;
+pub(crate) const DRM_IOCTL_CRTC_QUEUE_SEQUENCE: libc::c_ulong = ((3 as libc::c_ulong) << 30)
+    | ((std::mem::size_of::<drm_crtc_queue_sequence>() as libc::c_ulong) << 16)
+    | ((0x64 as libc::c_ulong) << 8)
+    | 0x3C;
 
 pub fn submit_flip(device: &Device, output: &Output, fb_id: framebuffer::Handle) -> io::Result<()> {
     submit_flip_inner(device, output, fb_id, None, None)
@@ -342,6 +342,7 @@ mod tests {
         // to the payload AFTER the 8-byte drm_event header; sizeof
         // of the full struct including header is 32.)
         assert_eq!(std::mem::size_of::<super::drm_event_crtc_sequence>(), 32);
+        assert_eq!(std::mem::align_of::<super::drm_event_crtc_sequence>(), 8);
     }
 
     #[test]
@@ -349,12 +350,15 @@ mod tests {
         // _IOWR('d' /*0x64*/, 0x3C, drm_crtc_queue_sequence).
         // _IOC(dir=3 /*RW*/, type='d', nr=0x3C, size=24)
         //   = (3 << 30) | (24 << 16) | (0x64 << 8) | 0x3C
-        //   = 0xC0186_43C? Compute:
+        //   = 0xC018_643C. Compute:
         //     (3 << 30) = 0xC0000000
         //     (24 << 16) = 0x00180000
         //     (0x64 << 8) = 0x00006400
         //     0x3C = 0x3C
         //   = 0xC018643C
-        assert_eq!(super::DRM_IOCTL_CRTC_QUEUE_SEQUENCE, 0xC018_643C);
+        assert_eq!(
+            super::DRM_IOCTL_CRTC_QUEUE_SEQUENCE,
+            0xC018_643C as libc::c_ulong
+        );
     }
 }
