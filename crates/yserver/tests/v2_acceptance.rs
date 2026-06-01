@@ -2982,6 +2982,7 @@ fn v2_drain_force_fires_all_pending_on_renderer_failed() {
                 options: 0,
                 wake: yserver_core::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
                 target_msc: 0,
+                bound_crtc: 0,
             },
             cow.as_raw(),
         );
@@ -3036,6 +3037,7 @@ fn v2_present_pixmap_enqueues_pending_and_defers_emission() {
             options: 0,
             wake: PresentWake::Pixmap { idle_fence_xid: 0 },
             target_msc: 0,
+            bound_crtc: 0,
         },
         cow_pix.as_raw(),
     );
@@ -3079,6 +3081,7 @@ fn v2_present_pixmap_synced_enqueues_with_release_syncobj_wake() {
                 release_value: 42,
             },
             target_msc: 0,
+            bound_crtc: 0,
         },
         cow_pix.as_raw(),
     );
@@ -3117,6 +3120,7 @@ fn v2_disable_output_flushes_pending_batches_before_drain_all() {
             options: 0,
             wake: PresentWake::Pixmap { idle_fence_xid: 0 },
             target_msc: 0,
+            bound_crtc: 0,
         },
         cow.as_raw(),
     );
@@ -3210,6 +3214,7 @@ fn submit_group_flushes_before_non_cow_present_completion_signal() {
             options: 0,
             wake: PresentWake::Pixmap { idle_fence_xid: 0 },
             target_msc: 0,
+            bound_crtc: 0,
         },
         dst_xid,
     );

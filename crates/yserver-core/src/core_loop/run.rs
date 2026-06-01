@@ -766,11 +766,9 @@ fn drain_present_completions(state: &mut ServerState, backend: &mut dyn Backend)
                 state.pending_complete_notify.len()
             );
         }
-        for (_crtc_id, msc, ust_micros) in flips {
-            // _crtc_id: consumed in Task 7 when drain_pending_complete_notify_for_flip
-            // gains CRTC-scoped routing. Discarded for now.
+        for (crtc_id, msc, ust_micros) in flips {
             crate::core_loop::process_request::drain_pending_complete_notify_for_flip(
-                state, msc, ust_micros,
+                state, crtc_id, msc, ust_micros,
             );
         }
         // T6 (idle-case MSC advance): if notifies remain after
@@ -794,7 +792,7 @@ fn drain_present_completions(state: &mut ServerState, backend: &mut dyn Backend)
             }
         }
     } else if !state.pending_complete_notify.is_empty() {
-        crate::core_loop::process_request::drain_pending_complete_notify_for_flip(state, 0, 0);
+        crate::core_loop::process_request::drain_pending_complete_notify_for_flip(state, 0, 0, 0);
     }
 }
 

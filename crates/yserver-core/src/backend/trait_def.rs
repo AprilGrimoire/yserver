@@ -156,6 +156,12 @@ pub struct CompletedPresentEvent {
     /// `target_window_msc` and `divisor` are zero — see
     /// `present_get_target_msc` in `present_request.c`).
     pub target_msc: u64,
+    /// CRTC the Present is paced against. Raw KMS `crtc_id` for the
+    /// v2 KMS backend; `0` for non-paced backends (HostX11, Recording).
+    /// Carried through to `PendingCompleteNotify.crtc` by
+    /// `fire_present_completion_events` so the CRTC-scoped drain can
+    /// reject cross-clock satisfaction.
+    pub bound_crtc: u32,
 }
 
 /// Per-PRESENT-path wake target. Surfaces the original
@@ -1723,6 +1729,7 @@ mod present_completion_trait_tests {
                 options: 0,
                 wake: PresentWake::Pixmap { idle_fence_xid: 0 },
                 target_msc: 0,
+                bound_crtc: 0,
             },
             /* dst_host_xid */ 0,
         );

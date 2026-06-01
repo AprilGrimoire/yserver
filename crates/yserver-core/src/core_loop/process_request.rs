@@ -6369,6 +6369,7 @@ fn handle_present_request(
                             idle_fence_xid: req.idle_fence,
                         },
                         target_msc: req.target_msc,
+                        bound_crtc: backend.pick_present_crtc(req.window).unwrap_or(0),
                     },
                     dst.host_xid(),
                 );
@@ -6464,6 +6465,7 @@ fn handle_present_request(
                         .map(|(e, s)| format!("eid=0x{e:x} mask=0x{:x}", s.event_mask))
                         .collect::<Vec<_>>(),
                 );
+                let notify_msc_crtc = backend.pick_present_crtc(req.window).unwrap_or(0);
                 for (eid, owner) in targets {
                     state
                         .pending_complete_notify
@@ -6475,6 +6477,7 @@ fn handle_present_request(
                             kind: x11present::COMPLETE_KIND_NOTIFY_MSC,
                             mode: x11present::COMPLETE_MODE_COPY,
                             target_msc: req.target_msc,
+                            crtc: notify_msc_crtc,
                         });
                 }
                 // `present_msc` is still maintained as a coarse
@@ -6641,6 +6644,7 @@ fn handle_present_request(
                                     release_value: req.release_value,
                                 },
                                 target_msc: req.target_msc,
+                                bound_crtc: backend.pick_present_crtc(req.window).unwrap_or(0),
                             },
                             dst.host_xid(),
                         );
@@ -6890,6 +6894,7 @@ pub fn fire_present_completion_events(
                     kind: x11present::COMPLETE_KIND_PIXMAP,
                     mode: x11present::COMPLETE_MODE_COPY,
                     target_msc: event.target_msc,
+                    crtc: event.bound_crtc,
                 });
             debug!(
                 "PRESENT CompleteNotify -> deferred (client {} eid=0x{eid:x} target_msc={})",
@@ -6970,12 +6975,26 @@ fn fire_present_configure_notify_for_window(
 /// `ust_micros` is the kernel pageflip timestamp packed into the
 /// event's u64 ust field. Mirrors Xorg `present_event_notify` →
 /// `present_execute` → `present_execute_post` ordering.
-pub fn drain_pending_complete_notify_for_flip(state: &mut ServerState, msc: u64, ust_micros: u64) {
+pub fn drain_pending_complete_notify_for_flip(
+    state: &mut ServerState,
+    crtc: u32,
+    msc: u64,
+    ust_micros: u64,
+) {
     use yserver_protocol::x11::present as x11present;
     const PRESENT_MAJOR_OPCODE: u8 = 145;
 
     let entries: Vec<_> = state.pending_complete_notify.drain(..).collect();
     for entry in entries {
+        // T7 gate: CRTC-scoped drain — a flip on CRTC A must not fire
+        // a waiter bound to CRTC B (the dual-monitor cross-clock
+        // satisfaction bug). `crtc == 0` is the non-paced sentinel:
+        // matches entries enqueued by backends that return `None` from
+        // `pick_present_crtc`.
+        if entry.crtc != crtc {
+            state.pending_complete_notify.push_back(entry);
+            continue;
+        }
         // T4 gate: requeue if the CRTC hasn't reached the requested
         // target yet. `target_msc == 0` is "next vblank", which this
         // call (firing at `msc`) by definition satisfies.
@@ -17382,11 +17401,11 @@ mod tests {
         peer.set_nonblocking(false).expect("blocking");
 
         // Vblank at msc=3 — still below target, no fire.
-        super::drain_pending_complete_notify_for_flip(&mut state, 3, 0);
+        super::drain_pending_complete_notify_for_flip(&mut state, 0, 3, 0);
         assert_eq!(state.pending_complete_notify.len(), 1);
 
         // Vblank at msc=5 — fires.
-        super::drain_pending_complete_notify_for_flip(&mut state, 5, 77_777);
+        super::drain_pending_complete_notify_for_flip(&mut state, 0, 5, 77_777);
         assert!(state.pending_complete_notify.is_empty());
 
         let mut complete = [0u8; 40];
@@ -17465,12 +17484,13 @@ mod tests {
                 options: 0,
                 wake: PresentWake::Pixmap { idle_fence_xid: 0 },
                 target_msc: 42,
+                bound_crtc: 0,
             },
         );
         assert_eq!(state.pending_complete_notify.len(), 1);
 
         // Premature vblank at msc=10 — must NOT fire; entry stays queued.
-        super::drain_pending_complete_notify_for_flip(&mut state, 10, 0);
+        super::drain_pending_complete_notify_for_flip(&mut state, 0, 10, 0);
         assert_eq!(
             state.pending_complete_notify.len(),
             1,
@@ -17486,7 +17506,7 @@ mod tests {
         peer.set_nonblocking(false).expect("blocking");
 
         // Vblank at msc=42 — entry fires now.
-        super::drain_pending_complete_notify_for_flip(&mut state, 42, 999_999);
+        super::drain_pending_complete_notify_for_flip(&mut state, 0, 42, 999_999);
         assert!(state.pending_complete_notify.is_empty());
 
         let mut complete = [0u8; 40];
@@ -17561,6 +17581,7 @@ mod tests {
                 idle_fence_xid: IDLE_FENCE,
             },
             target_msc: 0,
+            bound_crtc: 0,
         };
 
         super::fire_present_completion_events(&mut state, &event);
@@ -17590,7 +17611,7 @@ mod tests {
         assert_eq!(state.pending_complete_notify.len(), 1);
 
         // Pageflip retire with kernel-reported (msc, ust). Drain.
-        super::drain_pending_complete_notify_for_flip(&mut state, 42, 123_456);
+        super::drain_pending_complete_notify_for_flip(&mut state, 0, 42, 123_456);
         assert!(state.pending_complete_notify.is_empty());
 
         let mut complete = [0u8; 40];
@@ -17707,7 +17728,7 @@ mod tests {
         // still exercises "client gets a CompleteNotify when its
         // request is satisfied".
         assert_eq!(state.pending_complete_notify.len(), 1);
-        super::drain_pending_complete_notify_for_flip(&mut state, 0, 0);
+        super::drain_pending_complete_notify_for_flip(&mut state, 0, 0, 0);
 
         let mut event = [0u8; 40];
         peer.read_exact(&mut event).expect("CompleteNotify event");
@@ -17733,6 +17754,36 @@ mod tests {
             u32::from_le_bytes([event[20], event[21], event[22], event[23]]),
             SERIAL
         );
+    }
+
+    /// T7 (CRTC-scoped drain): a flip on CRTC A must not fire a waiter
+    /// bound to CRTC B. This pins the `entry.crtc == crtc` filter added
+    /// to `drain_pending_complete_notify_for_flip`.
+    #[test]
+    fn drain_pending_complete_notify_for_flip_filters_by_crtc() {
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mk = |crtc: u32, eid: u32| crate::server::PendingCompleteNotify {
+            client_id: ClientId(1),
+            eid,
+            window: ResourceId(0x100),
+            serial: 0,
+            kind: 1,
+            mode: 0,
+            target_msc: 0,
+            crtc,
+        };
+        state.pending_complete_notify.push_back(mk(0x42, 0xA));
+        state.pending_complete_notify.push_back(mk(0x99, 0xB));
+
+        // Flip on CRTC 0x42 — should drain only eid 0xA.
+        super::drain_pending_complete_notify_for_flip(&mut state, 0x42, 1, 1_000);
+        let remaining: Vec<u32> = state
+            .pending_complete_notify
+            .iter()
+            .map(|e| e.eid)
+            .collect();
+        assert_eq!(remaining, vec![0xB], "eid 0xB must remain (different CRTC)");
     }
 
     #[test]

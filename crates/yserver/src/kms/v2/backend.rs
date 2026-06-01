@@ -2882,6 +2882,7 @@ impl KmsBackendV2 {
                 options: 0,
                 wake: PresentWake::Pixmap { idle_fence_xid: 0 },
                 target_msc: 0,
+                bound_crtc: 0,
             },
         };
         self.engine
@@ -3084,6 +3085,7 @@ impl KmsBackendV2 {
                 options: 0,
                 wake: PresentWake::Pixmap { idle_fence_xid: 0 },
                 target_msc: 0,
+                bound_crtc: 0,
             },
         };
         self.engine
@@ -12813,6 +12815,7 @@ mod tests {
                 options: 0,
                 wake: yserver_core::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
                 target_msc: 0,
+                bound_crtc: 0,
             },
             0x1001,
         );

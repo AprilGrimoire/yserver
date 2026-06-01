@@ -911,6 +911,12 @@ pub struct PendingCompleteNotify {
     pub kind: u8,
     pub mode: u8,
     pub target_msc: u64,
+    /// CRTC bound at enqueue time. Raw KMS `crtc_id` for KMS backends;
+    /// `0` sentinel for non-paced backends (HostX11, Recording) so
+    /// their `drain_pending_complete_notify_for_flip(_, 0, _, _)` calls
+    /// match. Stays attached even if the window moves before the
+    /// completion arrives.
+    pub crtc: u32,
 }
 
 /// A shared memory segment attached via MIT-SHM. Owns the lifetime of both

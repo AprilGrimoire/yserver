@@ -96,6 +96,7 @@ mod tests {
                 idle_fence_xid: 0xCC,
             },
             target_msc: 0,
+            bound_crtc: 0,
         };
         assert_eq!(event.serial, 42);
     }
