@@ -34,7 +34,6 @@ pub(crate) const DRM_CRTC_SEQUENCE_RELATIVE: u32 = 0x0000_0001;
 pub(crate) const DRM_CRTC_SEQUENCE_NEXT_ON_MISS: u32 = 0x0000_0002;
 
 /// kernel `DRM_EVENT_CRTC_SEQUENCE` event type id.
-#[allow(dead_code)]
 pub(crate) const DRM_EVENT_CRTC_SEQUENCE: u32 = 0x03;
 
 #[allow(non_camel_case_types)]
@@ -49,7 +48,7 @@ pub(crate) struct drm_crtc_queue_sequence {
     pub user_data: u64,
 }
 
-#[allow(non_camel_case_types, dead_code)]
+#[allow(non_camel_case_types)]
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct drm_event_header {
@@ -57,7 +56,7 @@ pub(crate) struct drm_event_header {
     pub length: u32,
 }
 
-#[allow(non_camel_case_types, dead_code)]
+#[allow(non_camel_case_types)]
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct drm_event_crtc_sequence {
@@ -216,12 +215,13 @@ fn submit_flip_inner(
     )
 }
 
-pub fn drain_events<F: FnMut(crtc::Handle, u64, std::time::Duration)>(
-    device: &Device,
-    mut on_page_flip: F,
-) -> io::Result<()> {
+pub fn drain_events<A, S>(device: &Device, mut on_advance: A, mut on_sequence: S) -> io::Result<()>
+where
+    A: FnMut(crtc::Handle, u64, std::time::Duration),
+    S: FnMut(u32, i64, u64),
+{
     for event in device.receive_events()? {
-        dispatch_event(event, &mut on_page_flip);
+        dispatch_event(event, &mut on_advance, &mut on_sequence);
     }
     Ok(())
 }
@@ -259,28 +259,28 @@ pub fn request_next_vblank_event(device: &Device, crtc_index: u32) -> io::Result
         .map(drop)
 }
 
-/// Dispatch a single drm event: invoke `on_page_flip` for `Event::PageFlip`
-/// or `Event::Vblank` with `(crtc, msc, ust)`; ignore `Unknown`.
+/// Dispatch a single drm event.
 ///
-/// `msc` is the kernel vblank sequence widened to u64 (raw sequence wraps
-/// at u32; wrap-tracking is owned by the per-CRTC state in the backend).
-/// `ust` is the kernel-reported timestamp (since-boot Duration, treated
-/// as opaque UST by Present completion consumers).
+/// - `Event::PageFlip` / `Event::Vblank` → `on_advance(crtc, msc, ust)`
+///   (existing behaviour; carries kernel `(msc, ust)` already widened).
+///   Note: under the EOPNOTSUPP fallback path (relative-1 keep-alive,
+///   wired in Task 8), the kernel emits `Event::Vblank` rather than
+///   a `CRTC_SEQUENCE` event — both flow through `on_advance` and
+///   into the same `record_crtc_ust_msc` → arm-clear pipeline.
+/// - `Event::Unknown` matching `DRM_EVENT_CRTC_SEQUENCE` (type==3,
+///   length==32) → `on_sequence(crtc_id_raw_u32, time_ns_i64,
+///   sequence_u64)`. **Raw**: `time_ns` is signed and not yet
+///   validated; `crtc_id_raw` is the bottom 32 bits of `user_data`
+///   (we encode it there in Task 8). The caller does clear-arm
+///   BEFORE any drop on validity check.
+/// - Everything else: dropped.
 ///
-/// T6 (idle-case MSC advance): Vblank events flow through the same
-/// callback so the run loop can drain `pending_complete_notify` even
-/// when no pageflip is happening. Vblanks are produced only when the
-/// backend explicitly requests them via `wait_vblank` with the EVENT
-/// flag (so idle sessions don't spin on vblanks); when no request is
-/// in flight, the event stream is naturally PageFlip-only.
-///
-/// Factored out of [`drain_events`] so the per-event routing is unit-testable
-/// without a real DRM fd (synthetic event values can be constructed via the
-/// public `PageFlipEvent` / `VblankEvent` fields).
-fn dispatch_event<F: FnMut(crtc::Handle, u64, std::time::Duration)>(
-    event: Event,
-    on_page_flip: &mut F,
-) {
+/// Factored so per-event routing is unit-testable without a real DRM fd.
+fn dispatch_event<A, S>(event: Event, on_advance: &mut A, on_sequence: &mut S)
+where
+    A: FnMut(crtc::Handle, u64, std::time::Duration),
+    S: FnMut(u32, i64, u64),
+{
     match event {
         Event::PageFlip(ev) => {
             log::info!(
@@ -289,7 +289,7 @@ fn dispatch_event<F: FnMut(crtc::Handle, u64, std::time::Duration)>(
                 ev.frame,
                 ev.duration
             );
-            on_page_flip(ev.crtc, u64::from(ev.frame), ev.duration);
+            on_advance(ev.crtc, u64::from(ev.frame), ev.duration);
         }
         Event::Vblank(ev) => {
             log::info!(
@@ -298,9 +298,37 @@ fn dispatch_event<F: FnMut(crtc::Handle, u64, std::time::Duration)>(
                 ev.frame,
                 ev.time
             );
-            on_page_flip(ev.crtc, u64::from(ev.frame), ev.time);
+            on_advance(ev.crtc, u64::from(ev.frame), ev.time);
         }
-        Event::Unknown(_) => {}
+        Event::Unknown(bytes) => {
+            // Header: u32 type, u32 length (8 bytes total).
+            if bytes.len() < std::mem::size_of::<drm_event_header>() {
+                return;
+            }
+            let header: drm_event_header =
+                unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const drm_event_header) };
+            if header.r#type != DRM_EVENT_CRTC_SEQUENCE {
+                return;
+            }
+            if header.length as usize != std::mem::size_of::<drm_event_crtc_sequence>() {
+                return;
+            }
+            if bytes.len() < std::mem::size_of::<drm_event_crtc_sequence>() {
+                return;
+            }
+            let ev: drm_event_crtc_sequence = unsafe {
+                std::ptr::read_unaligned(bytes.as_ptr() as *const drm_event_crtc_sequence)
+            };
+            // Bottom 32 bits of user_data are the crtc_id we encoded.
+            #[allow(clippy::cast_possible_truncation)]
+            let crtc_id_raw = ev.user_data as u32;
+            log::info!(
+                "PRESENT-DBG: CrtcSequence event crtc_id={crtc_id_raw} sequence={} time_ns={}",
+                ev.sequence,
+                ev.time_ns
+            );
+            on_sequence(crtc_id_raw, ev.time_ns, ev.sequence);
+        }
     }
 }
 
@@ -322,7 +350,7 @@ mod tests {
         });
 
         let mut seen: Vec<crtc::Handle> = Vec::new();
-        dispatch_event(event, &mut |c, _msc, _ust| seen.push(c));
+        dispatch_event(event, &mut |c, _msc, _ust| seen.push(c), &mut |_, _, _| {});
 
         assert_eq!(seen, vec![handle]);
     }
@@ -331,7 +359,7 @@ mod tests {
     fn dispatch_event_ignores_unknown() {
         let event = Event::Unknown(Vec::new());
         let mut called = 0u32;
-        dispatch_event(event, &mut |_, _, _| called += 1);
+        dispatch_event(event, &mut |_, _, _| called += 1, &mut |_, _, _| {});
         assert_eq!(called, 0);
     }
 
@@ -358,7 +386,11 @@ mod tests {
         });
 
         let mut seen: Vec<(crtc::Handle, u64, Duration)> = Vec::new();
-        dispatch_event(event, &mut |c, msc, t| seen.push((c, msc, t)));
+        dispatch_event(
+            event,
+            &mut |c, msc, t| seen.push((c, msc, t)),
+            &mut |_, _, _| {},
+        );
 
         assert_eq!(seen, vec![(handle, 9876u64, ust)]);
     }
@@ -379,7 +411,11 @@ mod tests {
         });
 
         let mut seen: Vec<(crtc::Handle, u64, Duration)> = Vec::new();
-        dispatch_event(event, &mut |c, msc, t| seen.push((c, msc, t)));
+        dispatch_event(
+            event,
+            &mut |c, msc, t| seen.push((c, msc, t)),
+            &mut |_, _, _| {},
+        );
 
         assert_eq!(seen, vec![(handle, 12345u64, ust)]);
     }
@@ -450,5 +486,77 @@ mod tests {
             super::DRM_IOCTL_CRTC_QUEUE_SEQUENCE,
             0xC018_643C as libc::c_ulong
         );
+    }
+
+    #[test]
+    fn dispatch_event_decodes_crtc_sequence() {
+        use super::{DRM_EVENT_CRTC_SEQUENCE, drm_event_crtc_sequence, drm_event_header};
+        // Build a raw 32-byte event matching the kernel layout.
+        let raw = drm_event_crtc_sequence {
+            base: drm_event_header {
+                r#type: DRM_EVENT_CRTC_SEQUENCE,
+                length: 32,
+            },
+            user_data: 0xCAFE_BABE_0000_0042, // bottom 32 bits = crtc_id 0x42
+            time_ns: 1_234_567_890_i64,
+            sequence: 9_999,
+        };
+        let bytes: [u8; 32] = unsafe { std::mem::transmute(raw) };
+        let event = Event::Unknown(bytes.to_vec());
+
+        let mut advance_calls = Vec::<(crtc::Handle, u64, Duration)>::new();
+        let mut seq_calls = Vec::<(u32, i64, u64)>::new();
+        super::dispatch_event(
+            event,
+            &mut |c, m, u| advance_calls.push((c, m, u)),
+            &mut |cid, t, s| seq_calls.push((cid, t, s)),
+        );
+
+        assert!(
+            advance_calls.is_empty(),
+            "sequence event must NOT route through advance callback"
+        );
+        assert_eq!(seq_calls.len(), 1);
+        let (cid, time_ns, seq) = seq_calls[0];
+        // Bottom 32 bits of user_data carry the crtc_id.
+        assert_eq!(cid, 0x42);
+        assert_eq!(time_ns, 1_234_567_890_i64);
+        assert_eq!(seq, 9_999);
+    }
+
+    #[test]
+    fn dispatch_event_ignores_wrong_length_sequence_event() {
+        use super::{DRM_EVENT_CRTC_SEQUENCE, drm_event_header};
+        // Right type, wrong length → silently dropped.
+        let header = drm_event_header {
+            r#type: DRM_EVENT_CRTC_SEQUENCE,
+            length: 16,
+        };
+        let mut bytes = vec![0u8; 16];
+        bytes[..8].copy_from_slice(&unsafe { std::mem::transmute::<_, [u8; 8]>(header) });
+        let event = Event::Unknown(bytes);
+
+        let mut advance_calls = 0usize;
+        let mut seq_calls = 0usize;
+        super::dispatch_event(event, &mut |_, _, _| advance_calls += 1, &mut |_, _, _| {
+            seq_calls += 1
+        });
+        assert_eq!(advance_calls, 0);
+        assert_eq!(seq_calls, 0);
+    }
+
+    #[test]
+    fn dispatch_event_ignores_unknown_type() {
+        use super::drm_event_header;
+        let header = drm_event_header {
+            r#type: 99,
+            length: 32,
+        };
+        let mut bytes = vec![0u8; 32];
+        bytes[..8].copy_from_slice(&unsafe { std::mem::transmute::<_, [u8; 8]>(header) });
+        let event = Event::Unknown(bytes);
+        let mut seq_calls = 0usize;
+        super::dispatch_event(event, &mut |_, _, _| {}, &mut |_, _, _| seq_calls += 1);
+        assert_eq!(seq_calls, 0);
     }
 }

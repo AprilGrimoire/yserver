@@ -1189,9 +1189,13 @@ impl PlatformBackend {
         use ::drm::control::crtc;
 
         let mut flipped: Vec<(crtc::Handle, u64, std::time::Duration)> = Vec::new();
-        crate::drm::page_flip::drain_events(&self.device, |c, msc, ust| {
-            flipped.push((c, msc, ust));
-        })?;
+        crate::drm::page_flip::drain_events(
+            &self.device,
+            |c, msc, ust| {
+                flipped.push((c, msc, ust));
+            },
+            |_cid, _t, _s| { /* wired in Task 8 */ },
+        )?;
 
         let mut completions = Vec::with_capacity(flipped.len());
         for (crtc, msc, ust) in flipped {

@@ -90,7 +90,11 @@ pub fn run_loop(
                 }
                 DRM_TOKEN => {
                     let mut handled = 0u32;
-                    drm::page_flip::drain_events(device, |_crtc, _msc, _ust| handled += 1)?;
+                    drm::page_flip::drain_events(
+                        device,
+                        |_crtc, _msc, _ust| handled += 1,
+                        |_cid, _t, _s| { /* wired in Task 8 */ },
+                    )?;
                     for _ in 0..handled {
                         if let Some(idx) = swapchain.submitted_idx() {
                             swapchain.complete(idx).map_err(|e| {
