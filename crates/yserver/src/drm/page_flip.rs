@@ -30,17 +30,14 @@ use crate::drm::{
 // fields are little-endian on every supported target.
 //
 // Both flags are passed in the `flags` field; combined or'd.
-// (No callers yet — Task 2 in the idle-vblank plan adds the ioctl wrapper.)
-#[allow(dead_code)]
 pub(crate) const DRM_CRTC_SEQUENCE_RELATIVE: u32 = 0x0000_0001;
-#[allow(dead_code)]
 pub(crate) const DRM_CRTC_SEQUENCE_NEXT_ON_MISS: u32 = 0x0000_0002;
 
 /// kernel `DRM_EVENT_CRTC_SEQUENCE` event type id.
 #[allow(dead_code)]
 pub(crate) const DRM_EVENT_CRTC_SEQUENCE: u32 = 0x03;
 
-#[allow(non_camel_case_types, dead_code)]
+#[allow(non_camel_case_types)]
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct drm_crtc_queue_sequence {
@@ -75,11 +72,68 @@ pub(crate) struct drm_event_crtc_sequence {
 // `_IOWR('d', 0x3C, drm_crtc_queue_sequence)` expanded inline so
 // the request code is a `const` we can also assert in a unit test.
 //   dir = 3 (RW), type = 'd' (0x64), nr = 0x3C, size = 24
-#[allow(dead_code)]
 pub(crate) const DRM_IOCTL_CRTC_QUEUE_SEQUENCE: libc::c_ulong = ((3 as libc::c_ulong) << 30)
     | ((std::mem::size_of::<drm_crtc_queue_sequence>() as libc::c_ulong) << 16)
     | ((0x64 as libc::c_ulong) << 8)
     | 0x3C;
+
+/// Queue a one-shot CRTC vblank sequence event. `crtc_id` is the
+/// **raw KMS object id** (NOT a pipe index — that distinction is
+/// the whole reason this helper exists; the legacy `drmWaitVBlank`
+/// path used pipe indices and lost the dual-monitor case).
+///
+/// - `relative = true`  → kernel arms `current_msc + sequence`
+///   vblanks from now; pass `sequence = 1` for "next vblank".
+/// - `relative = false` → absolute target. **Always pair with
+///   `NEXT_ON_MISS`** (set internally) so an already-passed target
+///   fires at the next vblank instead of waiting a full 32-bit
+///   counter wrap.
+///
+/// `user_data` is echoed verbatim in the resulting
+/// `DRM_EVENT_CRTC_SEQUENCE` — we encode the stable `crtc_id` there
+/// (NOT `output_idx`, which is unstable across hotplug compaction
+/// at `platform.rs:2222`).
+///
+/// Returns the kernel-assigned scheduled sequence on success.
+///
+/// # Errors
+///
+/// - `EOPNOTSUPP` on pre-4.14 kernels — caller should fall back
+///   to the relative-keep-alive path.
+/// - `EACCES` if we no longer hold DRM master — caller must have
+///   pre-gated on `scanout_allowed()`.
+// Caller wired in Task 8; suppress dead_code until then.
+#[allow(dead_code)]
+pub(crate) fn queue_crtc_sequence(
+    device: &Device,
+    crtc_id: u32,
+    relative: bool,
+    sequence: u64,
+    user_data: u64,
+) -> io::Result<u64> {
+    use std::os::{fd::AsFd, unix::io::AsRawFd};
+
+    let mut flags = DRM_CRTC_SEQUENCE_NEXT_ON_MISS;
+    if relative {
+        flags |= DRM_CRTC_SEQUENCE_RELATIVE;
+    }
+    let mut req = drm_crtc_queue_sequence {
+        crtc_id,
+        flags,
+        sequence,
+        user_data,
+    };
+    // SAFETY: `req` is a fully-initialised POD of the exact size the
+    // kernel expects (24 bytes — pinned by the unit tests in Task 1).
+    // The device fd is held alive by `device` for the duration of the
+    // call; the kernel reads and writes `req` in place.
+    let raw_fd = device.as_fd().as_raw_fd();
+    let rc = unsafe { libc::ioctl(raw_fd, DRM_IOCTL_CRTC_QUEUE_SEQUENCE, &mut req as *mut _) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(req.sequence)
+}
 
 pub fn submit_flip(device: &Device, output: &Output, fb_id: framebuffer::Handle) -> io::Result<()> {
     submit_flip_inner(device, output, fb_id, None, None)
@@ -343,6 +397,38 @@ mod tests {
         // of the full struct including header is 32.)
         assert_eq!(std::mem::size_of::<super::drm_event_crtc_sequence>(), 32);
         assert_eq!(std::mem::align_of::<super::drm_event_crtc_sequence>(), 8);
+    }
+
+    #[test]
+    fn queue_sequence_layout_absolute_with_next_on_miss() {
+        use super::{DRM_CRTC_SEQUENCE_NEXT_ON_MISS, drm_crtc_queue_sequence};
+        // Absolute target: flags == NEXT_ON_MISS only (no RELATIVE bit).
+        let req = drm_crtc_queue_sequence {
+            crtc_id: 0x42,
+            flags: DRM_CRTC_SEQUENCE_NEXT_ON_MISS,
+            sequence: 0x1234_5678_9ABC_DEF0,
+            user_data: 0x42,
+        };
+        assert_eq!(
+            req.flags & 1,
+            0,
+            "RELATIVE bit must be clear for absolute target"
+        );
+        assert_eq!(req.flags & 2, 2, "NEXT_ON_MISS must be set");
+    }
+
+    #[test]
+    fn queue_sequence_layout_relative_one() {
+        use super::{DRM_CRTC_SEQUENCE_RELATIVE, drm_crtc_queue_sequence};
+        // target_msc == 0 maps to RELATIVE | sequence=1.
+        let req = drm_crtc_queue_sequence {
+            crtc_id: 0x42,
+            flags: DRM_CRTC_SEQUENCE_RELATIVE,
+            sequence: 1,
+            user_data: 0x42,
+        };
+        assert_eq!(req.flags & 1, 1);
+        assert_eq!(req.sequence, 1);
     }
 
     #[test]
