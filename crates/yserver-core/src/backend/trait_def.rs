@@ -1497,14 +1497,15 @@ pub trait Backend: Send {
         (0, std::time::Duration::ZERO)
     }
 
-    /// T3 (Present pacing): return + clear the per-iteration ring of
-    /// page-flip retirements. Each entry is `(msc, ust_micros)` for
-    /// the CRTC that just retired (T7 will extend with `output_idx`).
-    /// `run::drain_present_completions` then drains
+    /// T3/T5 (Present pacing): return + clear the per-iteration ring of
+    /// page-flip retirements. Each entry is `(crtc_id, msc, ust_micros)`.
+    /// `crtc_id` is the raw `u32` from `drm::control::crtc::Handle` (so
+    /// non-KMS backends do not need to depend on the `drm` crate).
+    /// `run::drain_present_completions` drains
     /// `state.pending_complete_notify` using these values.
     ///
     /// Default impl returns empty.
-    fn drain_recent_page_flips(&mut self) -> Vec<(u64, u64)> {
+    fn drain_recent_page_flips(&mut self) -> Vec<(u32, u64, u64)> {
         Vec::new()
     }
 

@@ -193,14 +193,13 @@ pub struct KmsBackendV2 {
     /// case (matches Xorg behavior before the first scanout).
     pub(crate) crtc_ust_msc: std::collections::HashMap<usize, (u64, std::time::Duration)>,
 
-    /// T3 (Present pacing): FIFO of pageflip retirements observed
+    /// T3/T5 (Present pacing): FIFO of pageflip retirements observed
     /// since the last `drain_recent_page_flips`. Each entry carries
-    /// `(msc, ust_micros)` for the CRTC that just retired. Drained
-    /// per iteration by `run::drain_present_completions` to fire
+    /// `(crtc::Handle, msc, ust_micros)` for the CRTC that just retired.
+    /// Drained per iteration by `run::drain_present_completions` to fire
     /// queued CompleteNotify events with kernel-real timestamps.
-    /// T7 will widen the tuple with `output_idx` for the
-    /// window→CRTC routing layer.
-    pub(crate) recent_page_flips: Vec<(u64, u64)>,
+    /// T7 uses the `crtc::Handle` for window→CRTC routing.
+    pub(crate) recent_page_flips: Vec<(::drm::control::crtc::Handle, u64, u64)>,
 
     /// Per-CRTC armed absolute MSC. Replaces the single
     /// `vblank_request_in_flight: bool` — that gate could only track one
@@ -2489,7 +2488,7 @@ impl KmsBackendV2 {
         self.store.get_by_xid(host_xid).is_some()
     }
 
-    /// T2/T3 (Present pacing): single-source update on a pageflip
+    /// T2/T3/T5 (Present pacing): single-source update on a pageflip
     /// retire. Writes the latest `(msc, ust)` into `crtc_ust_msc`
     /// (consumed by `present_get_ust_msc`) AND pushes the event
     /// onto `recent_page_flips` (drained by
@@ -2501,29 +2500,22 @@ impl KmsBackendV2 {
     /// (regression tests that don't pump real DRM events).
     pub(crate) fn record_crtc_ust_msc(
         &mut self,
+        crtc: ::drm::control::crtc::Handle,
         output_idx: usize,
         msc: u64,
         ust: std::time::Duration,
     ) {
         self.crtc_ust_msc.insert(output_idx, (msc, ust));
-        // T3: `(msc, ust_micros)` queued for the present-completion
+        // T3: `(crtc, msc, ust_micros)` queued for the present-completion
         // drain. Cast saturates rather than wraps — a u64-microsecond
         // representation lasts ~580k years, so reaching saturation
         // means the kernel timestamp got corrupted.
         #[allow(clippy::cast_possible_truncation)]
         let ust_micros: u64 = ust.as_micros() as u64;
-        self.recent_page_flips.push((msc, ust_micros));
-        // Advance proof: any retire on this CRTC's `crtc::Handle` clears
-        // the armed entry. The handler at the sequence-event call site
-        // resolves crtc_id → Handle and routes through here, so a single
-        // clear point covers both PageFlip/Vblank and CRTC_SEQUENCE.
-        // (Task 5 widens `record_crtc_ust_msc` to take the `crtc::Handle`
-        // explicitly so we can clear by Handle instead of having to look
-        // it up from output_idx here.)
-        // TEMP placeholder until Task 5: clear by linear scan from output_idx.
-        if let Some(layout) = self.platform.outputs.get(output_idx) {
-            self.armed_vblank_targets.remove(&layout.output.crtc);
-        }
+        self.recent_page_flips.push((crtc, msc, ust_micros));
+        // Advance proof: any retire on this CRTC clears the armed entry.
+        // The crtc::Handle is passed directly so no linear scan is needed.
+        self.armed_vblank_targets.remove(&crtc);
     }
 
     /// T4: remove the armed-target entry for one specific CRTC.
@@ -2545,7 +2537,7 @@ impl KmsBackendV2 {
         self.armed_vblank_targets.clear();
     }
 
-    /// T2 test-only injector: write a synthetic `(msc, ust)` into
+    /// T2/T5 test-only injector: write a synthetic `(msc, ust)` into
     /// per-CRTC state without going through the DRM event loop.
     /// Used by Present-pacing regression tests so they can drive
     /// `present_get_ust_msc` without a real device.
@@ -2556,7 +2548,8 @@ impl KmsBackendV2 {
         msc: u64,
         ust: std::time::Duration,
     ) {
-        self.record_crtc_ust_msc(output_idx, msc, ust);
+        let crtc = self.platform.outputs[output_idx].output.crtc;
+        self.record_crtc_ust_msc(crtc, output_idx, msc, ust);
     }
 
     /// Phase A T7: simulate the pageflip-retire frame-boundary flush
@@ -6677,10 +6670,11 @@ impl Backend for KmsBackendV2 {
             }
         };
         for completion in flipped {
-            // T2: route kernel MSC/UST into per-CRTC state so the
+            // T2/T5: route kernel MSC/UST into per-CRTC state so the
             // Present extension can later fire CompleteNotify with
             // real values (Xorg `get_ust_msc` semantics).
-            self.record_crtc_ust_msc(completion.output_idx, completion.msc, completion.ust);
+            let crtc = self.platform.outputs[completion.output_idx].output.crtc;
+            self.record_crtc_ust_msc(crtc, completion.output_idx, completion.msc, completion.ust);
             if self.scene.handle_page_flip_complete(
                 completion.output_idx,
                 &mut self.store,
@@ -11843,12 +11837,16 @@ impl Backend for KmsBackendV2 {
             .unwrap_or((0, std::time::Duration::ZERO))
     }
 
-    fn drain_recent_page_flips(&mut self) -> Vec<(u64, u64)> {
-        // T3: hand the per-iteration retirement ring to the run loop.
+    fn drain_recent_page_flips(&mut self) -> Vec<(u32, u64, u64)> {
+        // T3/T5: hand the per-iteration retirement ring to the run loop.
         // `record_crtc_ust_msc` pushes during `on_page_flip_ready`;
         // the drain clears the Vec so each entry fires CompleteNotify
-        // exactly once.
+        // exactly once. The crtc::Handle is converted to raw u32 so the
+        // trait surface does not expose drm crate types.
         std::mem::take(&mut self.recent_page_flips)
+            .into_iter()
+            .map(|(h, m, u)| (u32::from(h), m, u))
+            .collect()
     }
 
     fn has_vblank_pacing(&self) -> bool {
@@ -12615,6 +12613,27 @@ mod tests {
         b.armed_vblank_targets.insert(h, 1234);
         b.clear_armed_vblank_target(h);
         assert!(b.armed_vblank_targets.is_empty());
+    }
+
+    /// T5: `drain_recent_page_flips` carries `(crtc_id, msc, ust_micros)`.
+    #[test]
+    fn drain_recent_page_flips_includes_crtc_id() {
+        use yserver_core::backend::Backend;
+        let mut b = super::KmsBackendV2::for_tests();
+        // Push one synthetic retire via the test injector.
+        b.note_page_flip_complete_for_tests(
+            0,  /* output_idx */
+            42, /* msc */
+            std::time::Duration::from_micros(1000),
+        );
+        let drained = Backend::drain_recent_page_flips(&mut b);
+        assert_eq!(drained.len(), 1);
+        let (crtc_id, msc, ust_micros) = drained[0];
+        // `for_tests` builds output 0 with crtc handle = from_u32(1),
+        // so the raw id is 1. Assert the tuple shape and a non-zero id.
+        assert_ne!(crtc_id, 0, "v2 backend must surface a real crtc_id");
+        assert_eq!(msc, 42);
+        assert_eq!(ust_micros, 1_000);
     }
 
     /// T4: `clear_all_armed_vblank_targets` empties the map entirely.

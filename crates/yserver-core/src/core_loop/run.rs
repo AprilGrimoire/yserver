@@ -766,7 +766,9 @@ fn drain_present_completions(state: &mut ServerState, backend: &mut dyn Backend)
                 state.pending_complete_notify.len()
             );
         }
-        for (msc, ust_micros) in flips {
+        for (_crtc_id, msc, ust_micros) in flips {
+            // _crtc_id: consumed in Task 7 when drain_pending_complete_notify_for_flip
+            // gains CRTC-scoped routing. Discarded for now.
             crate::core_loop::process_request::drain_pending_complete_notify_for_flip(
                 state, msc, ust_micros,
             );
