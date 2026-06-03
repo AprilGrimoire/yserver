@@ -844,14 +844,80 @@ RENDER paint paths. Specifically:
    divergence was measured) as the load-bearing validation.
    yoga remains the rate-canary post-fix.
 
-## Cinnamon keyring modal freezes the shell clock — DIAGNOSED (2026-06-01)
+## Cinnamon keyring modal freezes the shell clock — pacing fix LANDED but did NOT resolve it; root cause REOPENED (2026-06-03)
 
 Long-standing (~2 weeks) bug: the gnome-keyring/polkit modal under
-Cinnamon goes inert and the panel clock stops ticking. Root cause
-**identified and timing-proven** on silence (i9/rx580/RADV); fix
-spec at
+Cinnamon goes inert and the panel clock stops ticking. The
+idle-vblank MSC-pacing rework
+(`docs/superpowers/specs/2026-06-01-idle-vblank-msc-pacing-design.md`,
+branch `fix/present-vblank-msc-rebase`, HEAD `7a95584`) **shipped
+all 3 parts** and is mechanically working — but a silence retest
+(2026-06-02) **still reproduces the stall**. The 2026-06-01
+"idle-vblank MSC starvation" root cause below is therefore
+**SUPERSEDED** — it was a real defect and a real improvement, but
+it is **not** the root cause of the keyring/clock stall.
+
+### UPDATE 2026-06-03 — pacing exonerated by data, root cause still open
+
+Retested on silence (capture `yserver-hw-cinnamon.log` +
+`cinnamon.xtrace`, 2026-06-02 16:16). The pacing rework works but
+the stall persists. Three data findings, in order of importance:
+
+1. **MSC/UST encoding is CORRECT — earlier "wrong MSC values" was
+   an xtrace artifact.** xtrace renders Present `CompleteNotify`
+   CARD64 `ust`/`msc` with their two 32-bit words swapped (looks
+   like `msc=4811617501970432`, consecutive frames differing by
+   exactly `2^32`, negative `ust`). **Proven a tool artifact, not
+   ours:** the *same* xtrace decoding a real **Xorg** capture
+   (`cinnamon-xorg.xtrace`) shows the identical word-swap. Un-swap
+   (`((v & 0xffffffff)<<32)|(v>>32)`) and both servers give clean,
+   byte-identical pacing: real `msc` +1/frame, real `ust`
+   +16,680 µs/frame = 60 Hz. `encode_complete_notify`
+   (`present.rs:295-298`) writes correct LE u64; the
+   `PRESENT-DBG: FIRE CompleteNotify msc=…` logger
+   (`process_request.rs:7027`) logs the correct pre-encode value.
+   Do **not** "fix" the encoder. (This generalizes the older
+   `ust=0`/`msc`-high-bits red herring already noted below.)
+
+2. **On silence the stall persists while we flip at full 60 Hz with
+   correct MSC** — so a pacing-cadence defect cannot be the silence
+   root cause. Output 0 (primary, 2560×1440) does *real* pageflips
+   at a steady **60/s** for long stretches (16:16:18–25, 28–36,
+   47–58), interleaved with ~2/s idle lulls. MSC advances on those
+   flips; un-swapped wire MSC is monotonic +1. The dialog is still
+   inert and the clock still frozen during the 60 Hz windows.
+
+3. **bee ≠ silence.** The other-session bee analysis (genuinely
+   idle desktop) showed the new path honored: **0** fallback Vblank
+   events, **721** `CrtcSequence` events, completion delivery
+   ~24 Hz (was ~1/s pre-fix — a 24× win), but **bursty**, arriving
+   every ~11 vblanks (≈183 ms) instead of every vblank — a ~167 ms
+   re-arm gap (run-loop arm latency or Cogl's own ~12 Hz request
+   cadence; unresolved). That cadence question is real but is about
+   the *idle* path, which silence barely exercises during its 60 Hz
+   flip storms. So the bee 167 ms gap is **orthogonal** to the
+   silence stall.
+
+**Net:** the idle-vblank rework fixed a genuine MSC-starvation
+defect and is worth keeping, but it is not the keyring/clock root
+cause. With pacing exonerated, the live silence repro
+("can't type / dialog inert for ~1 min, then a few clicks dismiss
+it; clock frozen") points back at the **input/grab path** (Clutter
+in-shell modal stage grab — see `project_cinnamon_keyring_grab`
+note: cinnamon stops re-grabbing after ~3 clicks) and/or a
+**composited-content** issue, not Present pacing. Next step: trace
+KeyPress/grab event *delivery* to the dialog window on silence and
+find what changes at the ~1-minute mark. **Do not re-chase MSC
+values, the encoder, or the bee 167 ms gap as the cause of this
+stall.**
+
+### SUPERSEDED diagnosis (2026-06-01) — kept for history
+
+Root cause **identified and timing-proven** on silence
+(i9/rx580/RADV); fix spec at
 `docs/superpowers/specs/2026-06-01-idle-vblank-msc-pacing-design.md`.
-Not yet implemented.
+Implemented on `fix/present-vblank-msc-rebase` (see UPDATE above for
+why it did not resolve the stall).
 
 **Symptom:** when the keyring modal appears, the whole Cinnamon
 Clutter/Cogl shell throttles to ~1 fps — panel clock freezes (seen
