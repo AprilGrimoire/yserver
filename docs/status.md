@@ -111,6 +111,14 @@ Cross-cutting bugs and followups that don't fit a stage live in
   `0c08568`; merged into master 2026-05-26. Next phase is B.4
   / B.5 work to retire SubmitGroup entirely and fold scene
   compose into the frame builder.
+- **2026-06-08 COW architectural reset**: the active Cinnamon blocker
+  is now treated as a structural COW/model bug, not another
+  scene-assembly edge case. Replacement design doc:
+  `docs/superpowers/specs/2026-06-08-cow-structural-design.md`.
+  Direction: make the Composite Overlay Window a real backend/window
+  node, remove the missing-parent reparent fallback, and make Manual
+  redirects suppress direct scanout unconditionally. Further
+  `cow_authoritative` surgery is no longer the primary path.
 - **Bugfixing kicked off 2026-05-26 PM** with Cinnamon validation.
   First live issue: clicks inside `cinnamon-settings` were not
   taking effect even though XI2 ButtonPress/Release reached the
