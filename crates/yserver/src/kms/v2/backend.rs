@@ -9336,10 +9336,10 @@ impl Backend for KmsBackendV2 {
     /// rather than recycled GPU garbage. The fill is best-effort
     /// — on the stub fixture (no Vk) `engine.fill_rect` errors;
     /// log + continue (storage already exists at xid level).
-    fn get_overlay_window(&mut self, _origin: Option<OriginContext>) -> io::Result<()> {
+    fn get_overlay_window(&mut self, _origin: Option<OriginContext>) -> io::Result<bool> {
         if self.cow_id.is_some() {
             self.core.cow_refcount += 1;
-            return Ok(());
+            return Ok(false); // already materialized; refcount bump only
         }
         let fb_w = self.platform.fb_w.max(1);
         let fb_h = self.platform.fb_h.max(1);
@@ -9394,7 +9394,35 @@ impl Backend for KmsBackendV2 {
         self.cow_id = Some(id);
         self.core.cow_refcount = 1;
         self.arm_cow_from_recent_present_if_needed();
-        Ok(())
+
+        // Phase 2 Task 2.2 — also materialize the backend's window-
+        // tree projection so the COW participates in build_scene /
+        // hit-testing / paint resolution the same way any top-level
+        // window does. The xid is the well-known protocol xid; v2
+        // keys windows_v2 on host xid directly.
+        let cow_host_xid = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+        let rank = self.alloc_window_stack_rank();
+        let geom = WindowGeometryV2 {
+            x: 0,
+            y: 0,
+            width: fb_w,
+            height: fb_h,
+            depth: 24,
+            mapped: true,
+            // `parent: None` matches windows_v2's convention for a
+            // direct child of the root (root is not itself tracked
+            // in windows_v2 — see register_top_level).
+            parent: None,
+            stack_rank: rank,
+            bg_pixel: None,
+            bg_pixmap: None,
+            cursor: None,
+        };
+        self.windows_v2.insert(cow_host_xid, geom);
+        self.core.top_level_order.retain(|&x| x != cow_host_xid);
+        self.core.top_level_order.push(cow_host_xid);
+        self.scene.mark_scene_structure_dirty();
+        Ok(true)
     }
 
     /// Stage 4d — Composite Overlay Window release.
@@ -9420,6 +9448,16 @@ impl Backend for KmsBackendV2 {
         }
         self.core.cow_refcount -= 1;
         if self.core.cow_refcount == 0 {
+            // Phase 2 Task 2.2 — tear down the backend's window-tree
+            // projection BEFORE the scene unregister / storage decref
+            // so any in-flight build_scene observer sees a consistent
+            // "COW gone" view (no dangling top_level_order entry that
+            // would re-emit a CompositeDraw against the dead xid).
+            let cow_host_xid = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+            self.core.top_level_order.retain(|&x| x != cow_host_xid);
+            self.windows_v2.remove(&cow_host_xid);
+            self.scene.mark_scene_structure_dirty();
+
             self.drain_engine_present_batches();
             if let Err(e) = self
                 .engine
@@ -9440,6 +9478,16 @@ impl Backend for KmsBackendV2 {
             Ok(true)
         } else {
             Ok(false)
+        }
+    }
+
+    fn cow_host_xid(&self) -> Option<u32> {
+        // The COW's host xid is the well-known protocol xid once
+        // get_overlay_window has materialized; None otherwise.
+        if self.cow_id.is_some() {
+            Some(yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0)
+        } else {
+            None
         }
     }
 
@@ -20526,5 +20574,80 @@ mod tests {
             b.inject_seat_event_for_test(&mut state, true);
             assert_eq!(b.seat_state, SeatState::Active);
         }
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // COW structural redesign — Phase 2 Task 2.2: get/release_overlay_window
+    // own the FULL backend lifecycle (storage + windows_v2 +
+    // top_level_order). The bool return signals the 0→1 / 1→0
+    // transition so the core handler drives the symmetric resources-
+    // side materialization once per lifecycle event.
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn get_overlay_window_first_claim_materializes_full_backend_state() {
+        let mut b = KmsBackendV2::for_tests();
+        let fb_w = u32::from(b.platform.fb_w);
+        let fb_h = u32::from(b.platform.fb_h);
+
+        let was_first_claim = b.get_overlay_window(None).expect("get_overlay_window");
+        assert!(was_first_claim, "0→1 transition must return Ok(true)");
+
+        let cow_host_xid = b
+            .cow_host_xid()
+            .expect("cow_host_xid getter must return Some after first claim");
+        let geom = b
+            .windows_v2
+            .get(&cow_host_xid)
+            .expect("COW must be present in windows_v2 after first claim");
+        assert!(geom.mapped);
+        assert_eq!(geom.depth, 24);
+        assert_eq!(u32::from(geom.width), fb_w);
+        assert_eq!(u32::from(geom.height), fb_h);
+        assert_eq!(geom.parent, None);
+        assert_eq!(
+            b.core.top_level_order.last().copied(),
+            Some(cow_host_xid),
+            "COW is the topmost entry in top_level_order"
+        );
+    }
+
+    #[test]
+    fn get_overlay_window_second_claim_does_not_remateralize() {
+        let mut b = KmsBackendV2::for_tests();
+        b.get_overlay_window(None).expect("first claim");
+        let cow_host_xid = b.cow_host_xid().expect("after first claim");
+        // Snapshot the rank to make sure a second claim doesn't reallocate.
+        let rank_before = b.windows_v2.get(&cow_host_xid).unwrap().stack_rank;
+
+        let was_first_claim = b.get_overlay_window(None).expect("second claim");
+        assert!(!was_first_claim, "subsequent claim must return Ok(false)");
+        let rank_after = b.windows_v2.get(&cow_host_xid).unwrap().stack_rank;
+        assert_eq!(
+            rank_before, rank_after,
+            "subsequent claim must not rebuild windows_v2 entry"
+        );
+    }
+
+    #[test]
+    fn release_overlay_window_final_release_tears_down_full_backend_state() {
+        let mut b = KmsBackendV2::for_tests();
+        b.get_overlay_window(None).expect("get");
+        let cow_host_xid = b.cow_host_xid().expect("present");
+
+        let was_final_release = b.release_overlay_window(None).expect("release");
+        assert!(was_final_release, "1→0 transition must return Ok(true)");
+        assert!(
+            !b.windows_v2.contains_key(&cow_host_xid),
+            "COW removed from windows_v2 on final release"
+        );
+        assert!(
+            !b.core.top_level_order.contains(&cow_host_xid),
+            "COW removed from top_level_order"
+        );
+        assert!(
+            b.cow_host_xid().is_none(),
+            "cow_host_xid getter returns None after final release"
+        );
     }
 }

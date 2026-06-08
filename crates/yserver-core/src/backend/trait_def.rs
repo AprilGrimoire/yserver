@@ -747,17 +747,19 @@ pub trait Backend: Send {
         Ok(())
     }
 
-    /// Stage 4d — Composite Overlay Window (COW) allocation hook.
+    /// Stage 4d — Composite Overlay Window allocation + materialization.
+    /// On the 0→1 refcount transition (first claim), allocate backing
+    /// storage AND populate the backend's window-tree projection: a
+    /// `windows_v2` entry sized to full screen extent (mapped=true,
+    /// depth=24, parent=root) and a slot at the top of
+    /// `top_level_order`. Returns `Ok(true)` on first claim, `Ok(false)`
+    /// on subsequent claims (refcount bump only — no new
+    /// materialization).
     ///
-    /// Called on each `XComposite::GetOverlayWindow` request.
-    /// First call must allocate screen-extent depth-24 storage
-    /// for the COW xid (`COMPOSITE_OVERLAY_WINDOW` = 0x103),
-    /// install it in the backend's drawable store with
-    /// `scene_participating=true`, and register the COW as a
-    /// scene entry layered ABOVE all top-levels but BELOW the
-    /// cursor (per Stage 4 plan §"scene layering item 3"+
-    /// item 4). Subsequent calls bump a refcount; the storage
-    /// is freed on the final `release_overlay_window`.
+    /// The core handler uses the bool to drive the symmetric resources-
+    /// side materialization (`materialize_cow_resource`). Both halves
+    /// must succeed or both must rollback; an Err here is a fatal
+    /// internal-consistency failure per the spec.
     ///
     /// Compositors (marco, xfwm4 with compositing on, etc.)
     /// `XSelectInput` on this XID and paint directly into it;
@@ -776,9 +778,9 @@ pub trait Backend: Send {
     /// insertion. Per protocol the `GetOverlayWindow` reply must
     /// still go out on the wire when this errors — callers
     /// (`process_request.rs`) log + continue.
-    fn get_overlay_window(&mut self, origin: Option<OriginContext>) -> io::Result<()> {
+    fn get_overlay_window(&mut self, origin: Option<OriginContext>) -> io::Result<bool> {
         let _ = origin;
-        Ok(())
+        Ok(false)
     }
 
     /// Stage 4d — Composite Overlay Window release hook.
@@ -799,6 +801,14 @@ pub trait Backend: Send {
     /// storage actually went away, so the next
     /// `GetOverlayWindow` re-wires fresh.
     ///
+    /// The v2 impl (`KmsBackendV2`) also tears down its
+    /// `windows_v2` entry and the COW's slot in
+    /// `top_level_order` on the final release — the mirror of
+    /// the materialization that `get_overlay_window`'s 0→1
+    /// branch installs. Single backend hook owns the full
+    /// lifecycle in both directions; there is no separate
+    /// `destroy_cow` API.
+    ///
     /// Default no-op as for `get_overlay_window`: returns
     /// `Ok(false)` because "I didn't destroy anything."
     ///
@@ -808,6 +818,14 @@ pub trait Backend: Send {
     fn release_overlay_window(&mut self, origin: Option<OriginContext>) -> io::Result<bool> {
         let _ = origin;
         Ok(false)
+    }
+
+    /// Stage 4e — return the host xid the backend has assigned to the
+    /// COW, or `None` if the COW is not currently materialized. The
+    /// core handler reads this to populate the resources COW record's
+    /// `host_xid` field after `get_overlay_window`'s 0→1 return.
+    fn cow_host_xid(&self) -> Option<u32> {
+        None
     }
 
     // ──────────────────────────────────────────────────────────────
