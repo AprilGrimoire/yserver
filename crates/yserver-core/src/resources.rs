@@ -1228,35 +1228,6 @@ impl ResourceTable {
         Some(best)
     }
 
-    /// X11 `QueryPointer`'s `child` field: the immediate child of
-    /// `parent` that contains the point `(x, y)` (given in
-    /// parent-relative coords), iterating in top-to-bottom stacking
-    /// order. Returns `None` if `(x, y)` doesn't land on any mapped
-    /// direct child — meaning the pointer is on `parent` itself or
-    /// outside it entirely, in which case the caller should report
-    /// `child = None (0)`.
-    #[must_use]
-    pub fn direct_child_at(&self, parent: ResourceId, x: i16, y: i16) -> Option<ResourceId> {
-        let parent_window = self.windows.get(&parent.0)?;
-        for child_id in parent_window.children.iter().rev() {
-            let child = self.windows.get(&child_id.0)?;
-            if child.map_state == MapState::Unmapped {
-                continue;
-            }
-            let cx = x.wrapping_sub(child.x);
-            let cy = y.wrapping_sub(child.y);
-            if cx < 0
-                || cy < 0
-                || cx >= i16::try_from(child.width).unwrap_or(i16::MAX)
-                || cy >= i16::try_from(child.height).unwrap_or(i16::MAX)
-            {
-                continue;
-            }
-            return Some(*child_id);
-        }
-        None
-    }
-
     fn pointer_target_at_inner(
         &self,
         parent: ResourceId,
