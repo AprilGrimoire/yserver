@@ -2173,8 +2173,15 @@ fn emit_window_subtree(
             // GTK/marco CSD frames lose their inner widgets (per audit
             // #3 / Control Center missing-widget reports).
             let has_own_redirected_target = source_id != id;
-            let paint_target_is_self =
-                has_own_redirected_target || (d_part && !under_redirected_ancestor);
+            // Phase 3.1 — Manual-redirected windows (own a
+            // `redirected_target` AND `scene_participating=false`)
+            // must NEVER emit to scanout. They go offscreen for the
+            // compositor to read via NameWindowPixmap; the X server
+            // must not also blit the backing in. Mirrors Xorg's
+            // structural guarantee from `compCheckRedirect`.
+            let is_manual_redirected = has_own_redirected_target && !d_part;
+            let paint_target_is_self = !is_manual_redirected
+                && (has_own_redirected_target || (d_part && !under_redirected_ancestor));
 
             // Project onto output-local coords (computed once here so
             // both the SKIP=no_intersect and WILL_EMIT trace lines can
@@ -2191,10 +2198,19 @@ fn emit_window_subtree(
             // Pick the first failing gate and emit a single SKIP line;
             // otherwise emit WILL_EMIT. Order matches the production
             // gate ordering below so the trace mirrors the live path.
-            let skip_reason: Option<&'static str> = if !paint_target_is_self {
+            let skip_reason: Option<&'static str> = if is_manual_redirected {
+                // Phase 3.1 — first reason in the cascade. A
+                // Manual-redirected window (own redirected_target +
+                // scene_participating=false) is unconditionally
+                // skipped; the compositor reads its backing via
+                // NameWindowPixmap and re-emits it on the COW.
+                Some("manual_redirect_unconditional_skip")
+            } else if !paint_target_is_self {
                 if has_own_redirected_target {
                     // Defensive — `paint_target_is_self` is true when
-                    // `has_own_redirected_target`, so this branch is
+                    // `has_own_redirected_target` AND not
+                    // Manual-redirected (the Manual case is handled
+                    // by the branch above), so this branch is
                     // unreachable. Kept so the match stays exhaustive
                     // if the rule ever evolves.
                     Some("paint_target_not_self")
@@ -3943,10 +3959,10 @@ mod tests {
     }
 
     /// Stage 4d — `build_scene` must skip non-redirected descendants
-    /// of a Manual-redirected ancestor that owns its own backing.
-    /// The descendants' paint routes through `resolve_paint_target`
-    /// to the ancestor's B; emitting their own (stale) storage on
-    /// top of the ancestor's B would muddy the compositor output.
+    /// of a Manual-redirected ancestor. The descendants' paint
+    /// routes through `resolve_paint_target` to the ancestor's B;
+    /// emitting their own (stale) storage on top of the ancestor's B
+    /// would muddy the compositor output.
     ///
     /// Audit #3 follow-up (2026-05-19): the test was originally
     /// written against the degenerate state where the parent has
@@ -3956,8 +3972,13 @@ mod tests {
     /// `scene_participating=false`, see
     /// `activate_redirect_backing_for`). Updated to mirror the
     /// realistic state: frame has both a backing AND
-    /// `scene_participating=false`, and the assertion checks that
-    /// frame_B emits while the non-redirected child is skipped.
+    /// `scene_participating=false`.
+    ///
+    /// Phase 3.1 update: the parent is Manual-redirected so it ALSO
+    /// no longer emits (the compositor reads its backing via
+    /// `NameWindowPixmap` and re-emits it on the COW). The remaining
+    /// invariant is "the non-redirected child must NOT leak into
+    /// scene.draws"; the bystander stands in as a positive control.
     #[test]
     fn build_scene_prunes_descendants_of_manual_redirected_ancestor() {
         let mut core = KmsCore::for_tests();
@@ -4052,165 +4073,55 @@ mod tests {
         );
         let scene = &built.scene;
 
-        // Two draws: frame_B (origin = frame's pos, since the
-        // Manual-redirected window emits its backing at its own
-        // geometry) AND the bystander. The child of frame W must
-        // NOT emit — its paint routes to frame_B.
+        // Phase 3.1 — only the bystander emits. The Manual-redirected
+        // frame is unconditionally skipped (compositor consumes its
+        // backing offscreen via NameWindowPixmap); the non-redirected
+        // child must also stay out (its paint resolves to frame_B via
+        // the ancestor walk, so emitting its stale storage would muddy
+        // the compositor's re-emit on the COW).
         assert_eq!(
             scene.draws.len(),
-            2,
-            "expected frame_B + bystander; got {} — non-redirected children of \
-             a Manual-redirected ancestor with a backing must skip emit \
-             (their paint resolves to the ancestor's B): {:?}",
+            1,
+            "expected bystander only; got {} — Manual-redirected frame and \
+             its non-redirected child must both stay out of scene.draws: {:?}",
             scene.draws.len(),
             scene.draws,
-        );
-        assert!(
-            scene
-                .draws
-                .iter()
-                .any(|d| d.dst_origin == [100.0, 200.0] && d.dst_size == [200.0, 150.0]),
-            "frame backing draw missing: {:?}",
-            scene.draws
         );
         assert!(
             scene.draws.iter().any(|d| d.dst_origin == [500.0, 500.0]),
             "bystander draw missing: {:?}",
             scene.draws
         );
-        // The "must not leak" property — child's draw entry must NOT appear.
+        // The "must not leak" property — frame backing AND child draw
+        // entries must both be absent from scene.draws.
+        assert!(
+            !scene
+                .draws
+                .iter()
+                .any(|d| d.dst_origin == [100.0, 200.0] && d.dst_size == [200.0, 150.0]),
+            "Manual-redirected frame leaked into scene.draws: {:?}",
+            scene.draws,
+        );
         assert!(
             !scene.draws.iter().any(|d| d.dst_origin == [111.0, 241.0]),
             "non-redirected child of Manual-redirected ancestor leaked into scene.draws: {:?}",
             scene.draws,
         );
-        // First-draw checks below are scoped to the surviving entries.
-        let bystander_draw = scene
-            .draws
-            .iter()
-            .find(|d| d.dst_origin == [500.0, 500.0])
-            .expect("bystander present");
-        assert_eq!(
-            bystander_draw.dst_origin,
-            [500.0, 500.0],
-            "the surviving draw must be the bystander at (500,500); \
-             frame and its child were ostensibly pruned",
-        );
-        // sampled_ids mirrors draws — frame_B + bystander, no child.
+        // sampled_ids mirrors draws — bystander only, no frame_B, no child.
         let bystander_id = store.lookup(0x222).expect("bystander lookup");
-        assert_eq!(built.sampled_ids.len(), 2);
-        assert!(built.sampled_ids.contains(&frame_backing_id));
+        assert_eq!(built.sampled_ids.len(), 1);
+        assert!(!built.sampled_ids.contains(&frame_backing_id));
         assert!(built.sampled_ids.contains(&bystander_id));
     }
 
-    /// Stage 4d follow-up — a Manual-redirected parent with a
-    /// redirected backing must emit that backing directly, while
-    /// still pruning its descendants.
-    #[test]
-    fn build_scene_emits_manual_redirected_parent_backing_but_prunes_descendants() {
-        let mut core = KmsCore::for_tests();
-        let mut store = DrawableStore::new();
-        let platform = PlatformBackend::for_tests();
-        let mut windows_v2 = super::super::backend::WindowsV2Map::new();
-
-        alloc_stub_window(
-            &mut store,
-            &mut windows_v2,
-            0x111,
-            100,
-            200,
-            200,
-            150,
-            None,
-            true,
-        );
-        core.top_level_order.push(0x111);
-        let w_frame_id = store.lookup(0x111).expect("frame lookup");
-
-        let mut backing = super::super::store::Storage::for_tests_null(
-            extent(200, 150),
-            vk::Format::B8G8R8A8_UNORM,
-        );
-        let backing_view: vk::ImageView = ash::vk::Handle::from_raw(0xBEEF_CAFE);
-        backing.image_view = backing_view;
-        backing.sample_view = backing_view;
-        let backing_id = store
-            .allocate(0xB002, DrawableKind::Pixmap, 32, true, backing)
-            .expect("alloc redirected backing");
-        store.set_redirected_target(w_frame_id, Some(backing_id));
-        store.set_scene_participating(w_frame_id, false);
-        assert!(
-            store.get(backing_id).unwrap().scene_participating,
-            "fixture sanity: redirected backing stays scene_participating=true",
-        );
-
-        alloc_stub_window(
-            &mut store,
-            &mut windows_v2,
-            0x112,
-            11,
-            41,
-            100,
-            80,
-            Some(0x111),
-            true,
-        );
-
-        alloc_stub_window(
-            &mut store,
-            &mut windows_v2,
-            0x222,
-            500,
-            500,
-            60,
-            30,
-            None,
-            true,
-        );
-        core.top_level_order.push(0x222);
-
-        let child_id = store.lookup(0x112).expect("child lookup");
-        assert!(
-            store.get(child_id).unwrap().scene_participating,
-            "fixture sanity: child stays scene_participating=true",
-        );
-
-        let built = build_scene(
-            &core,
-            &mut store,
-            &windows_v2,
-            0,
-            &platform,
-            None,
-            None,
-            None,
-            false,
-        );
-        let scene = &built.scene;
-
-        assert_eq!(scene.draws.len(), 2, "expected manual backing + bystander");
-        assert!(
-            scene
-                .draws
-                .iter()
-                .any(|d| d.dst_origin == [100.0, 200.0] && d.dst_size == [200.0, 150.0]),
-            "manual parent backing draw missing: {:?}",
-            scene.draws
-        );
-        assert!(
-            scene
-                .draws
-                .iter()
-                .any(|d| d.dst_origin == [500.0, 500.0] && d.dst_size == [60.0, 30.0]),
-            "bystander draw missing: {:?}",
-            scene.draws
-        );
-
-        let bystander_id = store.lookup(0x222).expect("bystander lookup");
-        assert_eq!(built.sampled_ids.len(), 2);
-        assert!(built.sampled_ids.contains(&backing_id));
-        assert!(built.sampled_ids.contains(&bystander_id));
-    }
+    // Phase 3.1 — the legacy `build_scene_emits_manual_redirected_parent_backing_but_prunes_descendants`
+    // test was deleted here. Its sole purpose was to assert that a
+    // Manual-redirected top-level emits its backing directly into
+    // scanout — exactly the bug-shaped state Task 3.1 closes. The
+    // compositor (in production) reads the backing via
+    // `NameWindowPixmap` and re-emits it on the COW; the X server
+    // must never short-circuit that. `manual_redirected_top_level_skips_emit_unconditional`
+    // covers the replacement invariant.
 
     /// Audit #3 (2026-05-19) — a Manual-redirected parent still
     /// prunes its NON-redirected descendants (their paint resolves
@@ -4223,6 +4134,12 @@ mod tests {
     /// RedirectSubwindows(frame, Automatic) makes Automatic
     /// widgets vanish" symptom (Control Center missing menus /
     /// widgets).
+    ///
+    /// Phase 3.1 update: the Manual-redirected parent ALSO no longer
+    /// emits (compositor reads its backing via NameWindowPixmap).
+    /// The load-bearing assertion of this test is still "Automatic
+    /// child backing emits despite Manual ancestor"; the parent emit
+    /// is dropped from the expectation set.
     #[test]
     fn build_scene_emits_automatic_descendant_under_manual_ancestor() {
         let mut core = KmsCore::for_tests();
@@ -4304,20 +4221,23 @@ mod tests {
         );
         let scene = &built.scene;
 
-        // Two draws: parent F's backing at (100, 200), child C's
-        // backing at (111, 241) (= F.pos + C.pos relative).
+        // Phase 3.1 — only the Automatic child backing emits, at
+        // (111, 241) (= F.pos + C.pos relative). Parent F is
+        // Manual-redirected so it stays out of scene.draws; the
+        // compositor consumes its backing offscreen via
+        // NameWindowPixmap.
         assert_eq!(
             scene.draws.len(),
-            2,
-            "expected manual-parent backing + automatic-child backing; got {:?}",
+            1,
+            "expected automatic-child backing only (Manual parent skipped); got {:?}",
             scene.draws
         );
         assert!(
-            scene
+            !scene
                 .draws
                 .iter()
                 .any(|d| d.dst_origin == [100.0, 200.0] && d.dst_size == [200.0, 150.0]),
-            "manual parent backing draw missing: {:?}",
+            "Manual parent backing must NOT emit: {:?}",
             scene.draws
         );
         assert!(
@@ -4328,7 +4248,7 @@ mod tests {
             "automatic child backing draw missing: {:?}",
             scene.draws
         );
-        assert!(built.sampled_ids.contains(&frame_backing_id));
+        assert!(!built.sampled_ids.contains(&frame_backing_id));
         assert!(built.sampled_ids.contains(&child_backing_id));
     }
 
@@ -4663,6 +4583,136 @@ mod tests {
         assert!(
             cow_draws[0].alpha_passthrough,
             "COW draw still has alpha_passthrough=true",
+        );
+    }
+
+    /// Phase 3.1 — a Manual-redirected top-level (own
+    /// `redirected_target` + `scene_participating=false`) must NEVER
+    /// emit a `CompositeDraw` from its backing, regardless of whether
+    /// the COW is materialized. Xorg's `compCheckRedirect` ensures
+    /// Manual-redirected windows go offscreen for the compositor to
+    /// read via `NameWindowPixmap`; the X server must not also blit
+    /// the backing into scanout.
+    #[test]
+    fn manual_redirected_top_level_skips_emit_unconditional() {
+        for cow_host_xid in [None, Some(0x103_u32)] {
+            let mut core = KmsCore::for_tests();
+            let mut store = DrawableStore::new();
+            let platform = PlatformBackend::for_tests();
+            let mut windows_v2 = super::super::backend::WindowsV2Map::new();
+
+            // W with a redirected backing (Manual mode:
+            // scene_participating=false). Unique sentinel handle so
+            // a stray draw entry is unambiguous.
+            let w: u32 = 0xA1;
+            alloc_stub_window(&mut store, &mut windows_v2, w, 100, 100, 50, 50, None, true);
+            let w_id = store.lookup(w).expect("w lookup");
+            let mut backing = super::super::store::Storage::for_tests_null(
+                extent(50, 50),
+                PlatformBackend::format_for_depth(24),
+            );
+            let view: vk::ImageView = ash::vk::Handle::from_raw(0xBEEF_0000);
+            backing.image_view = view;
+            backing.sample_view = view;
+            let b_id = store
+                .allocate(0xB0A1, DrawableKind::Pixmap, 24, true, backing)
+                .expect("alloc manual backing");
+            store.set_redirected_target(w_id, Some(b_id));
+            store.set_scene_participating(w_id, false);
+            core.top_level_order.push(w);
+
+            if let Some(cow_xid) = cow_host_xid {
+                alloc_stub_window(
+                    &mut store,
+                    &mut windows_v2,
+                    cow_xid,
+                    0,
+                    0,
+                    800,
+                    600,
+                    None,
+                    true,
+                );
+                core.top_level_order.push(cow_xid);
+            }
+
+            let built = build_scene(
+                &core,
+                &mut store,
+                &windows_v2,
+                0,
+                &platform,
+                None,
+                None,
+                cow_host_xid,
+                false,
+            );
+            let scene = &built.scene;
+
+            let w_draws: Vec<_> = scene
+                .draws
+                .iter()
+                .filter(|d| d.dst_size == [50.0, 50.0])
+                .collect();
+            assert!(
+                w_draws.is_empty(),
+                "Manual-redirected W must NOT emit (cow={cow_host_xid:?}): {:?}",
+                scene.draws,
+            );
+        }
+    }
+
+    /// Phase 3.1 negative — an Automatic-redirected top-level (own
+    /// `redirected_target` + `scene_participating=true`) still emits
+    /// a draw. Only the Manual mode (the bug-shaped case the gate
+    /// closes) is unconditionally skipped.
+    #[test]
+    fn automatic_redirected_top_level_still_emits() {
+        let mut core = KmsCore::for_tests();
+        let mut store = DrawableStore::new();
+        let platform = PlatformBackend::for_tests();
+        let mut windows_v2 = super::super::backend::WindowsV2Map::new();
+
+        let w: u32 = 0xA2;
+        alloc_stub_window(&mut store, &mut windows_v2, w, 100, 100, 50, 50, None, true);
+        let w_id = store.lookup(w).expect("w lookup");
+        let mut backing = super::super::store::Storage::for_tests_null(
+            extent(50, 50),
+            PlatformBackend::format_for_depth(24),
+        );
+        let view: vk::ImageView = ash::vk::Handle::from_raw(0xBEEF_0001);
+        backing.image_view = view;
+        backing.sample_view = view;
+        let b_id = store
+            .allocate(0xB0A2, DrawableKind::Pixmap, 24, true, backing)
+            .expect("alloc automatic backing");
+        store.set_redirected_target(w_id, Some(b_id));
+        // scene_participating left as default true (Automatic).
+        core.top_level_order.push(w);
+
+        let built = build_scene(
+            &core,
+            &mut store,
+            &windows_v2,
+            0,
+            &platform,
+            None,
+            None,
+            None,
+            false,
+        );
+        let scene = &built.scene;
+
+        let w_draws: Vec<_> = scene
+            .draws
+            .iter()
+            .filter(|d| d.dst_size == [50.0, 50.0])
+            .collect();
+        assert_eq!(
+            w_draws.len(),
+            1,
+            "Automatic-redirected W still emits one draw: {:?}",
+            scene.draws,
         );
     }
 }
