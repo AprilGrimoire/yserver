@@ -1815,20 +1815,16 @@ impl ServerState {
         x: i16,
         y: i16,
     ) -> Option<(ResourceId, i16, i16)> {
+        // Strict-Xorg miSpriteTrace: iterate children top-to-bottom and
+        // let hit_test_child's window_input_contains gate decide each one.
+        // The COW is no longer special once it's a real root child
+        // (Phase 2 materialization). With its default empty input shape,
+        // hit_test_child(COW) returns None and the trace continues to
+        // the next sibling — exactly matching Xorg's mi/misprite.c.
+        // When a compositor populates the COW input region via XFIXES,
+        // the gate descends naturally via pointer_target_at_inner's
+        // recursive walk.
         let parent_window = self.resources.window(parent)?;
-
-        if parent == ROOT_WINDOW
-            && !parent_window.children.contains(&COMPOSITE_OVERLAY_WINDOW)
-            && self
-                .resources
-                .window(COMPOSITE_OVERLAY_WINDOW)
-                .and_then(|overlay| overlay.host_xid)
-                .is_some()
-            && let Some(hit) = self.hit_test_child(COMPOSITE_OVERLAY_WINDOW, x, y)
-        {
-            return Some(hit);
-        }
-
         for child_id in parent_window.children.iter().rev() {
             if let Some(hit) = self.hit_test_child(*child_id, x, y) {
                 return Some(hit);
@@ -4269,6 +4265,97 @@ mod tests {
     }
 
     #[test]
+    fn cow_with_empty_input_shape_passes_clicks_to_sibling_below() {
+        use crate::resources::{ROOT_VISUAL, ROOT_WINDOW};
+        use yserver_protocol::x11::CreateWindowRequest;
+
+        let mut state = ServerState::new();
+
+        // Non-COW sibling at (0,0) 800x600, default (full) input shape.
+        let sib = ResourceId(0x0010_0080);
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: sib,
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+                border_width: 0,
+                class: 1,
+                visual: ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(sib);
+
+        // Materialize COW (full-screen, empty input shape per Task 2.8).
+        let host_xid = crate::backend::WindowHandle::from_raw_panicking(0x4000_0103);
+        state.resources.materialize_cow_resource(host_xid);
+        state.materialize_cow_input_shape();
+
+        // Click at (50, 50): inside both sibling and COW geometry. COW's
+        // empty input shape → hit_test_child(COW) = None → iteration
+        // falls through to `sib`.
+        let (target, _, _) = state
+            .root_pointer_target_at(50, 50)
+            .expect("trace hits sibling below COW");
+        assert_eq!(
+            target, sib,
+            "empty COW input shape must let clicks through to sibling below"
+        );
+    }
+
+    #[test]
+    fn cow_with_non_empty_input_shape_descends_into_stage() {
+        use crate::resources::{COMPOSITE_OVERLAY_WINDOW, ROOT_VISUAL};
+        use yserver_protocol::x11::{CreateWindowRequest, xfixes};
+
+        let mut state = ServerState::new();
+
+        let host_xid = crate::backend::WindowHandle::from_raw_panicking(0x4000_0103);
+        state.resources.materialize_cow_resource(host_xid);
+        // Compositor populates COW input shape covering the stage region.
+        state
+            .shape_windows
+            .entry(COMPOSITE_OVERLAY_WINDOW)
+            .or_default()
+            .input = Some(vec![xfixes::RegionRect {
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        }]);
+
+        let stage = ResourceId(0x0010_0050);
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: stage,
+                parent: COMPOSITE_OVERLAY_WINDOW,
+                x: 10,
+                y: 10,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(stage);
+
+        let (target, _, _) = state.root_pointer_target_at(50, 50).expect("hit");
+        assert_eq!(
+            target, stage,
+            "non-empty COW input shape lets the trace descend to stage"
+        );
+    }
+
+    #[test]
     fn cow_default_input_shape_is_empty() {
         use crate::resources::COMPOSITE_OVERLAY_WINDOW;
 
@@ -4290,109 +4377,6 @@ mod tests {
             0,
             "COW's default input shape rects are empty (click-through)"
         );
-    }
-
-    #[test]
-    fn root_hit_test_reaches_overlay_child_without_querytree_child() {
-        use crate::resources::{COMPOSITE_OVERLAY_WINDOW, ROOT_VISUAL};
-        use yserver_protocol::x11::CreateWindowRequest;
-
-        let mut state = ServerState::new();
-        let stage = ResourceId(0x0010_0040);
-        state
-            .resources
-            .window_mut(COMPOSITE_OVERLAY_WINDOW)
-            .unwrap()
-            .host_xid = Some(crate::backend::WindowHandle::from_raw_panicking(0x103));
-        state.resources.create_window(
-            ClientId(1),
-            CreateWindowRequest {
-                depth: 24,
-                window: stage,
-                parent: COMPOSITE_OVERLAY_WINDOW,
-                x: 0,
-                y: 0,
-                width: 800,
-                height: 600,
-                border_width: 0,
-                class: 1,
-                visual: ROOT_VISUAL,
-                ..Default::default()
-            },
-        );
-        let _ = state.resources.map_window(stage);
-
-        assert!(
-            !state
-                .resources
-                .children(ROOT_WINDOW)
-                .contains(&COMPOSITE_OVERLAY_WINDOW)
-        );
-        assert_eq!(state.root_pointer_target_at(25, 30), Some((stage, 25, 30)));
-        assert_eq!(
-            state.direct_child_at(ROOT_WINDOW, 25, 30),
-            Some(COMPOSITE_OVERLAY_WINDOW)
-        );
-    }
-
-    #[test]
-    fn root_hit_test_skips_overlay_when_input_shape_is_empty() {
-        use crate::resources::{COMPOSITE_OVERLAY_WINDOW, ROOT_VISUAL};
-        use yserver_protocol::x11::{CreateWindowRequest, xfixes};
-
-        let mut state = ServerState::new();
-        let stage = ResourceId(0x0010_0041);
-        let desktop = ResourceId(0x0010_0042);
-        state
-            .resources
-            .window_mut(COMPOSITE_OVERLAY_WINDOW)
-            .unwrap()
-            .host_xid = Some(crate::backend::WindowHandle::from_raw_panicking(0x103));
-        state.resources.create_window(
-            ClientId(1),
-            CreateWindowRequest {
-                depth: 24,
-                window: desktop,
-                parent: ROOT_WINDOW,
-                x: 0,
-                y: 0,
-                width: 800,
-                height: 600,
-                border_width: 0,
-                class: 1,
-                visual: ROOT_VISUAL,
-                ..Default::default()
-            },
-        );
-        let _ = state.resources.map_window(desktop);
-        state.resources.create_window(
-            ClientId(1),
-            CreateWindowRequest {
-                depth: 24,
-                window: stage,
-                parent: COMPOSITE_OVERLAY_WINDOW,
-                x: 0,
-                y: 0,
-                width: 800,
-                height: 600,
-                border_width: 0,
-                class: 1,
-                visual: ROOT_VISUAL,
-                ..Default::default()
-            },
-        );
-        let _ = state.resources.map_window(stage);
-        state
-            .shape_windows
-            .entry(COMPOSITE_OVERLAY_WINDOW)
-            .or_default()
-            .input = Some(Vec::<xfixes::RegionRect>::new());
-
-        assert_eq!(
-            state.root_pointer_target_at(25, 30),
-            Some((desktop, 25, 30))
-        );
-        assert_eq!(state.direct_child_at(ROOT_WINDOW, 25, 30), Some(desktop));
     }
 
     #[test]
