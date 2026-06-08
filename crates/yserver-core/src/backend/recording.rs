@@ -146,6 +146,15 @@ pub struct RecordingBackend {
     /// methods take `&mut self`, so the test thread already has
     /// exclusive access.
     pub cow_next_release_is_final: bool,
+    /// Stage 4e COW: tracks whether `get_overlay_window` has
+    /// materialised the COW (refcount > 0) so the override can
+    /// signal the 0→1 transition to the core handler. Mirrors
+    /// `KmsBackendV2`'s `core.cow_refcount`-based logic; the
+    /// `RecordingBackend` doesn't own GPU storage so a plain bool
+    /// suffices. Reset by `release_overlay_window` on the
+    /// final-release branch (controlled by
+    /// `cow_next_release_is_final`).
+    pub cow_materialized: bool,
     /// Phase 2 (reparent reconciliation): lets tests opt in to
     /// claiming `supports_redirect_activation = true` so the
     /// production reconciliation block in `handle_reparent_window`
@@ -192,6 +201,7 @@ impl RecordingBackend {
             xid_map: HostXidMap::new(),
             page_flip_count: std::sync::atomic::AtomicU32::new(0),
             cow_next_release_is_final: false,
+            cow_materialized: false,
             redirect_activation_supported: false,
             query_pointer_mask: 0,
             dpms_capable: true,
@@ -1213,6 +1223,31 @@ impl Backend for RecordingBackend {
         _origin: Option<OriginContext>,
     ) -> io::Result<(u8, Vec<u8>)> {
         Ok((0, Vec::new()))
+    }
+
+    /// Stage 4e COW: override to model the 0→1 transition so the
+    /// core handler can drive `materialize_cow_resource`. Returns
+    /// `Ok(true)` on first claim (cow_materialized was false),
+    /// `Ok(false)` on subsequent claims. Mirrors `KmsBackendV2`'s
+    /// semantics — single backend hook owns the full COW lifecycle.
+    fn get_overlay_window(&mut self, _origin: Option<OriginContext>) -> io::Result<bool> {
+        if self.cow_materialized {
+            return Ok(false);
+        }
+        self.cow_materialized = true;
+        Ok(true)
+    }
+
+    /// Stage 4e COW: return the well-known COW host xid while
+    /// materialised. The core handler reads this to populate the
+    /// resources COW record's `host_xid` after `get_overlay_window`'s
+    /// 0→1 return.
+    fn cow_host_xid(&self) -> Option<u32> {
+        if self.cow_materialized {
+            Some(crate::resources::COMPOSITE_OVERLAY_WINDOW.0)
+        } else {
+            None
+        }
     }
 
     /// Stage 4d COW: override only to honor the

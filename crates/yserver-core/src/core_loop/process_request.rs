@@ -4252,57 +4252,47 @@ fn handle_composite_request(
             // for why — marco's compositor immediately calls XSelectInput on
             // this XID and would otherwise wipe its own WM event mask on root.
             let overlay = COMPOSITE_OVERLAY_WINDOW.0;
-            // Stage 4d: ask the backend to materialise the COW as a
+            // Stage 4e: ask the backend to materialise the COW as a
             // first-class scene entry (allocate screen-extent storage,
-            // register the scene layer). v1 picks up the trait default
-            // no-op; v2's override is the load-bearing path for
-            // compositing WMs. Log + continue on Err — the protocol
-            // reply must still go out (marco treats a failed
-            // GetOverlayWindow as fatal otherwise).
-            if let Err(err) = backend.get_overlay_window(origin) {
-                log::warn!(
-                    "client {} #{} COMPOSITE::GetOverlayWindow backend hook failed: {err}",
-                    client_id.0,
-                    sequence.0,
-                );
-            }
-            // Stage 4d gate: wire the COW resource record's `host_xid`
-            // + dimensions so `host_drawable_target(COW)` resolves.
-            // Without this, marco-with-compositing's PRESENT::Pixmap
-            // onto COW (which it does instead of NameWindowPixmap)
-            // silently falls through the `if let (Some, Some)` guard
-            // in the PresentPixmap handler and drops every paint.
+            // populate `windows_v2` + `top_level_order`). v1 picks up
+            // the trait default no-op (`Ok(false)`); v2's override is
+            // the load-bearing path for compositing WMs. Backends that
+            // already have COW materialised (refcount > 0) return
+            // `Ok(false)` — refcount bump only, no resources-side
+            // materialization needed.
             //
-            // Idempotent across repeated GETs: the `host_xid.is_none()`
-            // guard skips re-wiring after the first allocation.
-            // RELEASE_OVERLAY_WINDOW clears `host_xid` on the final
-            // release so a subsequent GET re-wires fresh.
+            // On `Ok(true)` (0→1 transition), the resources side
+            // must mirror via `materialize_cow_resource`. Both layers
+            // hold the COW state in lockstep.
             //
-            // The COW xid IS the host xid here (v2 keys its
-            // `DrawableStore` on the protocol xid directly — see
-            // `KmsBackendV2::get_overlay_window`). v1 and other
-            // backends without a real COW allocation return `Ok(())`
-            // from the default no-op above; this wiring is harmless
-            // there since v1 never reaches the v2 COW scene path.
-            if let Some(overlay_win) = state.resources.window_mut(COMPOSITE_OVERLAY_WINDOW)
-                && overlay_win.host_xid.is_none()
-            {
-                overlay_win.host_xid =
-                    Some(crate::backend::WindowHandle::from_raw_panicking(overlay));
-                // Match the backend-side COW storage extent. Backends
-                // allocate screen-extent storage; read from the root
-                // window so this stays protocol-layer (no new Backend
-                // trait method needed to ask for fb_w / fb_h).
-                let root_extent = state
-                    .resources
-                    .window(ROOT_WINDOW)
-                    .map(|root| (root.width, root.height));
-                if let Some((w, h)) = root_extent
-                    && let Some(overlay_win) = state.resources.window_mut(COMPOSITE_OVERLAY_WINDOW)
-                {
-                    overlay_win.width = w;
-                    overlay_win.height = h;
+            // Log + continue on Err — the protocol reply must still
+            // go out (marco treats a failed GetOverlayWindow as
+            // fatal otherwise).
+            let was_zero_to_one = match backend.get_overlay_window(origin) {
+                Ok(first_claim) => first_claim,
+                Err(err) => {
+                    log::warn!(
+                        "client {} #{} COMPOSITE::GetOverlayWindow backend hook failed: {err}",
+                        client_id.0,
+                        sequence.0,
+                    );
+                    false
                 }
+            };
+            if was_zero_to_one {
+                // Backend has materialised its side (`windows_v2` +
+                // `top_level_order`). Drive the symmetric resources-
+                // side materialization. The host xid is whatever the
+                // backend assigned — for v2 / `RecordingBackend` this
+                // is `COMPOSITE_OVERLAY_WINDOW.0` itself; backends
+                // without a real COW (default trait impl) never
+                // reach this branch because they return `Ok(false)`.
+                let cow_host_xid = backend.cow_host_xid().expect(
+                    "backend.get_overlay_window returned Ok(true) without populating cow_host_xid",
+                );
+                state.resources.materialize_cow_resource(
+                    crate::backend::WindowHandle::from_raw_panicking(cow_host_xid),
+                );
             }
             debug!(
                 "client {} #{} COMPOSITE::GetOverlayWindow -> 0x{:x}",
@@ -27408,19 +27398,19 @@ mod tests {
 
     #[test]
     fn get_overlay_window_wires_cow_host_xid() {
-        // Pre-condition: COW resource record exists with host_xid = None.
+        // Pre-condition: COW resource record does NOT exist (post-Task-2.1
+        // the pre-seed is gone; COW materialises only on GetOverlayWindow).
         let mut state = ServerState::new();
         let _peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
 
-        let cow_pre = state
-            .resources
-            .window(crate::resources::COMPOSITE_OVERLAY_WINDOW)
-            .expect("COW record seeded at ResourceTable::new");
         assert!(
-            cow_pre.host_xid.is_none(),
-            "COW must start with host_xid=None — the seed in resources.rs:230 \
-             must not be silently fixed without updating this oracle",
+            state
+                .resources
+                .window(crate::resources::COMPOSITE_OVERLAY_WINDOW)
+                .is_none(),
+            "COW must NOT be pre-seeded; the materialise-on-GET model \
+             owns the entire COW lifecycle (Task 2.1 + Task 2.4)",
         );
 
         // GetOverlayWindow body: window xid (we use root, marco ignores

@@ -503,6 +503,74 @@ impl ResourceTable {
         destroyed
     }
 
+    /// Stage 4e — create the Composite Overlay Window resource record
+    /// as a child of root, populate its `host_xid`, and insert it as
+    /// the topmost child via `cow_aware_top_index`.
+    ///
+    /// **Precondition: COW is not currently materialized.** Called by
+    /// the core `GetOverlayWindow` handler only on the 0→1 refcount
+    /// transition (the backend's `get_overlay_window` returned
+    /// `Ok(true)`). Panics if a COW resource record already exists;
+    /// repeated `GetOverlayWindow` calls without an intervening release
+    /// are refcount-only and never reach this function. This guard is
+    /// load-bearing: the COW's resource record may carry live state
+    /// across an interactive session (event-mask selections, properties,
+    /// children — the compositor stage gets reparented under it),
+    /// rebuilding it would silently drop that state.
+    pub fn materialize_cow_resource(&mut self, host_xid: crate::backend::WindowHandle) {
+        assert!(
+            !self.windows.contains_key(&COMPOSITE_OVERLAY_WINDOW.0),
+            "materialize_cow_resource: COW already materialized; \
+             core handler must only call this on get_overlay_window's \
+             Ok(true) (0→1) return, never on subsequent claims"
+        );
+        // Build the resource record. Geometry mirrors Xorg
+        // `compoverlay.c:compCreateOverlayWindow`: full screen, depth =
+        // root depth, override-redirect, no automatic background.
+        let root_w = self.window(ROOT_WINDOW).map_or(1, |r| r.width);
+        let root_h = self.window(ROOT_WINDOW).map_or(1, |r| r.height);
+        let root_visual = self.window(ROOT_WINDOW).map_or(ROOT_VISUAL, |r| r.visual);
+        let cow_window = Window {
+            id: COMPOSITE_OVERLAY_WINDOW,
+            parent: ROOT_WINDOW,
+            x: 0,
+            y: 0,
+            width: root_w,
+            height: root_h,
+            depth: 24,
+            visual: root_visual,
+            class: WindowClass::InputOutput,
+            map_state: MapState::Viewable,
+            override_redirect: true,
+            host_xid: Some(host_xid),
+            // Remaining fields default per `Window::placeholder` (background
+            // none, empty properties, no cursor, etc.).
+            ..Window::placeholder(COMPOSITE_OVERLAY_WINDOW)
+        };
+        self.windows.insert(COMPOSITE_OVERLAY_WINDOW.0, cow_window);
+
+        // Insert COW into root.children at the cow-aware top slot. The
+        // post-condition: COW is the last entry in root.children.
+        if let Some(root) = self.windows.get_mut(&ROOT_WINDOW.0) {
+            let idx = cow_aware_top_index(root);
+            root.children.insert(idx, COMPOSITE_OVERLAY_WINDOW);
+        }
+    }
+
+    /// Stage 4e — symmetric teardown. Remove the COW from root.children
+    /// and drop the resource record. Called by the core
+    /// `ReleaseOverlayWindow` handler only on the 1→0 refcount
+    /// transition (`backend.release_overlay_window` returned
+    /// `Ok(true)`). Drops any live COW-local state (event-mask
+    /// selections, property store, child window list) — by definition
+    /// the compositor has explicitly released, so this is intentional.
+    pub fn destroy_cow_resource(&mut self) {
+        if let Some(root) = self.windows.get_mut(&ROOT_WINDOW.0) {
+            root.children.retain(|&c| c != COMPOSITE_OVERLAY_WINDOW);
+        }
+        self.windows.remove(&COMPOSITE_OVERLAY_WINDOW.0);
+    }
+
     #[must_use]
     pub fn configure_notify_above_sibling(&self, id: ResourceId) -> Option<ResourceId> {
         let window = self.windows.get(&id.0)?;
@@ -4833,6 +4901,63 @@ mod tests {
                 .children
                 .contains(&COMPOSITE_OVERLAY_WINDOW),
             "fresh root.children must not contain COW"
+        );
+    }
+
+    #[test]
+    fn materialize_cow_resource_creates_record_and_inserts_at_top() {
+        let mut t = ResourceTable::new();
+        make_child(&mut t, 0x200, ROOT_WINDOW.0, 0, 0);
+        let host_xid = crate::backend::WindowHandle::from_raw_panicking(COMPOSITE_OVERLAY_WINDOW.0);
+        t.materialize_cow_resource(host_xid);
+
+        let cow = t
+            .window(COMPOSITE_OVERLAY_WINDOW)
+            .expect("COW resource exists after materialize");
+        assert_eq!(cow.host_xid, Some(host_xid));
+        assert_eq!(cow.parent, ROOT_WINDOW);
+        assert!(cow.override_redirect);
+        assert_eq!(cow.depth, 24);
+        assert_eq!(cow.class, WindowClass::InputOutput);
+        assert_eq!(cow.map_state, MapState::Viewable);
+
+        let root = t.window(ROOT_WINDOW).unwrap();
+        // COW geometry matches root extent.
+        assert_eq!(cow.width, root.width, "COW width mirrors root");
+        assert_eq!(cow.height, root.height, "COW height mirrors root");
+
+        let kids = &root.children;
+        assert_eq!(
+            kids.last().copied(),
+            Some(COMPOSITE_OVERLAY_WINDOW),
+            "COW lands at the top of root.children",
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "COW already materialized")]
+    fn materialize_cow_resource_panics_if_already_materialized() {
+        let mut t = ResourceTable::new();
+        let host_xid = crate::backend::WindowHandle::from_raw_panicking(COMPOSITE_OVERLAY_WINDOW.0);
+        t.materialize_cow_resource(host_xid);
+        // Second call without intervening destroy must panic — repeated
+        // GetOverlayWindow calls without ReleaseOverlayWindow are
+        // refcount-only and must not reach this function.
+        t.materialize_cow_resource(host_xid);
+    }
+
+    #[test]
+    fn destroy_cow_resource_removes_record_and_root_child() {
+        let mut t = ResourceTable::new();
+        let host_xid = crate::backend::WindowHandle::from_raw_panicking(COMPOSITE_OVERLAY_WINDOW.0);
+        t.materialize_cow_resource(host_xid);
+        t.destroy_cow_resource();
+        assert!(t.window(COMPOSITE_OVERLAY_WINDOW).is_none());
+        assert!(
+            !t.window(ROOT_WINDOW)
+                .unwrap()
+                .children
+                .contains(&COMPOSITE_OVERLAY_WINDOW)
         );
     }
 }
