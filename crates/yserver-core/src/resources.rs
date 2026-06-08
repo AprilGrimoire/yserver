@@ -4797,8 +4797,6 @@ mod tests {
         let root = t.window(ROOT_WINDOW).unwrap();
         assert_eq!(cow_aware_top_index(root), root.children.len() - 1);
     }
-<<<<<<< HEAD
-
     #[test]
     fn create_window_with_cow_present_inserts_below_cow() {
         let mut t = ResourceTable::new();
@@ -4820,7 +4818,6 @@ mod tests {
             "new top-level lands just below COW"
         );
     }
-
     #[test]
     fn restack_top_with_cow_present_lands_just_below_cow() {
         let mut t = ResourceTable::new();
