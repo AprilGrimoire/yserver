@@ -4322,32 +4322,8 @@ mod tests {
     }
 
     #[test]
-    fn cow_default_input_shape_is_empty() {
-        use crate::resources::COMPOSITE_OVERLAY_WINDOW;
-
-        let mut state = ServerState::new();
-        let host_xid = crate::backend::WindowHandle::from_raw_panicking(0x4000_0103);
-        state.resources.materialize_cow_resource(host_xid);
-        state.materialize_cow_input_shape();
-
-        let shape = state
-            .shape_windows
-            .get(&COMPOSITE_OVERLAY_WINDOW)
-            .expect("COW must have a shape_windows entry after materialization");
-        assert!(
-            shape.input.is_some(),
-            "COW must have a non-default input shape (set, but empty)"
-        );
-        assert_eq!(
-            shape.input.as_ref().unwrap().len(),
-            0,
-            "COW's default input shape rects are empty (click-through)"
-        );
-    }
-
-    #[test]
-    fn root_hit_test_reaches_overlay_child_without_querytree_child() {
-        use crate::resources::{COMPOSITE_OVERLAY_WINDOW, ROOT_VISUAL, ROOT_WINDOW};
+    fn cow_with_empty_input_shape_passes_clicks_to_sibling_below() {
+        use crate::resources::{ROOT_VISUAL, ROOT_WINDOW};
         use yserver_protocol::x11::CreateWindowRequest;
 
         let mut state = ServerState::new();
@@ -4433,6 +4409,30 @@ mod tests {
         assert_eq!(
             target, stage,
             "non-empty COW input shape lets the trace descend to stage"
+        );
+    }
+
+    #[test]
+    fn cow_default_input_shape_is_empty() {
+        use crate::resources::COMPOSITE_OVERLAY_WINDOW;
+
+        let mut state = ServerState::new();
+        let host_xid = crate::backend::WindowHandle::from_raw_panicking(0x4000_0103);
+        state.resources.materialize_cow_resource(host_xid);
+        state.materialize_cow_input_shape();
+
+        let shape = state
+            .shape_windows
+            .get(&COMPOSITE_OVERLAY_WINDOW)
+            .expect("COW must have a shape_windows entry after materialization");
+        assert!(
+            shape.input.is_some(),
+            "COW must have a non-default input shape (set, but empty)"
+        );
+        assert_eq!(
+            shape.input.as_ref().unwrap().len(),
+            0,
+            "COW's default input shape rects are empty (click-through)"
         );
     }
 
