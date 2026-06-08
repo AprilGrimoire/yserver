@@ -795,19 +795,22 @@ pub trait Backend: Send {
     /// one (refcount transitioned to 0 and the backend
     /// destroyed the COW storage); `Ok(false)` otherwise
     /// (refcount > 0 after decrement, defensive no-op, or
-    /// backends that don't track COW lifecycle at all — v1,
-    /// ynest, `RecordingBackend`). The handler uses this signal
-    /// to clear `host_xid` on the COW resource record when the
-    /// storage actually went away, so the next
-    /// `GetOverlayWindow` re-wires fresh.
+    /// backends that don't track COW lifecycle — v1, ynest).
+    /// The handler uses this signal to drive
+    /// `destroy_cow_resource()` in lockstep: the resources-side
+    /// Window record and its slot in `root.children` come down
+    /// together with the backend storage. The next
+    /// `GetOverlayWindow` re-materializes the whole thing fresh
+    /// via `materialize_cow_resource()`.
     ///
     /// The v2 impl (`KmsBackendV2`) also tears down its
     /// `windows_v2` entry and the COW's slot in
     /// `top_level_order` on the final release — the mirror of
     /// the materialization that `get_overlay_window`'s 0→1
-    /// branch installs. Single backend hook owns the full
-    /// lifecycle in both directions; there is no separate
-    /// `destroy_cow` API.
+    /// branch installs. `RecordingBackend` similarly tracks
+    /// 1→0 via its `cow_materialized` flag for handler-wiring
+    /// tests. Single backend hook owns the full lifecycle in
+    /// both directions; there is no separate `destroy_cow` API.
     ///
     /// Default no-op as for `get_overlay_window`: returns
     /// `Ok(false)` because "I didn't destroy anything."
