@@ -231,51 +231,10 @@ impl Default for ResourceTable {
             },
         );
 
-        // Composite overlay window. Marco (and other compositors) calls
-        // XCompositeGetOverlayWindow → XSelectInput(overlay, ExposureMask)
-        // during compositor init. The overlay must be a real, distinct
-        // XID — if we hand back root here, the XSelectInput call replaces
-        // the WM's root event mask and drops SubstructureRedirect, after
-        // which marco silently stops acting as a window manager. We don't
-        // composite through it on KMS, but it has to exist as a window so
-        // the standard CWA / Select / Release sequence works.
-        windows.insert(
-            COMPOSITE_OVERLAY_WINDOW.0,
-            Window {
-                id: COMPOSITE_OVERLAY_WINDOW,
-                parent: ROOT_WINDOW,
-                children: Vec::new(),
-                x: 0,
-                y: 0,
-                width: 800,
-                height: 600,
-                border_width: 0,
-                depth: 24,
-                visual: ROOT_VISUAL,
-                class: WindowClass::InputOutput,
-                map_state: MapState::Viewable,
-                background_pixel: 0,
-                background_pixmap: None,
-                background_none: false,
-                background_pixmap_host_xid: None,
-                border_pixmap_host_xid: None,
-                override_redirect: true,
-                bit_gravity: 0,
-                win_gravity: 1,
-                backing_store: 0,
-                backing_planes: u32::MAX,
-                backing_pixel: 0,
-                save_under: false,
-                do_not_propagate_mask: 0,
-                colormap: ROOT_COLORMAP,
-                cursor: None,
-                owner: SERVER_OWNER,
-                properties: HashMap::new(),
-                host_xid: None,
-                composite_named_pixmaps: Vec::new(),
-                redirected_backing: None,
-            },
-        );
+        // COW is NOT pre-seeded. Per the COW lifecycle spec (invariant 4),
+        // the overlay window exists fully or not at all; it is materialized
+        // on the 0→1 refcount transition of `GetOverlayWindow` and torn
+        // down on the 1→0 of `ReleaseOverlayWindow`.
 
         // Seed the visual + colormap tables with the same pair the setup
         // reply advertises. `host_visual_xid` / `host_colormap_xid` stay
@@ -4858,6 +4817,22 @@ mod tests {
             kids.last().copied(),
             Some(ResourceId(0xd0)),
             "the reparented child must NOT be above COW"
+        );
+    }
+
+    #[test]
+    fn fresh_resources_does_not_contain_cow() {
+        let t = ResourceTable::new();
+        assert!(
+            t.window(COMPOSITE_OVERLAY_WINDOW).is_none(),
+            "COW must NOT be pre-seeded; it materializes only on GetOverlayWindow"
+        );
+        assert!(
+            !t.window(ROOT_WINDOW)
+                .unwrap()
+                .children
+                .contains(&COMPOSITE_OVERLAY_WINDOW),
+            "fresh root.children must not contain COW"
         );
     }
 }
