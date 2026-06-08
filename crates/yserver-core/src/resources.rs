@@ -348,6 +348,22 @@ impl Default for ResourceTable {
     }
 }
 
+/// Index where a new "top" child should be inserted under `parent`. If
+/// the COW is currently the topmost child (last in the `children` vec
+/// per yserver's `children[len-1] == top` convention), insert below it;
+/// otherwise insert at the very end. Mirrors Xorg's
+/// `CompositeRealChildHead` (composite/compwindow.c:761-792).
+///
+/// `parent` is typically `ROOT_WINDOW` (COW's parent); calling on other
+/// parents is a no-op (returns `children.len()`).
+#[must_use]
+pub(crate) fn cow_aware_top_index(parent: &Window) -> usize {
+    match parent.children.last() {
+        Some(&last) if last == COMPOSITE_OVERLAY_WINDOW => parent.children.len() - 1,
+        _ => parent.children.len(),
+    }
+}
+
 impl ResourceTable {
     pub fn new() -> Self {
         Self::default()
@@ -4636,5 +4652,29 @@ mod tests {
             t.resource_owner(ResourceId(0x0210_0001)),
             Some(ClientId(33))
         );
+    }
+
+    #[test]
+    fn cow_aware_top_index_with_no_cow_returns_end() {
+        let mut t = ResourceTable::new();
+        make_child(&mut t, 0x200, ROOT_WINDOW.0, 0, 0);
+        make_child(&mut t, 0x300, ROOT_WINDOW.0, 0, 0);
+        let root = t.window(ROOT_WINDOW).unwrap();
+        assert_eq!(cow_aware_top_index(root), root.children.len());
+    }
+
+    #[test]
+    fn cow_aware_top_index_with_cow_at_top_returns_just_below() {
+        let mut t = ResourceTable::new();
+        make_child(&mut t, 0x200, ROOT_WINDOW.0, 0, 0);
+        // Simulate the post-Phase-2 state where COW is the last (topmost) root child.
+        // For this isolated unit test, push it directly so we can exercise the helper.
+        t.windows
+            .get_mut(&ROOT_WINDOW.0)
+            .unwrap()
+            .children
+            .push(COMPOSITE_OVERLAY_WINDOW);
+        let root = t.window(ROOT_WINDOW).unwrap();
+        assert_eq!(cow_aware_top_index(root), root.children.len() - 1);
     }
 }
