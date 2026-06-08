@@ -4311,26 +4311,22 @@ fn handle_composite_request(
                 "client {} #{} COMPOSITE::ReleaseOverlayWindow",
                 client_id.0, sequence.0
             );
-            // Stage 4d: decrement the COW refcount; the final release
-            // drops the scene entry + storage. Log-only on Err (the
-            // request carries no reply).
+            // Stage 4e: decrement the COW refcount; the final release
+            // (1→0 transition) tears down the backend's storage +
+            // `windows_v2` + `top_level_order` and the resources-side
+            // COW record. Log-only on Err (the request carries no
+            // reply).
             //
             // The backend returns `Ok(true)` iff this call was the
-            // final release (refcount → 0, COW storage destroyed) —
-            // in that case clear the COW resource record's `host_xid`
-            // so the next `GetOverlayWindow` re-wires fresh. Backends
-            // that don't track COW lifecycle (v1, ynest,
-            // `RecordingBackend`) keep the default `Ok(false)` and we
-            // leave `host_xid` alone.
-            //
-            // The backend returns `Ok(true)` iff this call was the
-            // final release (refcount → 0, COW storage destroyed) —
-            // in that case clear the COW resource record's `host_xid`
-            // so the next `GetOverlayWindow` re-wires fresh. Backends
-            // that don't track COW lifecycle (v1, ynest,
-            // `RecordingBackend`'s default) keep the `Ok(false)` and
-            // we leave `host_xid` alone.
-            let final_release = match backend.release_overlay_window(origin) {
+            // final release (refcount → 0, COW storage destroyed).
+            // The resources-side teardown via `destroy_cow_resource`
+            // mirrors that — both layers stay in lockstep with the
+            // backend-driven refcount. Backends that don't track COW
+            // lifecycle (v1, ynest defaults) keep `Ok(false)` and we
+            // skip the resources teardown — there's nothing to tear
+            // down because they never reached `materialize_cow_resource`
+            // either.
+            let was_one_to_zero = match backend.release_overlay_window(origin) {
                 Ok(final_release) => final_release,
                 Err(err) => {
                     log::warn!(
@@ -4341,10 +4337,8 @@ fn handle_composite_request(
                     false
                 }
             };
-            if final_release
-                && let Some(overlay_win) = state.resources.window_mut(COMPOSITE_OVERLAY_WINDOW)
-            {
-                overlay_win.host_xid = None;
+            if was_one_to_zero {
+                state.resources.destroy_cow_resource();
             }
         }
         other => {
@@ -27509,12 +27503,15 @@ mod tests {
     }
 
     #[test]
-    fn release_overlay_window_clears_host_xid_on_final_release() {
-        // Final release (backend returns Ok(true)) must clear host_xid so
-        // a subsequent GetOverlayWindow re-wires fresh storage. Otherwise
-        // host_xid would alias the prior (freed) backend storage — paint
-        // would land on stale GPU memory or, depending on the store's
-        // detach behaviour, gap-log silently.
+    fn release_overlay_window_destroys_cow_resource_on_final_release() {
+        // Final release (backend returns Ok(true)) must DESTROY the COW
+        // resource record entirely (record removed from `windows`, edge
+        // removed from `root.children`) so a subsequent `GetOverlayWindow`
+        // re-materialises fresh storage via the 0→1 backend path. The
+        // pre-Task-2.5 shape merely cleared `host_xid` on the still-existing
+        // record; that diverged from Xorg (no record between
+        // release-and-next-claim) and silently retained per-COW state
+        // (event masks, properties) across the release boundary.
         let mut state = ServerState::new();
         let _peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
@@ -27548,14 +27545,23 @@ mod tests {
             yserver_protocol::x11::composite::RELEASE_OVERLAY_WINDOW,
             &[],
         );
-        let cow = state
-            .resources
-            .window(crate::resources::COMPOSITE_OVERLAY_WINDOW)
-            .expect("COW record");
         assert!(
-            cow.host_xid.is_none(),
-            "final release (backend.Ok(true)) must clear host_xid so the \
-             next GetOverlayWindow can re-wire fresh storage",
+            state
+                .resources
+                .window(crate::resources::COMPOSITE_OVERLAY_WINDOW)
+                .is_none(),
+            "final release (backend.Ok(true)) must destroy the COW resource \
+             record entirely so the next GetOverlayWindow re-materialises \
+             fresh storage",
+        );
+        assert!(
+            !state
+                .resources
+                .window(crate::resources::ROOT_WINDOW)
+                .unwrap()
+                .children
+                .contains(&crate::resources::COMPOSITE_OVERLAY_WINDOW),
+            "final release must remove COW from root.children too",
         );
     }
 

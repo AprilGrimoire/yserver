@@ -1253,11 +1253,16 @@ impl Backend for RecordingBackend {
     /// Stage 4d COW: override only to honor the
     /// `cow_next_release_is_final` knob set by tests. Default trait
     /// impl returns `Ok(false)` ("I didn't destroy anything"); tests
-    /// that exercise the handler-side `host_xid` clear-on-final-
-    /// release path flip the knob first.
+    /// that exercise the handler-side teardown path flip the knob
+    /// first. On final release also clears `cow_materialized` so
+    /// `cow_host_xid` reverts to `None` and the next
+    /// `get_overlay_window` re-signals a 0→1 transition.
     fn release_overlay_window(&mut self, _origin: Option<OriginContext>) -> io::Result<bool> {
         let final_release = self.cow_next_release_is_final;
         self.cow_next_release_is_final = false;
+        if final_release {
+            self.cow_materialized = false;
+        }
         Ok(final_release)
     }
 
