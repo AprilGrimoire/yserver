@@ -4919,7 +4919,6 @@ mod tests {
             "the reparented child must NOT be above COW"
         );
     }
-
     #[test]
     fn fresh_resources_does_not_contain_cow() {
         let t = ResourceTable::new();
