@@ -1423,12 +1423,15 @@ fn tick_one_output(
     let hw_available = platform.cursor_plane_available();
     let hw_can_run = hw_strategy_enabled && hw_available;
     let prev_mode = inner.outputs[output_idx].last_frame_cursor_mode;
-    // Phase 2.6 — derive the COW host xid from the scene-registered
-    // `cow: Option<DrawableId>`. After Phase 2.2/2.5, the COW's host
-    // xid is the well-known protocol constant whenever the backend
-    // has materialized the overlay. Both Drawable and host-xid views
-    // come up + go down together; we just need one bool's worth of
-    // info to flag the COW top-level in the walk.
+    // Phase 2.6/2.7 — derive the COW host xid from the scene-
+    // registered `cow: Option<DrawableId>`. After Phase 2.2/2.5,
+    // the COW's host xid is the well-known protocol constant
+    // whenever the backend has materialized the overlay. Both
+    // Drawable and host-xid views come up + go down together; we
+    // just need one bool's worth of info to flag the COW top-level
+    // in the walk. The DrawableId itself is no longer threaded —
+    // Phase 2.7 deleted the special post-walk COW append, and the
+    // COW now emits via the normal top_level_order recursion.
     let cow_host_xid = cow.map(|_| yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0);
     let built = build_scene(
         core,
@@ -1438,7 +1441,6 @@ fn tick_one_output(
         platform,
         inner.cursor.clone(),
         cursor_prev_pos_before,
-        cow,
         cow_host_xid,
         hw_can_run,
     );
@@ -1832,14 +1834,17 @@ fn build_scene(
     platform: &PlatformBackend,
     cursor: Option<CursorEntry>,
     cursor_prev_pos: Option<(i32, i32)>,
-    cow: Option<super::store::DrawableId>,
     // Phase 2.6 — host xid of the materialized Composite Overlay
     // Window, if any. The top-level walk uses this to mark the COW
     // top-level (and its descendants by recursion) with
     // `under_cow_subtree = true`, which in turn sets
     // `alpha_passthrough = true` on every emitted `CompositeDraw`.
     // `None` when the COW is not materialized (no compositor active
-    // or not yet claimed via GetOverlayWindow).
+    // or not yet claimed via GetOverlayWindow). Phase 2.7 replaced
+    // the prior `cow: Option<DrawableId>` arg: the COW now emits
+    // via the normal top_level_order walk, not via a special
+    // post-walk append, so we only need the host xid to tag the
+    // walk's recursion flag — no DrawableId needed.
     cow_host_xid: Option<u32>,
     // Stage 5 Phase C — when `true`, the strategy picks `Hw` for
     // cursors that fit the plane and lie on-output; otherwise `Sw`.
@@ -1946,40 +1951,6 @@ fn build_scene(
             // draws inherit `alpha_passthrough = true`.
             Some(top_xid) == cow_host_xid,
         );
-    } else {
-        log::trace!(
-            "v2 scene_walk begin output={output_idx} cow_authoritative=false \
-             top_levels={n} order={order:?} \
-             layout=({layout_x0},{layout_y0} {layout_w}x{layout_h})",
-            n = core.top_level_order.len(),
-            order = core.top_level_order,
-        );
-        for &top_xid in &core.top_level_order {
-            emit_window_subtree(
-                top_xid,
-                0,
-                0,
-                store,
-                windows_v2,
-                &core.shape_bounding,
-                layout_x0,
-                layout_y0,
-                layout_w,
-                layout_h,
-                &mut draws,
-                &mut snapshots,
-                &mut sampled_ids,
-                &mut projected,
-                // Top-level windows start with no redirected ancestor;
-                // the flag flips on inside the recursion when entering
-                // a redirected window's subtree.
-                false,
-                // Phase 2.6 — flag the COW top-level (and its
-                // descendants, propagated by recursion) so emitted
-                // draws inherit `alpha_passthrough = true`.
-                Some(top_xid) == cow_host_xid,
-            );
-        }
     }
     log::trace!(
         "v2 scene_walk end output={output_idx} draws={n_draws} \
@@ -1988,11 +1959,14 @@ fn build_scene(
         n_sampled = sampled_ids.len(),
     );
 
-    // Stage 5 Phase C: pure cursor strategy decision. `build_scene`
-    // decides visibility + HW/SW assignment and reports the current
-    // clipped footprint, but it does NOT emit cursor damage. The
-    // tick owns that decision because it also owns the transactional
-    // "last successfully presented cursor footprint/version" state.
+    // Stage 5 Phase C: pure cursor strategy decision. Produces a
+    // `CursorAssignment`; the SW draw is appended only when the
+    // strategy picks `Sw` (HW assignment omits the draw entirely
+    // since the kernel overlay covers it). Trail elimination
+    // damage for the PRIOR SW rect runs unconditionally — even
+    // after a Sw → Hw transition, the next frame must clear stale
+    // SW pixels off the scanout BO (the prior SW position is the
+    // bottom of the now-vacated SW area).
     #[allow(clippy::cast_possible_truncation)]
     let (cursor_assignment, new_cursor_rect, cursor_record_version): (
         CursorAssignment,
@@ -3637,7 +3611,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             false,
         );
         let scene = built.scene;
@@ -3707,7 +3680,6 @@ mod tests {
             &windows_v2,
             0,
             &platform,
-            None,
             None,
             None,
             None,
@@ -3793,7 +3765,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             false,
         )
         .scene;
@@ -3864,7 +3835,6 @@ mod tests {
             0,
             &platform,
             Some(cursor),
-            None,
             None,
             None,
             false,
@@ -3971,7 +3941,6 @@ mod tests {
             &windows_v2,
             0,
             &platform,
-            None,
             None,
             None,
             None,
@@ -4096,7 +4065,6 @@ mod tests {
             &windows_v2,
             0,
             &platform,
-            None,
             None,
             None,
             None,
@@ -4243,7 +4211,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             false,
         );
         let scene = &built.scene;
@@ -4370,7 +4337,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             false,
         );
         let scene = &built.scene;
@@ -4493,7 +4459,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             false,
         );
         let scene = &built.scene;
@@ -4576,8 +4541,7 @@ mod tests {
             &platform,
             None, // no cursor in this fixture
             None,
-            None, // cow=None — legacy non-redirected path
-            None, // cow_host_xid — Phase 2.6
+            None, // cow_host_xid — Phase 2.6 (None = no compositor active)
             false,
         );
         let scene = &built.scene;
@@ -4683,8 +4647,7 @@ mod tests {
             &platform,
             Some(cursor),
             None,
-            None, // cow=None — legacy non-redirected path
-            None, // cow_host_xid — Phase 2.6
+            None, // cow_host_xid — Phase 2.6 (None = no compositor active)
             false,
         );
         let scene = &built.scene;
@@ -5180,104 +5143,5 @@ mod tests {
             cow_pos < stage_pos,
             "COW host draw precedes its stage child in the subtree recursion: cow={cow_pos} stage={stage_pos}",
         );
-    }
-
-    /// Phase 2.6 — `under_cow_subtree` recursion flag propagates
-    /// `alpha_passthrough = true` to every `CompositeDraw` emitted
-    /// inside the COW subtree (the COW top-level itself + all of its
-    /// descendants). Non-COW top-levels (the no-compositor path)
-    /// emit with `alpha_passthrough = false`.
-    #[test]
-    fn cow_subtree_draws_inherit_alpha_passthrough_true() {
-        let mut core = KmsCore::for_tests();
-        let mut store = DrawableStore::new();
-        let platform = PlatformBackend::for_tests();
-        let mut windows_v2 = super::super::backend::WindowsV2Map::new();
-
-        // Non-COW top-level W @ (0, 0), 200×200.
-        alloc_stub_window(
-            &mut store,
-            &mut windows_v2,
-            0xA1,
-            0,
-            0,
-            200,
-            200,
-            None,
-            true,
-        );
-        core.top_level_order.push(0xA1);
-
-        // COW host xid @ (0, 0), 800×600 — matches PlatformBackend::for_tests output.
-        let cow_xid: u32 = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
-        alloc_stub_window(
-            &mut store,
-            &mut windows_v2,
-            cow_xid,
-            0,
-            0,
-            800,
-            600,
-            None,
-            true,
-        );
-        core.top_level_order.push(cow_xid);
-
-        // Compositor stage as child of COW @ (0, 0), 800×600.
-        alloc_stub_window(
-            &mut store,
-            &mut windows_v2,
-            0xB1,
-            0,
-            0,
-            800,
-            600,
-            Some(cow_xid),
-            true,
-        );
-
-        let built = build_scene(
-            &core,
-            &mut store,
-            &windows_v2,
-            0,
-            &platform,
-            None,
-            None,
-            None,
-            Some(cow_xid),
-            false,
-        );
-        let scene = &built.scene;
-
-        // The non-COW W (200×200) must have alpha_passthrough=false.
-        let w_draw = scene
-            .draws
-            .iter()
-            .find(|d| d.dst_size == [200.0, 200.0])
-            .expect("W draw present");
-        assert!(
-            !w_draw.alpha_passthrough,
-            "non-COW top-level uses opaque blend (alpha_passthrough=false)",
-        );
-
-        // COW + stage (both 800×600) must have alpha_passthrough=true.
-        let cow_or_stage_draws: Vec<_> = scene
-            .draws
-            .iter()
-            .filter(|d| d.dst_size == [800.0, 600.0])
-            .collect();
-        assert!(
-            !cow_or_stage_draws.is_empty(),
-            "COW and stage emitted: {:?}",
-            scene.draws,
-        );
-        for d in cow_or_stage_draws {
-            assert!(
-                d.alpha_passthrough,
-                "COW subtree draw must have alpha_passthrough=true: {:?}",
-                d,
-            );
-        }
     }
 }
