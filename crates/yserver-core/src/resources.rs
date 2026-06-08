@@ -4797,6 +4797,7 @@ mod tests {
         let root = t.window(ROOT_WINDOW).unwrap();
         assert_eq!(cow_aware_top_index(root), root.children.len() - 1);
     }
+<<<<<<< HEAD
 
     #[test]
     fn create_window_with_cow_present_inserts_below_cow() {
