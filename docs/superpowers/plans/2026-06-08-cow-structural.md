@@ -1327,62 +1327,87 @@ to adjust as needed; the default matches Xorg's compositor convention."
 
 ---
 
-### Task 2.9: Update `hit_test_children` to descend through COW
+### Task 2.9: Drop the pre-Phase-2 special case in `hit_test_children`
 
 **Files:**
 - Modify: `crates/yserver-core/src/server.rs` (line ~1791 — `hit_test_children`)
 - Test: same file's tests mod
 
-Current code has a special case at line 1799-1807: when COW isn't in root.children but exists as a resource with host_xid, hit-test it specially. With Phase 2 COW IS in root.children, so that special case must change shape: when iterating root.children and we hit COW, recurse into its descendants — don't return COW itself.
+**Strict Xorg approach** (decided 2026-06-09): once the COW is in `root.children` (Phase 2 materialization), the existing `window_input_contains` gate inside `hit_test_child` (server.rs:1835) is sufficient. With Task 2.8's default empty input shape, `hit_test_child(COW)` returns `None`, and the iteration falls through to the next sibling — exactly matching Xorg's `miSpriteTrace` (`in_input_shape → descend firstChild; else → nextSib`).
 
-- [ ] **Step 1: Add a failing test**
+We therefore **delete** the pre-Phase-2 special case (1799-1808) and add **no replacement**. The COW becomes just another root child, distinguished only by the (compositor-managed) input region.
+
+If a compositor explicitly populates the COW's input region via `XFIXES SetWindowShapeRegion`, `hit_test_child(COW)` returns the COW (or recurses via the normal nested loop in `pointer_target_at_inner` if a descendant matches). No COW-special code path required.
+
+- [ ] **Step 1: Add a failing test (strict-Xorg shape)**
 
 ```rust
     #[test]
-    fn root_hit_test_does_not_return_cow_but_reaches_descendants() {
+    fn cow_with_empty_input_shape_passes_clicks_to_sibling_below() {
         let mut state = ServerState::new();
+
+        // Non-COW sibling at (0,0) 800x600, default (full) input shape.
+        let sib = ResourceId(0x0010_0080);
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24, window: sib, parent: ROOT_WINDOW,
+                x: 0, y: 0, width: 800, height: 600, border_width: 0,
+                class: 1, visual: ROOT_VISUAL, ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(sib);
+
+        // Materialize COW (full-screen, empty input shape per Task 2.8).
         let host_xid = WindowHandle::from_raw_panicking(0x4000_0103);
         state.resources.materialize_cow_resource(host_xid);
         state.materialize_cow_input_shape();
 
-        // Add a stage child of COW at (10, 10), 100x100 with default
-        // (full) input shape.
+        // Click at (50, 50): inside both sibling and COW geometry. COW's
+        // empty input shape → hit_test_child(COW) = None → iteration
+        // falls through to `sib`.
+        let (target, _, _) = state.root_pointer_target_at(50, 50)
+            .expect("trace hits sibling below COW");
+        assert_eq!(target, sib,
+            "empty COW input shape must let clicks through to sibling below");
+    }
+
+    #[test]
+    fn cow_with_non_empty_input_shape_descends_into_stage() {
+        let mut state = ServerState::new();
+
+        let host_xid = WindowHandle::from_raw_panicking(0x4000_0103);
+        state.resources.materialize_cow_resource(host_xid);
+        // Compositor populates COW input shape covering the stage region.
+        state.shape_windows.entry(COMPOSITE_OVERLAY_WINDOW).or_default().input =
+            Some(vec![Rectangle { x: 0, y: 0, width: 800, height: 600 }]);
+
         let stage = ResourceId(0x0010_0050);
         state.resources.create_window(
             ClientId(1),
             CreateWindowRequest {
-                depth: 24,
-                window: stage,
-                parent: COMPOSITE_OVERLAY_WINDOW,
-                x: 10, y: 10, width: 100, height: 100,
-                border_width: 0,
-                class: 1,
-                visual: ROOT_VISUAL,
-                ..Default::default()
+                depth: 24, window: stage, parent: COMPOSITE_OVERLAY_WINDOW,
+                x: 10, y: 10, width: 100, height: 100, border_width: 0,
+                class: 1, visual: ROOT_VISUAL, ..Default::default()
             },
         );
         let _ = state.resources.map_window(stage);
 
-        // Click inside the stage region — should resolve to stage, NOT COW.
         let (target, _, _) = state.root_pointer_target_at(50, 50)
-            .expect("hit somewhere");
-        assert_eq!(target, stage, "click inside stage region must resolve to stage");
-
-        // Click outside any descendant but inside COW's geometry — should
-        // resolve to ROOT_WINDOW (the COW is click-through; nothing else
-        // covers the point).
-        let (target, _, _) = state.root_pointer_target_at(700, 500)
             .expect("hit");
-        assert_ne!(target, COMPOSITE_OVERLAY_WINDOW,
-            "COW must never be the direct pointer target");
+        assert_eq!(target, stage,
+            "non-empty COW input shape lets the trace descend to stage");
     }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+Match `Rectangle`'s actual type/field names from the surrounding code — adjust if the project uses a different type for shape rects (e.g., `ShapeRect`).
 
-Expected: FAIL — current code returns COW directly when point is inside its bounds (whether through the special case or, post-Phase-2, the normal children iteration).
+- [ ] **Step 2: Run tests to verify they fail**
 
-- [ ] **Step 3: Patch `hit_test_children`**
+Run: `cargo test -p yserver-core --lib server::tests::cow_with_`
+Expected: FAIL — the pre-Phase-2 special-case branch fires (COW not in children) but its hit semantics don't match these strict-Xorg expectations; the empty-input-shape test in particular fails because `hit_test_child(COW)` correctly returns `None` but the iteration's first child is still `sib`, so the test may pass for the wrong reason. Read the failure message and adjust if needed before patching.
+
+- [ ] **Step 3: Patch `hit_test_children` — delete-only**
 
 Replace the current implementation:
 
@@ -1425,24 +1450,17 @@ With:
         x: i16,
         y: i16,
     ) -> Option<(ResourceId, i16, i16)> {
+        // Strict-Xorg miSpriteTrace: iterate children top-to-bottom and
+        // let hit_test_child's window_input_contains gate decide each one.
+        // The COW is no longer special once it's a real root child
+        // (Phase 2 materialization). With its default empty input shape,
+        // hit_test_child(COW) returns None and the trace continues to
+        // the next sibling — exactly matching Xorg's mi/misprite.c.
+        // When a compositor populates the COW input region via XFIXES,
+        // the gate descends naturally via pointer_target_at_inner's
+        // recursive walk.
         let parent_window = self.resources.window(parent)?;
-
         for child_id in parent_window.children.iter().rev() {
-            // COW is click-through: descend into its subtree but never
-            // return the COW itself as the hit. Mirrors Xorg's
-            // CompositeRealChildHead behavior — the COW shapes where
-            // other windows land in the stack but doesn't become a
-            // direct pointer target.
-            if *child_id == COMPOSITE_OVERLAY_WINDOW {
-                if let Some(cow) = self.resources.window(COMPOSITE_OVERLAY_WINDOW) {
-                    let cx = x.wrapping_sub(cow.x);
-                    let cy = y.wrapping_sub(cow.y);
-                    if let Some(hit) = self.hit_test_children(COMPOSITE_OVERLAY_WINDOW, cx, cy) {
-                        return Some(hit);
-                    }
-                }
-                continue;
-            }
             if let Some(hit) = self.hit_test_child(*child_id, x, y) {
                 return Some(hit);
             }
@@ -1451,119 +1469,78 @@ With:
     }
 ```
 
-(Note: the recursion descends into COW's children directly without going through `hit_test_child` on COW itself, because `hit_test_child` would return None for COW with empty input shape OR would otherwise return COW as the hit. The recursive `hit_test_children(COW, ...)` call walks COW's children.)
-
 - [ ] **Step 4: Run hit-test tests**
 
-Run: `cargo test -p yserver-core --lib server::tests::root_hit_test`
-Expected: PASS — new test + any pre-existing root_hit_test_* tests. Some pre-existing tests (like `root_hit_test_reaches_overlay_child_without_querytree_child`) may need updates because they relied on the old "COW not in children" assumption. Update them to set up the post-materialization state (COW in `root.children`).
+Run: `cargo test -p yserver-core --lib server::tests::root_hit_test server::tests::cow_with_`
+Expected: PASS — new tests + any pre-existing `root_hit_test_*` tests. Pre-existing tests like `root_hit_test_reaches_overlay_child_without_querytree_child` and `root_hit_test_skips_overlay_when_input_shape_is_empty` were written against the pre-Phase-2 "COW not in children" shape; update them to set up the post-materialization state (call `materialize_cow_resource` + `materialize_cow_input_shape`) and re-assert against the strict-Xorg semantics. Any test that still depends on the deleted special-case branch — delete it; the equivalent post-Phase-2 behavior is covered by the new tests.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add crates/yserver-core/src/server.rs
-git commit -m "input: COW is click-through; hit-test descends but doesn't stop on it
+git commit -m "input: strict-Xorg hit-test; delete pre-Phase-2 COW special case
 
-Replaces the pre-Phase-2 'COW not in children, hit-test it specially'
-branch with the post-Phase-2 'COW is in children, recurse into its
-subtree but skip it as a hit target' behavior. Reachable descendants
-(compositor stage etc.) still get input; clicks where no descendant
-covers reach the non-COW siblings via the normal walk."
+Once the COW is materialized as a real root child (Phase 2), the
+existing window_input_contains gate in hit_test_child gives Xorg-
+faithful semantics for free. Empty default input shape (Task 2.8)
+makes hit_test_child(COW) return None; the iteration falls through
+to the next sibling — exactly Xorg's miSpriteTrace
+('in_input_shape → descend firstChild; else → nextSib').
+
+Compositors that want stage clicks set a non-empty COW input region
+via XFIXES SetWindowShapeRegion; the gate then descends into the
+stage naturally. No COW-special branch required.
+
+Rejected alternative: COW-special 'always descend' — would steal
+clicks from siblings whenever compositor sets empty input shape
+expecting pass-through."
 ```
 
 ---
 
-### Task 2.10: Make `direct_child_at` skip COW in root iteration
+### Task 2.10: Delete the dead `resources::direct_child_at`
 
 **Files:**
-- Modify: `crates/yserver-core/src/resources.rs` (line ~1172 — `direct_child_at`)
-- Test: same file's tests mod
+- Modify: `crates/yserver-core/src/resources.rs` (line ~1172 — `direct_child_at`; delete the function)
+- Test: same file's tests mod (delete any tests that exercise the deleted function)
 
-The function returns the topmost direct child of `parent` whose bounds contain the point. Used by QueryPointer-style protocol queries to populate the `child` field. Per Xorg's `CompositeRealChildHead` (`compwindow.c:761-792`), the COW is skipped when computing root's "real children" for stacking + child-selection queries: clients see the next non-COW direct child of root, not the COW itself.
+**Strict Xorg approach** (decided 2026-06-09): the canonical `direct_child_at` callers (`server.rs` + tests; `core_loop/process_request.rs` for QueryPointer / XIQueryPointer; `core_loop/key_fanout.rs` for PointerRoot key delivery) all go through `ServerState::direct_child_at` (`crates/yserver-core/src/server.rs:1754`), which delegates to `hit_test_children` and inherits the strict-Xorg input-shape gating from Task 2.9. The separate `ResourceTable::direct_child_at` (resources.rs:~1172) has **no callers** project-wide (`grep -n direct_child_at crates/` shows the lone resources-level definition plus the server-level definition; only the latter is invoked).
 
-This is a SEPARATE code path from `hit_test_children` (Task 2.9). The two have different semantics:
-- `hit_test_children` (input dispatch): COW is click-through; recurse INTO its subtree to find a descendant that should receive the event.
-- `direct_child_at` (protocol query): COW is invisible to root's child-selection; return the next non-COW direct child (no descent).
+Leaving the dead function in place is a footgun: a future change could route a caller to it and silently bypass the input-shape gate (returning the COW for clicks inside its geometric bounds regardless of the compositor's input region). Delete it.
 
-Both treatments are correct per Xorg and the spec.
+- [ ] **Step 1: Confirm no callers**
 
-- [ ] **Step 1: Add a failing test**
+Run: `grep -rn '\.direct_child_at\b\|resources\.direct_child_at\|table\.direct_child_at' crates/ --include='*.rs'`
 
-```rust
-    #[test]
-    fn direct_child_at_root_skips_cow_returning_next_non_cow_child() {
-        let mut t = ResourceTable::new();
-        // Non-COW top-level W at (0, 0), 100x100, mapped.
-        make_child(&mut t, 0x200, ROOT_WINDOW.0, 0, 0);
-        let _ = t.map_window(ResourceId(0x200));
-        // Materialize COW at top of root (full screen 800x600 in this fixture).
-        let host_xid = WindowHandle::from_raw_panicking(0x4000_0103);
-        t.materialize_cow_resource(host_xid);
+Expected: every result is a method call on `state` / `ServerState` / `self` (in `server.rs`) — i.e., the server-level function. No call goes through `ResourceTable`. If a call site appears that DOES target the resources-level function, **stop and report BLOCKED** — the analysis behind this task is wrong and we need to rethink.
 
-        // Click at (50, 50): inside W AND inside COW. With COW skipped from
-        // root child iteration, the topmost-matching non-COW child is W.
-        assert_eq!(t.direct_child_at(ROOT_WINDOW, 50, 50), Some(ResourceId(0x200)));
+- [ ] **Step 2: Delete the function and any tests that target it**
 
-        // Click at (700, 500): outside W, inside COW. With COW skipped,
-        // no direct child of root matches.
-        assert_eq!(t.direct_child_at(ROOT_WINDOW, 700, 500), None);
-    }
-```
+In `crates/yserver-core/src/resources.rs` around line 1172, delete the entire `pub fn direct_child_at(...)` definition.
 
-- [ ] **Step 2: Run test to verify it fails**
+In the same file's `tests` mod, delete any tests that call `t.direct_child_at(...)` (where `t: ResourceTable`). The server-level coverage in `server.rs::tests` is the authoritative test bed and is updated in Task 2.9.
 
-Expected: FAIL — current code returns COW (it's topmost in `children.iter().rev()`, contains the point).
+- [ ] **Step 3: Build to verify nothing depended on the deleted function**
 
-- [ ] **Step 3: Patch `direct_child_at`**
+Run: `cargo build --locked 2>&1 | head -20`
+Expected: green. If a caller surfaces, it was missed by Step 1's grep — route it through `ServerState::direct_child_at` (which already exists and delegates correctly).
 
-In `crates/yserver-core/src/resources.rs` around line 1172:
+- [ ] **Step 4: Run resources tests**
 
-```rust
-    pub fn direct_child_at(&self, parent: ResourceId, x: i16, y: i16) -> Option<ResourceId> {
-        let parent_window = self.windows.get(&parent.0)?;
-        for child_id in parent_window.children.iter().rev() {
-            // Skip COW in root's iteration — protocol-query semantics
-            // (QueryPointer.child et al.) mirror Xorg's
-            // CompositeRealChildHead: clients see the next non-COW
-            // direct child of root, not the COW itself.
-            if parent == ROOT_WINDOW && *child_id == COMPOSITE_OVERLAY_WINDOW {
-                continue;
-            }
-            let child = self.windows.get(&child_id.0)?;
-            if child.map_state == MapState::Unmapped {
-                continue;
-            }
-            let cx = x.wrapping_sub(child.x);
-            let cy = y.wrapping_sub(child.y);
-            if cx < 0
-                || cy < 0
-                || cx >= i16::try_from(child.width).unwrap_or(i16::MAX)
-                || cy >= i16::try_from(child.height).unwrap_or(i16::MAX)
-            {
-                continue;
-            }
-            return Some(*child_id);
-        }
-        None
-    }
-```
-
-- [ ] **Step 4: Run test**
-
-Run: `cargo test -p yserver-core --lib resources::tests::direct_child_at`
-Expected: PASS — new test + pre-existing `direct_child_at_*` tests. Some pre-existing tests may need updates if they used `direct_child_at(ROOT_WINDOW, ...)` with the COW expected as a result; for those, materialize the COW separately and update the assertion.
+Run: `cargo test -p yserver-core --lib resources::tests`
+Expected: PASS (deletion didn't break anything else).
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add crates/yserver-core/src/resources.rs
-git commit -m "resources: direct_child_at on root skips COW (CompositeRealChildHead)
+git commit -m "resources: drop the dead ResourceTable::direct_child_at
 
-Mirrors Xorg's compwindow.c:761-792. Protocol-query callers
-(QueryPointer.child etc.) see the next non-COW direct child of root,
-matching Xorg's CompositeRealChildHead behavior. Separate from
-server.rs::hit_test_children (Task 2.9) which has different semantics
-for input dispatch (descend into COW subtree)."
+All callers route through ServerState::direct_child_at (server.rs:1754),
+which delegates to hit_test_children and inherits strict-Xorg input-
+shape gating. The resources-level version had no callers and would
+have silently bypassed the input-shape check if anyone wired into it.
+Deleting it removes the footgun."
 ```
 
 ---

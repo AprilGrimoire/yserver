@@ -129,17 +129,35 @@ There should be no state where only some of those are true.
 
 Input semantics are part of materialization, not a follow-up. A
 fullscreen mapped COW at the top of root would otherwise catch every
-root hit-test. The materialized COW therefore must be click-through:
+root hit-test. The materialized COW therefore defaults to
+click-through, using **strict Xorg `miSpriteTrace` semantics**:
 
-- its default input shape is empty, matching the Xorg/compositor model
-- root hit-testing must never return the COW itself as the pointer
-  target
-- hit-testing must still descend into COW descendants, so compositor
-  children like the stage remain reachable
+- its default input shape is empty
+- root hit-testing reuses the existing `window_input_contains` gate
+  in `hit_test_child` — no COW-special branch
+- with empty input shape, `hit_test_child(COW)` returns `None`; the
+  trace falls through to the next sibling below COW, exactly like
+  Xorg's `mi/misprite.c` (`in_input_shape → descend firstChild;
+  else → nextSib, never into the transparent window's children`)
+- when a compositor explicitly populates the COW's input region via
+  `XFIXES SetWindowShapeRegion`, the gate naturally descends into
+  the COW's descendants (the compositor's stage etc.); the COW
+  itself becomes a valid pointer target only when its input shape
+  contains the point AND no descendant matches
 
-In practice this means `direct_child_at` / `hit_test_children` must
-treat the COW as a transparent container: descend through it when a
-descendant matches, but never stop on the COW itself.
+The pre-Phase-2 "COW not in children" special-case branch in
+`hit_test_children` can be deleted with no replacement — once the
+COW is a real root child, the generic input-shape gate is sufficient.
+This is the deliberate **Strict Xorg** choice (rejected alternative:
+COW-special "always descend through COW regardless of input shape").
+
+Open follow-up: input-shape tracking on the COW relies on the
+generic XFIXES `SetWindowShapeRegion` path landing in
+`shape_windows[COW].input` correctly. The earlier yserver-vs-Xorg
+input-shape divergence is tracked separately and not in scope for
+this spec, but is the most likely failure mode if a real compositor
+sets a non-empty COW input region and the trace doesn't reach the
+expected descendants.
 
 ### 2. Remove the missing-parent fallback
 
