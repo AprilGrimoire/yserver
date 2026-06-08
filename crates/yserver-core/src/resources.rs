@@ -4884,7 +4884,6 @@ mod tests {
             "0x200 must land just below COW (capped)"
         );
     }
-
     #[test]
     fn reparent_to_root_with_cow_present_lands_below_cow() {
         let mut t = ResourceTable::new();
