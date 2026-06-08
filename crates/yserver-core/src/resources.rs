@@ -529,11 +529,12 @@ impl ResourceTable {
             redirected_backing: None,
         };
 
-        self.windows
+        let parent_entry = self
+            .windows
             .entry(request.parent.0)
-            .or_insert_with(|| Window::placeholder(request.parent))
-            .children
-            .push(request.window);
+            .or_insert_with(|| Window::placeholder(request.parent));
+        let insert_at = cow_aware_top_index(parent_entry);
+        parent_entry.children.insert(insert_at, request.window);
         self.windows.insert(request.window.0, window);
     }
 
@@ -4676,5 +4677,27 @@ mod tests {
             .push(COMPOSITE_OVERLAY_WINDOW);
         let root = t.window(ROOT_WINDOW).unwrap();
         assert_eq!(cow_aware_top_index(root), root.children.len() - 1);
+    }
+
+    #[test]
+    fn create_window_with_cow_present_inserts_below_cow() {
+        let mut t = ResourceTable::new();
+        t.windows
+            .get_mut(&ROOT_WINDOW.0)
+            .unwrap()
+            .children
+            .push(COMPOSITE_OVERLAY_WINDOW);
+        make_child(&mut t, 0x500, ROOT_WINDOW.0, 0, 0);
+        let kids = &t.window(ROOT_WINDOW).unwrap().children;
+        assert_eq!(
+            kids.last().copied(),
+            Some(COMPOSITE_OVERLAY_WINDOW),
+            "COW must stay at top after create_window"
+        );
+        assert_eq!(
+            kids[kids.len() - 2],
+            ResourceId(0x500),
+            "new top-level lands just below COW"
+        );
     }
 }
