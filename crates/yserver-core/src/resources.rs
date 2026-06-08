@@ -4850,7 +4850,6 @@ mod tests {
             ]
         );
     }
-
     #[test]
     fn restack_above_cow_caps_to_just_below_cow() {
         let mut t = ResourceTable::new();
