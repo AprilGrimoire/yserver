@@ -13022,8 +13022,15 @@ fn handle_reparent_window(
                 .map(|h| h.as_raw())
         };
         if let Some(host_parent) = new_host_parent {
-            let _ =
-                backend.reparent_subwindow(origin, xid.as_raw(), host_parent, result.x, result.y);
+            let child = xid.as_raw();
+            if let Err(e) =
+                backend.reparent_subwindow(origin, child, host_parent, result.x, result.y)
+            {
+                panic!(
+                    "reparent_subwindow failed after protocol validation: child=0x{child:x} \
+                     parent=0x{host_parent:x}: {e}"
+                );
+            }
         }
         if result.old_parent == ROOT_WINDOW && result.new_parent != ROOT_WINDOW {
             let _ = backend.update_host_event_mask(
