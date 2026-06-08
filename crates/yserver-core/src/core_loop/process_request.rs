@@ -4293,6 +4293,7 @@ fn handle_composite_request(
                 state.resources.materialize_cow_resource(
                     crate::backend::WindowHandle::from_raw_panicking(cow_host_xid),
                 );
+                state.materialize_cow_input_shape();
             }
             debug!(
                 "client {} #{} COMPOSITE::GetOverlayWindow -> 0x{:x}",
@@ -4339,6 +4340,7 @@ fn handle_composite_request(
             };
             if was_one_to_zero {
                 state.resources.destroy_cow_resource();
+                state.destroy_cow_input_shape();
             }
         }
         other => {

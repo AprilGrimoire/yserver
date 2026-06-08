@@ -1721,6 +1721,27 @@ pub struct EventTarget {
 }
 
 impl ServerState {
+    /// Stage 4e — set the COW's input shape to empty (click-through) at
+    /// materialization. Mirrors Xorg's compositor convention where the
+    /// COW's default input region passes pointer events through to
+    /// underlying root children, with descendants like the compositor's
+    /// stage receiving input directly.
+    ///
+    /// Pairs with `ResourceTable::materialize_cow_resource` — both run
+    /// from the `GetOverlayWindow` handler on the 0→1 transition.
+    pub fn materialize_cow_input_shape(&mut self) {
+        self.shape_windows
+            .entry(COMPOSITE_OVERLAY_WINDOW)
+            .or_default()
+            .input = Some(Vec::<xfixes::RegionRect>::new());
+    }
+
+    /// Symmetric teardown for [`Self::materialize_cow_input_shape`]. Called
+    /// from the `ReleaseOverlayWindow` handler on the 1→0 transition.
+    pub fn destroy_cow_input_shape(&mut self) {
+        self.shape_windows.remove(&COMPOSITE_OVERLAY_WINDOW);
+    }
+
     fn event_target_for_client(client: &ClientState) -> EventTarget {
         EventTarget {
             writer: client.writer.clone(),
@@ -4245,6 +4266,30 @@ mod tests {
         let button_press_mask: u32 = 0x0000_0004;
         let result = state.pointer_propagation_target(child, 10, 10, button_press_mask);
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn cow_default_input_shape_is_empty() {
+        use crate::resources::COMPOSITE_OVERLAY_WINDOW;
+
+        let mut state = ServerState::new();
+        let host_xid = crate::backend::WindowHandle::from_raw_panicking(0x4000_0103);
+        state.resources.materialize_cow_resource(host_xid);
+        state.materialize_cow_input_shape();
+
+        let shape = state
+            .shape_windows
+            .get(&COMPOSITE_OVERLAY_WINDOW)
+            .expect("COW must have a shape_windows entry after materialization");
+        assert!(
+            shape.input.is_some(),
+            "COW must have a non-default input shape (set, but empty)"
+        );
+        assert_eq!(
+            shape.input.as_ref().unwrap().len(),
+            0,
+            "COW's default input shape rects are empty (click-through)"
+        );
     }
 
     #[test]
