@@ -10487,6 +10487,7 @@ impl Backend for KmsBackendV2 {
         }
         self.cow_id = Some(id);
         self.core.cow_refcount = 1;
+        self.arm_cow_from_recent_present_if_needed();
 
         // Phase 2 Task 2.2 — also materialize the backend's window-
         // tree projection so the COW participates in build_scene /
@@ -22444,7 +22445,6 @@ mod tests {
             "cow_host_xid getter returns None after final release"
         );
     }
-
     /// Frame tick: advances mod n, re-arms relative, mints strictly
     /// increasing versions across a full wraparound (XFixes serial
     /// contract — naive Arc-swapping would repeat v1,v2,v1).
