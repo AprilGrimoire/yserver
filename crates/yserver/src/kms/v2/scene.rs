@@ -1389,12 +1389,15 @@ fn tick_one_output(
     let hw_available = platform.cursor_plane_available();
     let hw_can_run = hw_strategy_enabled && hw_available;
     let prev_mode = inner.outputs[output_idx].last_frame_cursor_mode;
-    // Phase 2.6 — derive the COW host xid from the scene-registered
-    // `cow: Option<DrawableId>`. After Phase 2.2/2.5, the COW's host
-    // xid is the well-known protocol constant whenever the backend
-    // has materialized the overlay. Both Drawable and host-xid views
-    // come up + go down together; we just need one bool's worth of
-    // info to flag the COW top-level in the walk.
+    // Phase 2.6/2.7 — derive the COW host xid from the scene-
+    // registered `cow: Option<DrawableId>`. After Phase 2.2/2.5,
+    // the COW's host xid is the well-known protocol constant
+    // whenever the backend has materialized the overlay. Both
+    // Drawable and host-xid views come up + go down together; we
+    // just need one bool's worth of info to flag the COW top-level
+    // in the walk. The DrawableId itself is no longer threaded —
+    // Phase 2.7 deleted the special post-walk COW append, and the
+    // COW now emits via the normal top_level_order recursion.
     let cow_host_xid = cow.map(|_| yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0);
     let built = build_scene(
         core,
@@ -1404,7 +1407,6 @@ fn tick_one_output(
         platform,
         inner.cursor.clone(),
         cursor_prev_pos_before,
-        cow,
         cow_host_xid,
         hw_can_run,
     );
@@ -1760,14 +1762,17 @@ fn build_scene(
     platform: &PlatformBackend,
     cursor: Option<CursorEntry>,
     cursor_prev_pos: Option<(i32, i32)>,
-    cow: Option<super::store::DrawableId>,
     // Phase 2.6 — host xid of the materialized Composite Overlay
     // Window, if any. The top-level walk uses this to mark the COW
     // top-level (and its descendants by recursion) with
     // `under_cow_subtree = true`, which in turn sets
     // `alpha_passthrough = true` on every emitted `CompositeDraw`.
     // `None` when the COW is not materialized (no compositor active
-    // or not yet claimed via GetOverlayWindow).
+    // or not yet claimed via GetOverlayWindow). Phase 2.7 replaced
+    // the prior `cow: Option<DrawableId>` arg: the COW now emits
+    // via the normal top_level_order walk, not via a special
+    // post-walk append, so we only need the host xid to tag the
+    // walk's recursion flag — no DrawableId needed.
     cow_host_xid: Option<u32>,
     // Stage 5 Phase C — when `true`, the strategy picks `Hw` for
     // cursors that fit the plane and lie on-output; otherwise `Sw`.
@@ -1835,67 +1840,45 @@ fn build_scene(
             }
         }
     }
-    // Stage 4d — COW-authoritative mode (option 2a from the
-    // shadow-hunt). Once a compositor has registered COW (i.e.
-    // `cow.is_some()` — set by `register_cow` on the first overlay
-    // `PresentPixmap`), the scene strips per-top-level entries.
-    // Scanout becomes `root + COW + cursor` only, mirroring Xorg's
-    // compositor contract: the X server doesn't itself compose
-    // redirected toplevels; the compositor reads the redirected
-    // backings, composes, and Presents the result into COW.
-    //
-    // Emitting top-levels alongside COW in v2 invented a layered-
-    // damage model that turned every gap (missed projection, off-
-    // by-one ancestor walk, ack timing, scene_participating gate)
-    // into a visible artefact. Skipping the walk removes that
-    // whole class of failure.
-    //
-    // `cow.is_none()` covers two cases that must still emit top-
-    // levels: (1) no compositor active, scene must drive the
-    // display itself; (2) compositor active but hasn't painted
-    // into COW yet, so the initial frame isn't a blank screen.
-    if cow.is_some() {
-        log::trace!(
-            "v2 scene_walk begin output={output_idx} cow_authoritative=true \
-             top_levels_skipped={n} order={order:?} \
-             layout=({layout_x0},{layout_y0} {layout_w}x{layout_h})",
-            n = core.top_level_order.len(),
-            order = core.top_level_order,
+    // Phase 2.7 — the COW emits via the normal top_level_order walk
+    // like any other root child. After Phase 2.2/2.5, the COW is a
+    // first-class entry in `windows_v2` + `top_level_order`; the
+    // walk's `under_cow_subtree` flag (Task 2.6) carries the
+    // alpha-passthrough semantic that the deleted post-walk append
+    // used to wire up. Mirrors Xorg's compositor contract: COW is
+    // a real root child stacked above the other top-levels.
+    log::trace!(
+        "v2 scene_walk begin output={output_idx} top_levels={n} order={order:?} \
+         cow_host_xid={cow_host_xid:?} \
+         layout=({layout_x0},{layout_y0} {layout_w}x{layout_h})",
+        n = core.top_level_order.len(),
+        order = core.top_level_order,
+    );
+    for &top_xid in &core.top_level_order {
+        emit_window_subtree(
+            top_xid,
+            0,
+            0,
+            store,
+            windows_v2,
+            &core.shape_bounding,
+            layout_x0,
+            layout_y0,
+            layout_w,
+            layout_h,
+            &mut draws,
+            &mut snapshots,
+            &mut sampled_ids,
+            &mut projected,
+            // Top-level windows start with no redirected ancestor;
+            // the flag flips on inside the recursion when entering
+            // a redirected window's subtree.
+            false,
+            // Phase 2.6 — flag the COW top-level (and its
+            // descendants, propagated by recursion) so emitted
+            // draws inherit `alpha_passthrough = true`.
+            Some(top_xid) == cow_host_xid,
         );
-    } else {
-        log::trace!(
-            "v2 scene_walk begin output={output_idx} cow_authoritative=false \
-             top_levels={n} order={order:?} \
-             layout=({layout_x0},{layout_y0} {layout_w}x{layout_h})",
-            n = core.top_level_order.len(),
-            order = core.top_level_order,
-        );
-        for &top_xid in &core.top_level_order {
-            emit_window_subtree(
-                top_xid,
-                0,
-                0,
-                store,
-                windows_v2,
-                &core.shape_bounding,
-                layout_x0,
-                layout_y0,
-                layout_w,
-                layout_h,
-                &mut draws,
-                &mut snapshots,
-                &mut sampled_ids,
-                &mut projected,
-                // Top-level windows start with no redirected ancestor;
-                // the flag flips on inside the recursion when entering
-                // a redirected window's subtree.
-                false,
-                // Phase 2.6 — flag the COW top-level (and its
-                // descendants, propagated by recursion) so emitted
-                // draws inherit `alpha_passthrough = true`.
-                Some(top_xid) == cow_host_xid,
-            );
-        }
     }
     log::trace!(
         "v2 scene_walk end output={output_idx} draws={n_draws} \
@@ -1903,62 +1886,6 @@ fn build_scene(
         n_draws = draws.len(),
         n_sampled = sampled_ids.len(),
     );
-
-    // Stage 4d: append the Composite Overlay Window draw entry
-    // ABOVE all top-levels but BELOW the cursor (Stage 4 plan
-    // §4d scene layering items 3 + 4). Position is (0, 0)
-    // absolute screen coords — projected onto the output by
-    // subtracting the layout origin, exactly like root storage
-    // above. `alpha_passthrough = true` because compositors
-    // paint their composited result here with alpha and the
-    // scene must blend it over the top-levels rather than
-    // force-opaque. Skip the entry cleanly when the storage
-    // isn't ready (null image_view from a stub fixture, or COW
-    // was unregistered between tick frames).
-    if let Some(cow_id) = cow
-        && let Some(drawable) = store.get(cow_id)
-        && drawable.scene_participating
-        && drawable.storage.image_view != vk::ImageView::null()
-    {
-        #[allow(clippy::cast_precision_loss)]
-        let dst_origin = [-(layout_x0 as f32), -(layout_y0 as f32)];
-        #[allow(clippy::cast_precision_loss)]
-        let dst_size = [
-            drawable.storage.extent.width as f32,
-            drawable.storage.extent.height as f32,
-        ];
-        // COW scene draw — bind the sample-side view so the
-        // compositor's xRGB-intent paint sees α=ONE through the
-        // shader (depth-24 BGRA8 padding bytes get force-opaque
-        // by the swizzle). Pre-fix the IDENTITY view leaked
-        // padding-α into the scene; with `alpha_passthrough=true`
-        // that blended the layer below through COW, matching the
-        // "wallpaper bleeds through marco/xfwm4 composited frame"
-        // hardware-smoke symptom.
-        let image_view = drawable.storage.sample_view;
-        draws.push(CompositeDraw {
-            image_view,
-            dst_origin,
-            dst_size,
-            src_origin: [0.0, 0.0],
-            src_size: [1.0, 1.0],
-            alpha_passthrough: true,
-        });
-        sampled_ids.push(cow_id);
-        if let Some(snap) = store.peek_presentation_damage(cow_id) {
-            for r in snap.region.rects() {
-                add_projected_damage(
-                    &mut projected,
-                    *r,
-                    -layout_x0,
-                    -layout_y0,
-                    layout_w,
-                    layout_h,
-                );
-            }
-            snapshots.push(snap);
-        }
-    }
 
     // Stage 5 Phase C: pure cursor strategy decision. Produces a
     // `CursorAssignment`; the SW draw is appended only when the
@@ -3526,7 +3453,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             false,
         );
         let scene = built.scene;
@@ -3596,7 +3522,6 @@ mod tests {
             &windows_v2,
             0,
             &platform,
-            None,
             None,
             None,
             None,
@@ -3682,7 +3607,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             false,
         )
         .scene;
@@ -3753,7 +3677,6 @@ mod tests {
             0,
             &platform,
             Some(cursor),
-            None,
             None,
             None,
             false,
@@ -3860,7 +3783,6 @@ mod tests {
             &windows_v2,
             0,
             &platform,
-            None,
             None,
             None,
             None,
@@ -3985,7 +3907,6 @@ mod tests {
             &windows_v2,
             0,
             &platform,
-            None,
             None,
             None,
             None,
@@ -4127,7 +4048,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             false,
         );
         let scene = &built.scene;
@@ -4264,7 +4184,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             false,
         );
         let scene = &built.scene;
@@ -4381,7 +4300,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             false,
         );
         let scene = &built.scene;
@@ -4461,8 +4379,7 @@ mod tests {
             &platform,
             None, // no cursor in this fixture
             None,
-            None, // cow=None — legacy non-redirected path
-            None, // cow_host_xid — Phase 2.6
+            None, // cow_host_xid — Phase 2.6 (None = no compositor active)
             false,
         );
         let scene = &built.scene;
@@ -4568,8 +4485,7 @@ mod tests {
             &platform,
             Some(cursor),
             None,
-            None, // cow=None — legacy non-redirected path
-            None, // cow_host_xid — Phase 2.6
+            None, // cow_host_xid — Phase 2.6 (None = no compositor active)
             false,
         );
         let scene = &built.scene;
@@ -4593,199 +4509,6 @@ mod tests {
             scene.draws[0].dst_size,
             [400.0, 300.0],
             "top-level must be below cursor",
-        );
-    }
-
-    #[test]
-    fn build_scene_cow_some_strips_top_levels_and_keeps_cursor_at_top() {
-        // Phase 1 (2a): when a compositor has registered COW, the scene
-        // strips per-top-level entries — scanout becomes root + COW
-        // (+ cursor) only. Mirrors Xorg's compositor contract: the X
-        // server doesn't compose redirected toplevels itself; the
-        // compositor reads backings, composes, and Presents into COW.
-        // Cursor stays at top-of-z (last in draws).
-
-        let mut core = KmsCore::for_tests();
-        let mut store = DrawableStore::new();
-        let platform = PlatformBackend::for_tests();
-        let mut windows_v2 = super::super::backend::WindowsV2Map::new();
-
-        // Two mapped top-levels with live storage (non-null sample
-        // views via alloc_stub_window's sentinel image_view) — under
-        // cow=None they would appear in draws. Under 2a they must NOT.
-        alloc_stub_window(
-            &mut store,
-            &mut windows_v2,
-            0x4000,
-            100,
-            100,
-            200,
-            150,
-            None,
-            true,
-        );
-        alloc_stub_window(
-            &mut store,
-            &mut windows_v2,
-            0x4001,
-            50,
-            50,
-            50,
-            50,
-            None,
-            true,
-        );
-        core.top_level_order.push(0x4000);
-        core.top_level_order.push(0x4001);
-        let top_a_id = store.lookup(0x4000).expect("top-level A allocated");
-        let top_b_id = store.lookup(0x4001).expect("top-level B allocated");
-
-        // Register COW: allocate stub storage with a sentinel
-        // image_view (so build_scene doesn't filter on the null-view
-        // gate) and call store.allocate directly — same pattern as
-        // the existing build_scene_cow_none_emits_top_levels test.
-        let mut cow_storage = super::super::store::Storage::for_tests_null(
-            extent(800, 600), // matches PlatformBackend::for_tests() output
-            vk::Format::B8G8R8A8_UNORM,
-        );
-        let cow_sentinel: ash::vk::ImageView = ash::vk::Handle::from_raw(0xC0_C0_C0_C0);
-        cow_storage.image_view = cow_sentinel;
-        cow_storage.sample_view = cow_sentinel;
-        let cow_id = store
-            .allocate(
-                yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0,
-                DrawableKind::Window,
-                24,
-                true, // scene_participating
-                cow_storage,
-            )
-            .expect("alloc COW stub");
-
-        // Cursor.
-        let mut cursor_storage = super::super::store::Storage::for_tests_null(
-            extent(16, 16),
-            vk::Format::B8G8R8A8_UNORM,
-        );
-        let cursor_sentinel: ash::vk::ImageView = ash::vk::Handle::from_raw(0xCAFE_BABE);
-        cursor_storage.image_view = cursor_sentinel;
-        cursor_storage.sample_view = cursor_sentinel;
-        let cursor_id = store
-            .allocate(0xCAFE_0003, DrawableKind::Pixmap, 32, false, cursor_storage)
-            .expect("alloc cursor stub");
-        core.cursor_x = 50.0;
-        core.cursor_y = 60.0;
-        let cursor = CursorEntry {
-            id: cursor_id,
-            extent: extent(16, 16),
-            hot_x: 0,
-            hot_y: 0,
-            record_version: 0,
-            bgra_bytes: None,
-        };
-
-        let built = build_scene(
-            &core,
-            &mut store,
-            &windows_v2,
-            0,
-            &platform,
-            Some(cursor),
-            None,
-            Some(cow_id),
-            Some(yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0),
-            false,
-        );
-
-        // Expect: COW + cursor only (root storage isn't allocated
-        // in this fixture so it doesn't contribute a draw). Pin all
-        // four invariants explicitly so the test catches each
-        // possible breakage shape:
-        //
-        //   (a) no top-level layer sneaks through;
-        //   (b) the COW layer IS emitted (a regression that emits
-        //       nothing but the cursor must fail this);
-        //   (c) the COW layer has the right shape (source view,
-        //       full-extent dst, alpha-passthrough on);
-        //   (d) cursor is last (i.e. immediately above COW).
-        let top_a_view = store
-            .get(top_a_id)
-            .expect("top_a present")
-            .storage
-            .sample_view;
-        let top_b_view = store
-            .get(top_b_id)
-            .expect("top_b present")
-            .storage
-            .sample_view;
-        let cow_view = store.get(cow_id).expect("cow present").storage.sample_view;
-        let cursor_view = store
-            .get(cursor_id)
-            .expect("cursor present")
-            .storage
-            .sample_view;
-
-        // (a)
-        let top_emit_count = built
-            .scene
-            .draws
-            .iter()
-            .filter(|d| d.image_view == top_a_view || d.image_view == top_b_view)
-            .count();
-        assert_eq!(
-            top_emit_count, 0,
-            "cow-authoritative mode must strip top-level draws, got {} of them in {:?}",
-            top_emit_count, built.scene.draws,
-        );
-
-        // (b) + (c): exactly one COW draw, full-extent, alpha-
-        // passthrough, sampling cow_sentinel.
-        let cow_draws: Vec<_> = built
-            .scene
-            .draws
-            .iter()
-            .filter(|d| d.image_view == cow_view)
-            .collect();
-        assert_eq!(
-            cow_draws.len(),
-            1,
-            "exactly one COW draw expected, got {} in {:?}",
-            cow_draws.len(),
-            built.scene.draws,
-        );
-        let cow_draw = cow_draws[0];
-        assert_eq!(
-            cow_draw.image_view, cow_sentinel,
-            "COW draw must sample cow_sentinel"
-        );
-        assert_eq!(
-            cow_draw.dst_origin,
-            [0.0, 0.0],
-            "COW dst_origin must be (0, 0)"
-        );
-        assert_eq!(
-            cow_draw.dst_size,
-            [800.0, 600.0],
-            "COW dst_size must be full output extent (800x600)"
-        );
-        assert!(
-            cow_draw.alpha_passthrough,
-            "COW must blend with alpha_passthrough=true"
-        );
-
-        // (d): cursor is the last draw, COW immediately precedes it.
-        assert!(
-            built.scene.draws.len() >= 2,
-            "expected at least COW + cursor"
-        );
-        let last = built.scene.draws.last().expect("at least one draw");
-        let penultimate = &built.scene.draws[built.scene.draws.len() - 2];
-        assert_eq!(
-            last.image_view, cursor_view,
-            "cursor must be the top (last) scene draw"
-        );
-        assert_eq!(
-            penultimate.image_view, cow_view,
-            "COW must be immediately below cursor",
         );
     }
 
@@ -4851,7 +4574,6 @@ mod tests {
             &platform,
             None,
             None,
-            None,
             Some(cow_xid),
             false,
         );
@@ -4886,5 +4608,61 @@ mod tests {
                 d,
             );
         }
+    }
+
+    /// Phase 2.7 — the COW must emit via the normal `top_level_order`
+    /// walk, NOT via a special post-walk append. With the COW as the
+    /// sole top-level, the scene contains exactly one draw sourced
+    /// from the COW's storage (alpha_passthrough=true from Task 2.6),
+    /// not two.
+    #[test]
+    fn build_scene_does_not_append_cow_after_top_level_walk() {
+        let mut core = KmsCore::for_tests();
+        let mut store = DrawableStore::new();
+        let platform = PlatformBackend::for_tests();
+        let mut windows_v2 = super::super::backend::WindowsV2Map::new();
+
+        let cow_xid: u32 = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+        alloc_stub_window(
+            &mut store,
+            &mut windows_v2,
+            cow_xid,
+            0,
+            0,
+            800,
+            600,
+            None,
+            true,
+        );
+        core.top_level_order.push(cow_xid);
+
+        let built = build_scene(
+            &core,
+            &mut store,
+            &windows_v2,
+            0,
+            &platform,
+            None,
+            None,
+            Some(cow_xid),
+            false,
+        );
+        let scene = &built.scene;
+
+        let cow_draws: Vec<_> = scene
+            .draws
+            .iter()
+            .filter(|d| d.dst_size == [800.0, 600.0])
+            .collect();
+        assert_eq!(
+            cow_draws.len(),
+            1,
+            "exactly one COW draw — no special append on top of top_level_order walk; got {:?}",
+            scene.draws,
+        );
+        assert!(
+            cow_draws[0].alpha_passthrough,
+            "COW draw still has alpha_passthrough=true",
+        );
     }
 }
