@@ -4990,7 +4990,6 @@ mod tests {
                 .contains(&COMPOSITE_OVERLAY_WINDOW)
         );
     }
-
     #[test]
     fn reparent_cow_under_its_own_descendant_is_bad_match() {
         // Materialize COW (child of root), then create a child C under COW.
