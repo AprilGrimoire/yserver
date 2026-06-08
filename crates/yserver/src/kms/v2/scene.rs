@@ -1389,6 +1389,13 @@ fn tick_one_output(
     let hw_available = platform.cursor_plane_available();
     let hw_can_run = hw_strategy_enabled && hw_available;
     let prev_mode = inner.outputs[output_idx].last_frame_cursor_mode;
+    // Phase 2.6 — derive the COW host xid from the scene-registered
+    // `cow: Option<DrawableId>`. After Phase 2.2/2.5, the COW's host
+    // xid is the well-known protocol constant whenever the backend
+    // has materialized the overlay. Both Drawable and host-xid views
+    // come up + go down together; we just need one bool's worth of
+    // info to flag the COW top-level in the walk.
+    let cow_host_xid = cow.map(|_| yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0);
     let built = build_scene(
         core,
         store,
@@ -1398,6 +1405,7 @@ fn tick_one_output(
         inner.cursor.clone(),
         cursor_prev_pos_before,
         cow,
+        cow_host_xid,
         hw_can_run,
     );
 
@@ -1753,6 +1761,14 @@ fn build_scene(
     cursor: Option<CursorEntry>,
     cursor_prev_pos: Option<(i32, i32)>,
     cow: Option<super::store::DrawableId>,
+    // Phase 2.6 — host xid of the materialized Composite Overlay
+    // Window, if any. The top-level walk uses this to mark the COW
+    // top-level (and its descendants by recursion) with
+    // `under_cow_subtree = true`, which in turn sets
+    // `alpha_passthrough = true` on every emitted `CompositeDraw`.
+    // `None` when the COW is not materialized (no compositor active
+    // or not yet claimed via GetOverlayWindow).
+    cow_host_xid: Option<u32>,
     // Stage 5 Phase C — when `true`, the strategy picks `Hw` for
     // cursors that fit the plane and lie on-output; otherwise `Sw`.
     // `false` collapses every assignment to the SW path (rollout
@@ -1874,6 +1890,10 @@ fn build_scene(
                 // the flag flips on inside the recursion when entering
                 // a redirected window's subtree.
                 false,
+                // Phase 2.6 — flag the COW top-level (and its
+                // descendants, propagated by recursion) so emitted
+                // draws inherit `alpha_passthrough = true`.
+                Some(top_xid) == cow_host_xid,
             );
         }
     }
@@ -2085,6 +2105,14 @@ fn emit_window_subtree(
     // breaks this chain (its paint stops at itself), so it still
     // emits its own backing regardless of the inherited flag.
     under_redirected_ancestor: bool,
+    // Phase 2.6 — true iff the current recursion path entered the
+    // COW top-level (or one of its descendants). When set, emitted
+    // `CompositeDraw` entries take `alpha_passthrough = true` so the
+    // compositor's composited result blends over the layer below;
+    // outside the COW subtree (no compositor active) draws stay
+    // opaque (`alpha_passthrough = false`). Mirrors the threading of
+    // `under_redirected_ancestor` above.
+    under_cow_subtree: bool,
 ) {
     let debug_focus = scene_walk_debug_enabled_for(host_xid);
     // Stage 4 diagnostic: trace-level scene-walk decision per window.
@@ -2401,7 +2429,11 @@ fn emit_window_subtree(
                             dst_size: [cw_f, ch_f],
                             src_origin: [cx_f / win_w_f, cy_f / win_h_f],
                             src_size: [cw_f / win_w_f, ch_f / win_h_f],
-                            alpha_passthrough: true,
+                            // Phase 2.6 — alpha-passthrough is inherited
+                            // from the COW subtree flag (set on the COW
+                            // top-level + descendants). Outside the COW
+                            // subtree, draws stay opaque.
+                            alpha_passthrough: under_cow_subtree,
                         });
                         emitted_any = true;
                     }
@@ -2413,20 +2445,14 @@ fn emit_window_subtree(
                         dst_size: [win_w_f, win_h_f],
                         src_origin: [0.0, 0.0],
                         src_size: [1.0, 1.0],
-                        // Depth-32 ARGB windows initialize their storage to
-                        // (0,0,0,0) per `default_window_init_color(32)`, so any
-                        // unpainted region is transparent and must alpha-blend
-                        // onto the layers below — matching X11 / Composite
-                        // semantics where the root window is the opaque
-                        // bottom layer and ARGB windows stack with blending.
-                        // Forcing alpha to 1.0 here (the old `false` setting)
-                        // turned transparent areas into opaque black, hiding
-                        // mate-panel applets, control-center sidebar text,
-                        // system-tray icons, and tooltips. Depth-24 sources
-                        // pass through `sample_view`'s α=ONE swizzle so the
-                        // shader sees α=1 from them regardless of the BGRA8
-                        // padding byte — that's the scene-α fix above.
-                        alpha_passthrough: true,
+                        // Phase 2.6 — alpha-passthrough is inherited
+                        // from the COW subtree flag (set on the COW
+                        // top-level + descendants). Outside the COW
+                        // subtree, draws stay opaque (no compositor
+                        // path); inside the COW subtree, the
+                        // compositor's stage paints with alpha and we
+                        // blend over whatever lies below.
+                        alpha_passthrough: under_cow_subtree,
                     });
                     emitted_any = true;
                 }
@@ -2508,6 +2534,10 @@ fn emit_window_subtree(
             sampled_ids,
             projected,
             child_under_redirected_ancestor,
+            // Phase 2.6 — COW subtree flag is inherited unchanged.
+            // Once we entered the COW top-level, every descendant
+            // emits with alpha_passthrough=true.
+            under_cow_subtree,
         );
     }
 }
@@ -3496,6 +3526,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             false,
         );
         let scene = built.scene;
@@ -3565,6 +3596,7 @@ mod tests {
             &windows_v2,
             0,
             &platform,
+            None,
             None,
             None,
             None,
@@ -3650,6 +3682,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             false,
         )
         .scene;
@@ -3720,6 +3753,7 @@ mod tests {
             0,
             &platform,
             Some(cursor),
+            None,
             None,
             None,
             false,
@@ -3826,6 +3860,7 @@ mod tests {
             &windows_v2,
             0,
             &platform,
+            None,
             None,
             None,
             None,
@@ -3950,6 +3985,7 @@ mod tests {
             &windows_v2,
             0,
             &platform,
+            None,
             None,
             None,
             None,
@@ -4091,6 +4127,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             false,
         );
         let scene = &built.scene;
@@ -4227,6 +4264,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             false,
         );
         let scene = &built.scene;
@@ -4343,6 +4381,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             false,
         );
         let scene = &built.scene;
@@ -4423,6 +4462,7 @@ mod tests {
             None, // no cursor in this fixture
             None,
             None, // cow=None — legacy non-redirected path
+            None, // cow_host_xid — Phase 2.6
             false,
         );
         let scene = &built.scene;
@@ -4529,6 +4569,7 @@ mod tests {
             Some(cursor),
             None,
             None, // cow=None — legacy non-redirected path
+            None, // cow_host_xid — Phase 2.6
             false,
         );
         let scene = &built.scene;
@@ -4651,6 +4692,7 @@ mod tests {
             Some(cursor),
             None,
             Some(cow_id),
+            Some(yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0),
             false,
         );
 
@@ -4745,5 +4787,104 @@ mod tests {
             penultimate.image_view, cow_view,
             "COW must be immediately below cursor",
         );
+    }
+
+    /// Phase 2.6 — `under_cow_subtree` recursion flag propagates
+    /// `alpha_passthrough = true` to every `CompositeDraw` emitted
+    /// inside the COW subtree (the COW top-level itself + all of its
+    /// descendants). Non-COW top-levels (the no-compositor path)
+    /// emit with `alpha_passthrough = false`.
+    #[test]
+    fn cow_subtree_draws_inherit_alpha_passthrough_true() {
+        let mut core = KmsCore::for_tests();
+        let mut store = DrawableStore::new();
+        let platform = PlatformBackend::for_tests();
+        let mut windows_v2 = super::super::backend::WindowsV2Map::new();
+
+        // Non-COW top-level W @ (0, 0), 200×200.
+        alloc_stub_window(
+            &mut store,
+            &mut windows_v2,
+            0xA1,
+            0,
+            0,
+            200,
+            200,
+            None,
+            true,
+        );
+        core.top_level_order.push(0xA1);
+
+        // COW host xid @ (0, 0), 800×600 — matches PlatformBackend::for_tests output.
+        let cow_xid: u32 = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+        alloc_stub_window(
+            &mut store,
+            &mut windows_v2,
+            cow_xid,
+            0,
+            0,
+            800,
+            600,
+            None,
+            true,
+        );
+        core.top_level_order.push(cow_xid);
+
+        // Compositor stage as child of COW @ (0, 0), 800×600.
+        alloc_stub_window(
+            &mut store,
+            &mut windows_v2,
+            0xB1,
+            0,
+            0,
+            800,
+            600,
+            Some(cow_xid),
+            true,
+        );
+
+        let built = build_scene(
+            &core,
+            &mut store,
+            &windows_v2,
+            0,
+            &platform,
+            None,
+            None,
+            None,
+            Some(cow_xid),
+            false,
+        );
+        let scene = &built.scene;
+
+        // The non-COW W (200×200) must have alpha_passthrough=false.
+        let w_draw = scene
+            .draws
+            .iter()
+            .find(|d| d.dst_size == [200.0, 200.0])
+            .expect("W draw present");
+        assert!(
+            !w_draw.alpha_passthrough,
+            "non-COW top-level uses opaque blend (alpha_passthrough=false)",
+        );
+
+        // COW + stage (both 800×600) must have alpha_passthrough=true.
+        let cow_or_stage_draws: Vec<_> = scene
+            .draws
+            .iter()
+            .filter(|d| d.dst_size == [800.0, 600.0])
+            .collect();
+        assert!(
+            !cow_or_stage_draws.is_empty(),
+            "COW and stage emitted: {:?}",
+            scene.draws,
+        );
+        for d in cow_or_stage_draws {
+            assert!(
+                d.alpha_passthrough,
+                "COW subtree draw must have alpha_passthrough=true: {:?}",
+                d,
+            );
+        }
     }
 }
