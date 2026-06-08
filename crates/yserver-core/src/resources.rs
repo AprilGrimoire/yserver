@@ -4934,7 +4934,6 @@ mod tests {
             "fresh root.children must not contain COW"
         );
     }
-
     #[test]
     fn materialize_cow_resource_creates_record_and_inserts_at_top() {
         let mut t = ResourceTable::new();
