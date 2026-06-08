@@ -1271,7 +1271,8 @@ impl ResourceTable {
             parent.children.retain(|child| *child != request.window);
         }
         if let Some(parent) = self.windows.get_mut(&request.parent.0) {
-            parent.children.push(request.window);
+            let insert_at = cow_aware_top_index(parent);
+            parent.children.insert(insert_at, request.window);
         }
         let window = self
             .windows
@@ -4773,6 +4774,42 @@ mod tests {
             kids[kids.len() - 2],
             ResourceId(0x200),
             "0x200 must land just below COW (capped)"
+        );
+    }
+
+    #[test]
+    fn reparent_to_root_with_cow_present_lands_below_cow() {
+        let mut t = ResourceTable::new();
+        // Build: root → container; container → child.
+        make_child(&mut t, 0xc0, ROOT_WINDOW.0, 0, 0);
+        make_child(&mut t, 0xd0, 0xc0, 0, 0);
+        // Put COW at top of root.
+        t.windows
+            .get_mut(&ROOT_WINDOW.0)
+            .unwrap()
+            .children
+            .push(COMPOSITE_OVERLAY_WINDOW);
+        // Reparent the inner child up to root.
+        let _ = t.reparent_window(ReparentWindowRequest {
+            window: ResourceId(0xd0),
+            parent: ROOT_WINDOW,
+            x: 0,
+            y: 0,
+        });
+        let kids = &t.window(ROOT_WINDOW).unwrap().children;
+        assert_eq!(
+            kids.last().copied(),
+            Some(COMPOSITE_OVERLAY_WINDOW),
+            "COW must remain topmost after reparent-to-root"
+        );
+        assert!(
+            kids.contains(&ResourceId(0xd0)),
+            "the reparented child must appear in root.children"
+        );
+        assert_ne!(
+            kids.last().copied(),
+            Some(ResourceId(0xd0)),
+            "the reparented child must NOT be above COW"
         );
     }
 }
