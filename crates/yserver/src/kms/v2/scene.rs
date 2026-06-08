@@ -1423,12 +1423,13 @@ fn tick_one_output(
     let hw_available = platform.cursor_plane_available();
     let hw_can_run = hw_strategy_enabled && hw_available;
     let prev_mode = inner.outputs[output_idx].last_frame_cursor_mode;
-    // Phase 5.1 — `cow_host_xid` is threaded directly from the
-    // backend's `cow_host_xid()` getter (the well-known protocol
-    // constant whenever the overlay is materialized, else `None`).
-    // It flags the COW top-level in the `top_level_order` walk so
-    // its subtree inherits `alpha_passthrough`. The COW emits via
-    // the normal recursion — there is no special post-walk append.
+    // Phase 2.6 — derive the COW host xid from the scene-registered
+    // `cow: Option<DrawableId>`. After Phase 2.2/2.5, the COW's host
+    // xid is the well-known protocol constant whenever the backend
+    // has materialized the overlay. Both Drawable and host-xid views
+    // come up + go down together; we just need one bool's worth of
+    // info to flag the COW top-level in the walk.
+    let cow_host_xid = cow.map(|_| yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0);
     let built = build_scene(
         core,
         store,
@@ -1437,6 +1438,7 @@ fn tick_one_output(
         platform,
         inner.cursor.clone(),
         cursor_prev_pos_before,
+        cow,
         cow_host_xid,
         hw_can_run,
     );
@@ -1829,18 +1831,15 @@ fn build_scene(
     output_idx: usize,
     platform: &PlatformBackend,
     cursor: Option<CursorEntry>,
-    _cursor_prev_pos: Option<(i32, i32)>,
+    cursor_prev_pos: Option<(i32, i32)>,
+    cow: Option<super::store::DrawableId>,
     // Phase 2.6 — host xid of the materialized Composite Overlay
     // Window, if any. The top-level walk uses this to mark the COW
     // top-level (and its descendants by recursion) with
     // `under_cow_subtree = true`, which in turn sets
     // `alpha_passthrough = true` on every emitted `CompositeDraw`.
     // `None` when the COW is not materialized (no compositor active
-    // or not yet claimed via GetOverlayWindow). Phase 2.7 replaced
-    // the prior `cow: Option<DrawableId>` arg: the COW now emits
-    // via the normal top_level_order walk, not via a special
-    // post-walk append, so we only need the host xid to tag the
-    // walk's recursion flag — no DrawableId needed.
+    // or not yet claimed via GetOverlayWindow).
     cow_host_xid: Option<u32>,
     // Stage 5 Phase C — when `true`, the strategy picks `Hw` for
     // cursors that fit the plane and lie on-output; otherwise `Sw`.
@@ -1947,6 +1946,40 @@ fn build_scene(
             // draws inherit `alpha_passthrough = true`.
             Some(top_xid) == cow_host_xid,
         );
+    } else {
+        log::trace!(
+            "v2 scene_walk begin output={output_idx} cow_authoritative=false \
+             top_levels={n} order={order:?} \
+             layout=({layout_x0},{layout_y0} {layout_w}x{layout_h})",
+            n = core.top_level_order.len(),
+            order = core.top_level_order,
+        );
+        for &top_xid in &core.top_level_order {
+            emit_window_subtree(
+                top_xid,
+                0,
+                0,
+                store,
+                windows_v2,
+                &core.shape_bounding,
+                layout_x0,
+                layout_y0,
+                layout_w,
+                layout_h,
+                &mut draws,
+                &mut snapshots,
+                &mut sampled_ids,
+                &mut projected,
+                // Top-level windows start with no redirected ancestor;
+                // the flag flips on inside the recursion when entering
+                // a redirected window's subtree.
+                false,
+                // Phase 2.6 — flag the COW top-level (and its
+                // descendants, propagated by recursion) so emitted
+                // draws inherit `alpha_passthrough = true`.
+                Some(top_xid) == cow_host_xid,
+            );
+        }
     }
     log::trace!(
         "v2 scene_walk end output={output_idx} draws={n_draws} \
@@ -3604,6 +3637,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             false,
         );
         let scene = built.scene;
@@ -3673,6 +3707,7 @@ mod tests {
             &windows_v2,
             0,
             &platform,
+            None,
             None,
             None,
             None,
@@ -3758,6 +3793,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             false,
         )
         .scene;
@@ -3828,6 +3864,7 @@ mod tests {
             0,
             &platform,
             Some(cursor),
+            None,
             None,
             None,
             false,
@@ -3934,6 +3971,7 @@ mod tests {
             &windows_v2,
             0,
             &platform,
+            None,
             None,
             None,
             None,
@@ -4058,6 +4096,7 @@ mod tests {
             &windows_v2,
             0,
             &platform,
+            None,
             None,
             None,
             None,
@@ -4204,6 +4243,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             false,
         );
         let scene = &built.scene;
@@ -4249,14 +4289,115 @@ mod tests {
         assert!(built.sampled_ids.contains(&bystander_id));
     }
 
-    // Phase 3.1 — the legacy `build_scene_emits_manual_redirected_parent_backing_but_prunes_descendants`
-    // test was deleted here. Its sole purpose was to assert that a
-    // Manual-redirected top-level emits its backing directly into
-    // scanout — exactly the bug-shaped state Task 3.1 closes. The
-    // compositor (in production) reads the backing via
-    // `NameWindowPixmap` and re-emits it on the COW; the X server
-    // must never short-circuit that. `manual_redirected_top_level_skips_emit_unconditional`
-    // covers the replacement invariant.
+    /// Stage 4d follow-up — a Manual-redirected parent with a
+    /// redirected backing must emit that backing directly, while
+    /// still pruning its descendants.
+    #[test]
+    fn build_scene_emits_manual_redirected_parent_backing_but_prunes_descendants() {
+        let mut core = KmsCore::for_tests();
+        let mut store = DrawableStore::new();
+        let platform = PlatformBackend::for_tests();
+        let mut windows_v2 = super::super::backend::WindowsV2Map::new();
+
+        alloc_stub_window(
+            &mut store,
+            &mut windows_v2,
+            0x111,
+            100,
+            200,
+            200,
+            150,
+            None,
+            true,
+        );
+        core.top_level_order.push(0x111);
+        let w_frame_id = store.lookup(0x111).expect("frame lookup");
+
+        let mut backing = super::super::store::Storage::for_tests_null(
+            extent(200, 150),
+            vk::Format::B8G8R8A8_UNORM,
+        );
+        let backing_view: vk::ImageView = ash::vk::Handle::from_raw(0xBEEF_CAFE);
+        backing.image_view = backing_view;
+        backing.sample_view = backing_view;
+        let backing_id = store
+            .allocate(0xB002, DrawableKind::Pixmap, 32, true, backing)
+            .expect("alloc redirected backing");
+        store.set_redirected_target(w_frame_id, Some(backing_id));
+        store.set_scene_participating(w_frame_id, false);
+        assert!(
+            store.get(backing_id).unwrap().scene_participating,
+            "fixture sanity: redirected backing stays scene_participating=true",
+        );
+
+        alloc_stub_window(
+            &mut store,
+            &mut windows_v2,
+            0x112,
+            11,
+            41,
+            100,
+            80,
+            Some(0x111),
+            true,
+        );
+
+        alloc_stub_window(
+            &mut store,
+            &mut windows_v2,
+            0x222,
+            500,
+            500,
+            60,
+            30,
+            None,
+            true,
+        );
+        core.top_level_order.push(0x222);
+
+        let child_id = store.lookup(0x112).expect("child lookup");
+        assert!(
+            store.get(child_id).unwrap().scene_participating,
+            "fixture sanity: child stays scene_participating=true",
+        );
+
+        let built = build_scene(
+            &core,
+            &mut store,
+            &windows_v2,
+            0,
+            &platform,
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        let scene = &built.scene;
+
+        assert_eq!(scene.draws.len(), 2, "expected manual backing + bystander");
+        assert!(
+            scene
+                .draws
+                .iter()
+                .any(|d| d.dst_origin == [100.0, 200.0] && d.dst_size == [200.0, 150.0]),
+            "manual parent backing draw missing: {:?}",
+            scene.draws
+        );
+        assert!(
+            scene
+                .draws
+                .iter()
+                .any(|d| d.dst_origin == [500.0, 500.0] && d.dst_size == [60.0, 30.0]),
+            "bystander draw missing: {:?}",
+            scene.draws
+        );
+
+        let bystander_id = store.lookup(0x222).expect("bystander lookup");
+        assert_eq!(built.sampled_ids.len(), 2);
+        assert!(built.sampled_ids.contains(&backing_id));
+        assert!(built.sampled_ids.contains(&bystander_id));
+    }
 
     /// Audit #3 (2026-05-19) — a Manual-redirected parent still
     /// prunes its NON-redirected descendants (their paint resolves
@@ -4352,6 +4493,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             false,
         );
         let scene = &built.scene;
@@ -4434,7 +4576,8 @@ mod tests {
             &platform,
             None, // no cursor in this fixture
             None,
-            None, // cow_host_xid — Phase 2.6 (None = no compositor active)
+            None, // cow=None — legacy non-redirected path
+            None, // cow_host_xid — Phase 2.6
             false,
         );
         let scene = &built.scene;
@@ -4540,7 +4683,8 @@ mod tests {
             &platform,
             Some(cursor),
             None,
-            None, // cow_host_xid — Phase 2.6 (None = no compositor active)
+            None, // cow=None — legacy non-redirected path
+            None, // cow_host_xid — Phase 2.6
             false,
         );
         let scene = &built.scene;
@@ -4620,6 +4764,7 @@ mod tests {
             Some(cow_xid),
             true,
         );
+        let cow_id = store.lookup(cow_xid).expect("cow drawable");
 
         let built = build_scene(
             &core,
@@ -4628,8 +4773,8 @@ mod tests {
             0,
             &platform,
             None,
-            None,
-            Some(cow_xid),
+            Some(cow_id),
+            Some(yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0),
             false,
         );
         let scene = &built.scene;
@@ -5035,5 +5180,104 @@ mod tests {
             cow_pos < stage_pos,
             "COW host draw precedes its stage child in the subtree recursion: cow={cow_pos} stage={stage_pos}",
         );
+    }
+
+    /// Phase 2.6 — `under_cow_subtree` recursion flag propagates
+    /// `alpha_passthrough = true` to every `CompositeDraw` emitted
+    /// inside the COW subtree (the COW top-level itself + all of its
+    /// descendants). Non-COW top-levels (the no-compositor path)
+    /// emit with `alpha_passthrough = false`.
+    #[test]
+    fn cow_subtree_draws_inherit_alpha_passthrough_true() {
+        let mut core = KmsCore::for_tests();
+        let mut store = DrawableStore::new();
+        let platform = PlatformBackend::for_tests();
+        let mut windows_v2 = super::super::backend::WindowsV2Map::new();
+
+        // Non-COW top-level W @ (0, 0), 200×200.
+        alloc_stub_window(
+            &mut store,
+            &mut windows_v2,
+            0xA1,
+            0,
+            0,
+            200,
+            200,
+            None,
+            true,
+        );
+        core.top_level_order.push(0xA1);
+
+        // COW host xid @ (0, 0), 800×600 — matches PlatformBackend::for_tests output.
+        let cow_xid: u32 = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+        alloc_stub_window(
+            &mut store,
+            &mut windows_v2,
+            cow_xid,
+            0,
+            0,
+            800,
+            600,
+            None,
+            true,
+        );
+        core.top_level_order.push(cow_xid);
+
+        // Compositor stage as child of COW @ (0, 0), 800×600.
+        alloc_stub_window(
+            &mut store,
+            &mut windows_v2,
+            0xB1,
+            0,
+            0,
+            800,
+            600,
+            Some(cow_xid),
+            true,
+        );
+
+        let built = build_scene(
+            &core,
+            &mut store,
+            &windows_v2,
+            0,
+            &platform,
+            None,
+            None,
+            None,
+            Some(cow_xid),
+            false,
+        );
+        let scene = &built.scene;
+
+        // The non-COW W (200×200) must have alpha_passthrough=false.
+        let w_draw = scene
+            .draws
+            .iter()
+            .find(|d| d.dst_size == [200.0, 200.0])
+            .expect("W draw present");
+        assert!(
+            !w_draw.alpha_passthrough,
+            "non-COW top-level uses opaque blend (alpha_passthrough=false)",
+        );
+
+        // COW + stage (both 800×600) must have alpha_passthrough=true.
+        let cow_or_stage_draws: Vec<_> = scene
+            .draws
+            .iter()
+            .filter(|d| d.dst_size == [800.0, 600.0])
+            .collect();
+        assert!(
+            !cow_or_stage_draws.is_empty(),
+            "COW and stage emitted: {:?}",
+            scene.draws,
+        );
+        for d in cow_or_stage_draws {
+            assert!(
+                d.alpha_passthrough,
+                "COW subtree draw must have alpha_passthrough=true: {:?}",
+                d,
+            );
+        }
     }
 }
