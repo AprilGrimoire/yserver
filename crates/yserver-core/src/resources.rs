@@ -754,11 +754,17 @@ impl ResourceTable {
             }
             RestackAction::AboveSibling(sibling_id) => {
                 let window = parent.children.remove(index);
-                let sibling_index = parent
-                    .children
-                    .iter()
-                    .position(|child| *child == sibling_id);
-                let insert_at = sibling_index.map_or(parent.children.len(), |i| i + 1);
+                let insert_at = if sibling_id == COMPOSITE_OVERLAY_WINDOW {
+                    // Cap: cannot land above COW. Use the same just-below-COW slot
+                    // the cow_aware_top_index helper computes.
+                    cow_aware_top_index(parent)
+                } else {
+                    let sibling_index = parent
+                        .children
+                        .iter()
+                        .position(|child| *child == sibling_id);
+                    sibling_index.map_or(parent.children.len(), |i| i + 1)
+                };
                 parent.children.insert(insert_at, window);
             }
             RestackAction::BelowSibling(sibling_id) => {
@@ -4732,6 +4738,41 @@ mod tests {
                 ResourceId(0x200),
                 COMPOSITE_OVERLAY_WINDOW
             ]
+        );
+    }
+
+    #[test]
+    fn restack_above_cow_caps_to_just_below_cow() {
+        let mut t = ResourceTable::new();
+        make_child(&mut t, 0x200, ROOT_WINDOW.0, 0, 0);
+        make_child(&mut t, 0x300, ROOT_WINDOW.0, 0, 0);
+        t.windows
+            .get_mut(&ROOT_WINDOW.0)
+            .unwrap()
+            .children
+            .push(COMPOSITE_OVERLAY_WINDOW);
+        // children: [0x200, 0x300, COW]; ask for 0x200 above COW.
+        let _ = t.configure_window(ConfigureWindowRequest {
+            window: ResourceId(0x200),
+            value_mask: 0,
+            x: None,
+            y: None,
+            width: None,
+            height: None,
+            border_width: None,
+            sibling: Some(COMPOSITE_OVERLAY_WINDOW),
+            stack_mode: Some(0), // Above
+        });
+        let kids = &t.window(ROOT_WINDOW).unwrap().children;
+        assert_eq!(
+            kids.last().copied(),
+            Some(COMPOSITE_OVERLAY_WINDOW),
+            "COW must remain at top after AboveSibling=COW"
+        );
+        assert_eq!(
+            kids[kids.len() - 2],
+            ResourceId(0x200),
+            "0x200 must land just below COW (capped)"
         );
     }
 }
