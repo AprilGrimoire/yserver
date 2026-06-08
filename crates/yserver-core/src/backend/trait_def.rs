@@ -869,14 +869,6 @@ pub trait Backend: Send {
     /// tests. Single backend hook owns the full lifecycle in
     /// both directions; there is no separate `destroy_cow` API.
     ///
-    /// The v2 impl (`KmsBackendV2`) also tears down its
-    /// `windows_v2` entry and the COW's slot in
-    /// `top_level_order` on the final release — the mirror of
-    /// the materialization that `get_overlay_window`'s 0→1
-    /// branch installs. Single backend hook owns the full
-    /// lifecycle in both directions; there is no separate
-    /// `destroy_cow` API.
-    ///
     /// Default no-op as for `get_overlay_window`: returns
     /// `Ok(false)` because "I didn't destroy anything."
     ///
