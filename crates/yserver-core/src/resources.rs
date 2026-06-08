@@ -745,7 +745,8 @@ impl ResourceTable {
             RestackAction::NoOp => {}
             RestackAction::Top => {
                 let window = parent.children.remove(index);
-                parent.children.push(window);
+                let insert_at = cow_aware_top_index(parent);
+                parent.children.insert(insert_at, window);
             }
             RestackAction::Bottom => {
                 let window = parent.children.remove(index);
@@ -4698,6 +4699,39 @@ mod tests {
             kids[kids.len() - 2],
             ResourceId(0x500),
             "new top-level lands just below COW"
+        );
+    }
+
+    #[test]
+    fn restack_top_with_cow_present_lands_just_below_cow() {
+        let mut t = ResourceTable::new();
+        make_child(&mut t, 0x200, ROOT_WINDOW.0, 0, 0);
+        make_child(&mut t, 0x300, ROOT_WINDOW.0, 0, 0);
+        t.windows
+            .get_mut(&ROOT_WINDOW.0)
+            .unwrap()
+            .children
+            .push(COMPOSITE_OVERLAY_WINDOW);
+        // children now: [0x200, 0x300, COW]
+        let _ = t.configure_window(ConfigureWindowRequest {
+            window: ResourceId(0x200),
+            value_mask: 1 << 6,
+            x: None,
+            y: None,
+            width: None,
+            height: None,
+            border_width: None,
+            sibling: None,
+            stack_mode: Some(0), // 0 = Above (with no sibling = top)
+        });
+        let kids = &t.window(ROOT_WINDOW).unwrap().children;
+        assert_eq!(
+            kids,
+            &[
+                ResourceId(0x300),
+                ResourceId(0x200),
+                COMPOSITE_OVERLAY_WINDOW
+            ]
         );
     }
 }
