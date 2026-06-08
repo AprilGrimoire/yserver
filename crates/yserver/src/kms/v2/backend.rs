@@ -8837,10 +8837,23 @@ impl Backend for KmsBackendV2 {
         // its correct screen position). Observable as MATE's clock
         // applet rendered at BOTH ends of the panel: the right edge
         // is the real position, the left edge is the ghost.
-        let parent = if host_parent == 0 || !self.windows_v2.contains_key(&host_parent) {
+        let parent = if host_parent == 0 {
+            // host_parent == 0 is the documented "reparent to root"
+            // convention in windows_v2 (root isn't tracked).
             None
-        } else {
+        } else if self.windows_v2.contains_key(&host_parent) {
             Some(host_parent)
+        } else {
+            // Per spec §"Remove the missing-parent fallback": backend
+            // projection drift after protocol-level validation is a
+            // fatal internal-consistency failure, not a silent
+            // recovery. If the resources tree says the parent exists
+            // but windows_v2 doesn't, that's drift — surface it.
+            panic!(
+                "reparent_subwindow: host_parent 0x{host_parent:x} missing from \
+                 windows_v2; resources layer must validate ReparentWindow before \
+                 dispatching to backend"
+            );
         };
         let new_rank = self.alloc_window_stack_rank();
         if let Some(geom) = self.windows_v2.get_mut(&host_xid) {
@@ -17486,6 +17499,43 @@ mod tests {
         assert_eq!(geom.parent, Some(0xC0FFEE));
         assert_eq!(geom.x, 30);
         assert_eq!(geom.y, 10);
+    }
+
+    /// Phase 4.1 (COW structural redesign): protocol-validation
+    /// guarantees the host_parent exists in `windows_v2` by the time
+    /// `reparent_subwindow` is invoked. A missing entry means projection
+    /// drift between resources and backend — a fatal internal-
+    /// consistency failure, not a recoverable "treat as top-level".
+    /// The old silent fallback masked the cinnamon COW bug for weeks;
+    /// surfacing the drift via panic is the spec'd behaviour.
+    #[test]
+    #[should_panic(expected = "reparent_subwindow")]
+    fn reparent_subwindow_panics_when_host_parent_missing() {
+        let mut b = KmsBackendV2::for_tests();
+        // Pre-seed the child so reparent_subwindow has something to
+        // operate on; the panic must come from the missing host_parent
+        // lookup, not from a missing child.
+        let child_xid: u32 = 0x0040_0050;
+        b.windows_v2.insert(
+            child_xid,
+            super::WindowGeometryV2 {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                depth: 24,
+                mapped: true,
+                parent: None,
+                stack_rank: 0,
+                bg_pixel: None,
+                bg_pixmap: None,
+                cursor: None,
+            },
+        );
+        // Reparent to a host_parent that doesn't exist in windows_v2.
+        // 0 is the legitimate "reparent to root" convention; 0xDEADBEEF
+        // is genuinely absent and must trip the drift panic.
+        let _ = b.reparent_subwindow(None, child_xid, 0xDEAD_BEEF, 0, 0);
     }
 
     /// Stage 3f.11: `restack_top_level` with `stack_mode=Below` and
