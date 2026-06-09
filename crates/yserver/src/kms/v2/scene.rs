@@ -4677,4 +4677,190 @@ mod tests {
             scene.draws,
         );
     }
+
+    /// Phase 6.1 — full compositor flow in one scenario. Exercises the
+    /// structural facts the COW redesign delivers, headless via a
+    /// direct `build_scene` call (no live Vulkan device required):
+    ///
+    /// 1. A materialized COW (`windows_v2` entry + `top_level_order`
+    ///    slot, per Task 2.2) emits exactly once via the normal
+    ///    `top_level_order` walk (Phase 2.7), with
+    ///    `alpha_passthrough=true` (Phase 2.6).
+    /// 2. A stage child of the COW with content emits exactly once via
+    ///    the COW-subtree recursion (Phase 2.6/2.7), also
+    ///    `alpha_passthrough=true`.
+    /// 3. A Manual-redirected sibling top-level (own
+    ///    `redirected_target` + `scene_participating=false`) emits
+    ///    ZERO draws (Phase 3.1) — even though the COW is materialized.
+    /// 4. Ordering: the COW-subtree draws appear after the earlier
+    ///    non-COW top-level (the Manual sibling contributes nothing).
+    ///
+    /// Sizes are chosen so each source is unambiguously identifiable by
+    /// `dst_size`:
+    ///   - early non-COW top-level W: 200×200
+    ///   - Manual-redirected sibling S: 50×50  (must not appear)
+    ///   - COW host:                    800×600
+    ///   - stage (COW child):           640×480
+    #[test]
+    fn compositor_stage_under_cow_emits_via_recursion_and_manual_siblings_skip() {
+        let mut core = KmsCore::for_tests();
+        let mut store = DrawableStore::new();
+        let platform = PlatformBackend::for_tests();
+        let mut windows_v2 = super::super::backend::WindowsV2Map::new();
+
+        // (1) An earlier, ordinary non-COW top-level W @ (0,0), 200×200.
+        // Establishes a "before" position to anchor ordering.
+        let w: u32 = 0xC001;
+        alloc_stub_window(&mut store, &mut windows_v2, w, 0, 0, 200, 200, None, true);
+        core.top_level_order.push(w);
+
+        // (2) A Manual-redirected sibling top-level S @ (100,100), 50×50.
+        // redirected_target + scene_participating=false → Manual mode.
+        let s: u32 = 0xC002;
+        alloc_stub_window(&mut store, &mut windows_v2, s, 100, 100, 50, 50, None, true);
+        let s_id = store.lookup(s).expect("s lookup");
+        let mut s_backing = super::super::store::Storage::for_tests_null(
+            extent(50, 50),
+            PlatformBackend::format_for_depth(24),
+        );
+        let s_view: vk::ImageView = ash::vk::Handle::from_raw(0xDEAD_0050);
+        s_backing.image_view = s_view;
+        s_backing.sample_view = s_view;
+        let s_backing_id = store
+            .allocate(0xB0C2, DrawableKind::Pixmap, 24, true, s_backing)
+            .expect("alloc manual sibling backing");
+        store.set_redirected_target(s_id, Some(s_backing_id));
+        store.set_scene_participating(s_id, false);
+        core.top_level_order.push(s);
+
+        // (3) The materialized COW host @ (0,0), 800×600 (matches the
+        // PlatformBackend::for_tests output extent). This stands in for
+        // GetOverlayWindow having created the windows_v2 entry +
+        // top_level_order slot (Task 2.2).
+        let cow_xid: u32 = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+        alloc_stub_window(
+            &mut store,
+            &mut windows_v2,
+            cow_xid,
+            0,
+            0,
+            800,
+            600,
+            None,
+            true,
+        );
+        core.top_level_order.push(cow_xid);
+
+        // (4) The compositor stage as a child of the COW @ (0,0),
+        // 640×480 — content the WM paints into the overlay.
+        let stage: u32 = 0xC003;
+        alloc_stub_window(
+            &mut store,
+            &mut windows_v2,
+            stage,
+            0,
+            0,
+            640,
+            480,
+            Some(cow_xid),
+            true,
+        );
+
+        let built = build_scene(
+            &core,
+            &mut store,
+            &windows_v2,
+            0,
+            &platform,
+            None,
+            None,
+            Some(cow_xid),
+            false,
+        );
+        let scene = &built.scene;
+
+        // Fact A — Manual-redirected sibling S emits ZERO draws.
+        let s_draws = scene
+            .draws
+            .iter()
+            .filter(|d| d.dst_size == [50.0, 50.0])
+            .count();
+        assert_eq!(
+            s_draws, 0,
+            "Manual-redirected sibling must not emit, even with COW materialized: {:?}",
+            scene.draws,
+        );
+
+        // Fact B — stage (COW child) emits exactly ONE draw with
+        // alpha_passthrough=true.
+        let stage_draws: Vec<_> = scene
+            .draws
+            .iter()
+            .filter(|d| d.dst_size == [640.0, 480.0])
+            .collect();
+        assert_eq!(
+            stage_draws.len(),
+            1,
+            "stage emits exactly once via COW subtree recursion: {:?}",
+            scene.draws,
+        );
+        assert!(
+            stage_draws[0].alpha_passthrough,
+            "stage draw inherits alpha_passthrough=true from the COW subtree: {:?}",
+            stage_draws[0],
+        );
+
+        // Fact C — COW emits exactly ONE draw with alpha_passthrough=true
+        // via the normal top_level_order walk (no special post-walk append).
+        let cow_draws: Vec<_> = scene
+            .draws
+            .iter()
+            .filter(|d| d.dst_size == [800.0, 600.0])
+            .collect();
+        assert_eq!(
+            cow_draws.len(),
+            1,
+            "COW emits exactly once via top_level_order walk: {:?}",
+            scene.draws,
+        );
+        assert!(
+            cow_draws[0].alpha_passthrough,
+            "COW draw has alpha_passthrough=true: {:?}",
+            cow_draws[0],
+        );
+
+        // The earlier non-COW top-level W emits one opaque draw.
+        let w_pos = scene
+            .draws
+            .iter()
+            .position(|d| d.dst_size == [200.0, 200.0])
+            .expect("W draw present");
+        assert!(
+            !scene.draws[w_pos].alpha_passthrough,
+            "non-COW top-level W uses opaque blend (alpha_passthrough=false)",
+        );
+
+        // Fact D — ordering: the COW-subtree draws (COW host + stage)
+        // appear AFTER the earlier non-COW top-level W. The Manual
+        // sibling contributes nothing in between.
+        let cow_pos = scene
+            .draws
+            .iter()
+            .position(|d| d.dst_size == [800.0, 600.0])
+            .expect("COW draw present");
+        let stage_pos = scene
+            .draws
+            .iter()
+            .position(|d| d.dst_size == [640.0, 480.0])
+            .expect("stage draw present");
+        assert!(
+            w_pos < cow_pos && w_pos < stage_pos,
+            "COW subtree draws come after the earlier top-level W: w={w_pos} cow={cow_pos} stage={stage_pos}",
+        );
+        // Within the COW subtree the host emits before its stage child.
+        assert!(
+            cow_pos < stage_pos,
+            "COW host draw precedes its stage child in the subtree recursion: cow={cow_pos} stage={stage_pos}",
+        );
+    }
 }
