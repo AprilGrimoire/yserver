@@ -9138,29 +9138,6 @@ impl Backend for KmsBackendV2 {
             self.recent_present_pixmaps
                 .push_back((src_pixmap_xid, dst_window_xid));
         }
-        // Capture COW-targeted presents too — that's the original
-        // Stage 4d shadow/COW bisect point. On KMS the destination
-        // xid passed here is the backend's drawable xid, not
-        // necessarily the protocol's literal overlay xid, so resolve
-        // it through the store and compare the resulting DrawableId.
-        let is_cow_dst = self
-            .cow_id
-            .is_some_and(|cow_id| self.store.lookup(dst_window_xid) == Some(cow_id));
-        if !is_cow_dst {
-            return;
-        }
-        // Deduplicate consecutive same-xid presents (marco
-        // double-buffers two offscreens so the ring otherwise
-        // alternates between two values; keeping only fresh xids
-        // means a dump of size N captures up to N *distinct*
-        // recent sources).
-        if self.present_to_cow_sources.back() == Some(&src_pixmap_xid) {
-            return;
-        }
-        if self.present_to_cow_sources.len() == COW_CAP {
-            self.present_to_cow_sources.pop_front();
-        }
-        self.present_to_cow_sources.push_back(src_pixmap_xid);
     }
 
     fn wait_present_source_ready(&mut self, src_pixmap_host_xid: u32) {
