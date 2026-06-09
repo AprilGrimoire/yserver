@@ -4931,4 +4931,54 @@ mod tests {
                 .contains(&COMPOSITE_OVERLAY_WINDOW)
         );
     }
+
+    #[test]
+    fn reparent_cow_under_its_own_descendant_is_bad_match() {
+        // Materialize COW (child of root), then create a child C under COW.
+        let mut t = ResourceTable::new();
+        let host_xid = crate::backend::WindowHandle::from_raw_panicking(0x4000_0103);
+        t.materialize_cow_resource(host_xid);
+        make_child(&mut t, 0xC0, COMPOSITE_OVERLAY_WINDOW.0, 0, 0);
+
+        // ReparentWindow(window=COW, parent=C) would make COW a descendant
+        // of itself -> BadMatch via the GENERIC cycle rule (no COW-special
+        // code). is_descendant_of(parent=C, window=COW) is true because C's
+        // parent chain reaches COW.
+        let err = t.reparent_window(ReparentWindowRequest {
+            window: COMPOSITE_OVERLAY_WINDOW,
+            parent: ResourceId(0xC0),
+            x: 0,
+            y: 0,
+        });
+        assert!(
+            matches!(err, Err(ReparentWindowError::BadMatch)),
+            "reparenting COW under its own child must be BadMatch (generic cycle rule)"
+        );
+    }
+
+    #[test]
+    fn reparent_cow_to_a_normal_toplevel_succeeds_xorg_faithful() {
+        // Xorg does NOT reject moving the COW to an unrelated window. yserver
+        // must match: a reparent to a non-descendant, non-root window succeeds.
+        let mut t = ResourceTable::new();
+        make_child(&mut t, 0x200, ROOT_WINDOW.0, 0, 0); // unrelated top-level W
+        let host_xid = crate::backend::WindowHandle::from_raw_panicking(0x4000_0103);
+        t.materialize_cow_resource(host_xid);
+
+        let res = t.reparent_window(ReparentWindowRequest {
+            window: COMPOSITE_OVERLAY_WINDOW,
+            parent: ResourceId(0x200),
+            x: 0,
+            y: 0,
+        });
+        assert!(
+            res.is_ok(),
+            "reparenting COW to an unrelated window succeeds — matches Xorg \
+             (compositing breaks, but that's the compositor's bug, not ours)"
+        );
+        assert_eq!(
+            t.window(COMPOSITE_OVERLAY_WINDOW).unwrap().parent,
+            ResourceId(0x200)
+        );
+    }
 }
