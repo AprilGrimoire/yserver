@@ -626,6 +626,18 @@ fn activate_redirect_backing_for(
     window: ResourceId,
     mode: crate::server::CompositeRedirectMode,
 ) {
+    // Xorg compCheckRedirect (composite/compwindow.c:156-170): the
+    // overlay window is NEVER actually redirected — should=FALSE for
+    // pWin == cs->pOverlayWin — regardless of trigger
+    // (RedirectSubwindows(root), explicit RedirectWindow, or
+    // auto-redirect-on-map). The COW is a real child of root (Phase 2),
+    // so RedirectSubwindows(root, Manual) would otherwise hand it a
+    // Manual backing + scene_participating=false, and the Phase 3
+    // Manual-skip would drop the whole composited desktop from scanout.
+    // The COW reaches scanout via the normal paint path.
+    if window == COMPOSITE_OVERLAY_WINDOW {
+        return;
+    }
     // Mode-flip on an existing redirect is routed through
     // `flip_redirect_target_mode` upstream — don't reallocate
     // here (Xorg preserves the backing per
@@ -28066,6 +28078,77 @@ mod tests {
                 } if *host_window == HOST_XID
             )),
             "expected SetWindowSceneParticipation(W, false) for Manual mode; got {calls:?}",
+        );
+        // Positive control for the COW guard
+        // (`activate_redirect_on_cow_is_never_applied`): a NORMAL window
+        // DOES receive a redirect backing. This proves the COW guard is
+        // overlay-window-specific, not a blanket disable of
+        // `activate_redirect_backing_for`.
+        assert!(
+            state
+                .resources
+                .window(ResourceId(WINDOW_XID))
+                .expect("window exists")
+                .redirected_backing
+                .is_some(),
+            "a normal window must receive a redirect backing",
+        );
+    }
+
+    /// Xorg `compCheckRedirect` (`composite/compwindow.c:156-170`) forces
+    /// `should = FALSE` for `pWin == cs->pOverlayWin`: the overlay window
+    /// is NEVER actually redirected, regardless of trigger. Since Phase 2
+    /// made the COW a real child of root, a compositor's
+    /// `CompositeRedirectSubwindows(root, Manual)` (mutter / cinnamon-mutter
+    /// all issue it) drives `activate_redirect_backing_for` once per root
+    /// child — including the COW. Without the guard the COW gets a Manual
+    /// backing + `scene_participating=false`, and the Phase 3 Manual-skip
+    /// drops the whole composited desktop from scanout (blank desktop,
+    /// observed bee/cinnamon-mutter 2026-06-09). The COW must keep its
+    /// `redirected_backing` empty and its scene participation untouched.
+    #[test]
+    fn activate_redirect_on_cow_is_never_applied() {
+        use crate::backend::recording::RecordedCall;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+
+        // Materialize the COW exactly as the `GetOverlayWindow` 0->1
+        // claim does (host xid == COMPOSITE_OVERLAY_WINDOW.0 for the
+        // RecordingBackend / v2 path, per the dispatch handler).
+        let cow_host = crate::backend::WindowHandle::from_raw_panicking(COMPOSITE_OVERLAY_WINDOW.0);
+        state.resources.materialize_cow_resource(cow_host);
+
+        // This is the call `RedirectSubwindows(root, Manual)`'s child
+        // loop makes for every child of root — the COW included.
+        activate_redirect_backing_for(
+            &mut state,
+            &mut backend,
+            None,
+            COMPOSITE_OVERLAY_WINDOW,
+            crate::server::CompositeRedirectMode::Manual,
+        );
+
+        let cow = state
+            .resources
+            .window(COMPOSITE_OVERLAY_WINDOW)
+            .expect("COW exists");
+        assert!(
+            cow.redirected_backing.is_none(),
+            "COW must never receive a redirect backing \
+             (compCheckRedirect: should=FALSE for pOverlayWin)",
+        );
+        // And no scene-participation flip was recorded for the COW host —
+        // the Phase 3 Manual-skip is driven off this flag.
+        let calls = backend.calls();
+        assert!(
+            !calls.iter().any(|c| matches!(
+                c,
+                RecordedCall::SetWindowSceneParticipation { host_window, .. }
+                    if *host_window == COMPOSITE_OVERLAY_WINDOW.0
+            )),
+            "COW scene participation must not be flipped by redirect activation; got {calls:?}",
         );
     }
 
