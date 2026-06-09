@@ -5039,7 +5039,6 @@ mod tests {
             ResourceId(0x200)
         );
     }
-
     #[test]
     fn cursor_anim_flag_default_false_settable_and_freed() {
         let mut table = ResourceTable::new();
