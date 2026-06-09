@@ -403,14 +403,6 @@ pub(crate) struct SceneCompositor {
     /// construction time so the gate is consistent across all
     /// `build_scene` calls.
     hw_cursor_strategy_enabled: bool,
-    /// Stage 4d — Composite Overlay Window scene entry. Lazily set
-    /// by `register_cow` on the first overlay `PresentPixmap` (the
-    /// xfwm4 case allocates COW but never paints into it, so
-    /// registering eagerly would cover the scene with the depth-24
-    /// force-opaque initial fill). Lives on the outer struct (not
-    /// `inner`) so the stub fixture can also track registration
-    /// state in unit tests that don't bring up a live scanout pool.
-    cow: Option<super::store::DrawableId>,
 }
 
 /// Stage 5 Phase H — env gate for the HW cursor strategy. Default
@@ -576,7 +568,6 @@ impl SceneCompositor {
             }),
             scene_structure_dirty: true,
             hw_cursor_strategy_enabled: hw_cursor_strategy_enabled(),
-            cow: None,
         })
     }
 
@@ -591,37 +582,6 @@ impl SceneCompositor {
         }
     }
 
-    /// Stage 4d — register the Composite Overlay Window scene
-    /// entry. Retained for the stage 4d layering tests; the live
-    /// backend no longer calls this because xfwm4 paints into a
-    /// child compositor window and a topmost COW obscures the
-    /// actual output. Marks scene structure dirty so the next
-    /// tick picks up the new layer. No-op on the stub fixture
-    /// (no Vk).
-    pub(crate) fn register_cow(&mut self, id: super::store::DrawableId) {
-        self.cow = Some(id);
-        self.scene_structure_dirty = true;
-    }
-
-    /// Stage 4d — clear the Composite Overlay Window scene
-    /// entry. Subsequent `build_scene` calls omit the COW layer;
-    /// the storage drop itself is handled by the backend's
-    /// `store.decref`. No-op on the stub fixture.
-    pub(crate) fn unregister_cow(&mut self) {
-        self.cow = None;
-        self.scene_structure_dirty = true;
-    }
-
-    /// Whether the Composite Overlay Window is currently registered
-    /// as a scene entry. The backend uses this to lazy-register on
-    /// the first overlay `PresentPixmap` (the xfwm4 case allocates
-    /// COW but never paints into it directly, so registering on
-    /// allocation would cover the scene with the depth-24
-    /// force-opaque initial fill).
-    pub(crate) fn is_cow_registered(&self) -> bool {
-        self.cow.is_some()
-    }
-
     /// Test fixture / Stage-1b-era stub. Construct via
     /// `SceneCompositor::stub()` so the `KmsBackendV2::for_tests`
     /// path doesn't need Vk.
@@ -630,7 +590,6 @@ impl SceneCompositor {
             inner: None,
             scene_structure_dirty: false,
             hw_cursor_strategy_enabled: false,
-            cow: None,
         }
     }
 
@@ -892,8 +851,8 @@ impl SceneCompositor {
         platform: &mut PlatformBackend,
         windows_v2: &super::backend::WindowsV2Map,
         telemetry: &mut Telemetry,
+        cow_host_xid: Option<u32>,
     ) -> Result<usize, SceneError> {
-        let cow = self.cow;
         let hw_strategy = self.hw_cursor_strategy_enabled;
         let Some(inner) = self.inner.as_mut() else {
             return Err(SceneError::NoVk);
@@ -913,7 +872,7 @@ impl SceneCompositor {
                 windows_v2,
                 telemetry,
                 hw_strategy,
-                cow,
+                cow_host_xid,
             ) {
                 Ok(true) => composed += 1,
                 Ok(false) => {} // skipped (no BO / empty scene)
@@ -1324,7 +1283,7 @@ fn tick_one_output(
     windows_v2: &super::backend::WindowsV2Map,
     telemetry: &mut Telemetry,
     hw_strategy_enabled: bool,
-    cow: Option<super::store::DrawableId>,
+    cow_host_xid: Option<u32>,
 ) -> Result<bool, SceneError> {
     // 0. **Per-output flip-pending gate.** KMS only allows one
     //    pending atomic commit per CRTC at a time; a second
@@ -1389,16 +1348,12 @@ fn tick_one_output(
     let hw_available = platform.cursor_plane_available();
     let hw_can_run = hw_strategy_enabled && hw_available;
     let prev_mode = inner.outputs[output_idx].last_frame_cursor_mode;
-    // Phase 2.6/2.7 — derive the COW host xid from the scene-
-    // registered `cow: Option<DrawableId>`. After Phase 2.2/2.5,
-    // the COW's host xid is the well-known protocol constant
-    // whenever the backend has materialized the overlay. Both
-    // Drawable and host-xid views come up + go down together; we
-    // just need one bool's worth of info to flag the COW top-level
-    // in the walk. The DrawableId itself is no longer threaded —
-    // Phase 2.7 deleted the special post-walk COW append, and the
-    // COW now emits via the normal top_level_order recursion.
-    let cow_host_xid = cow.map(|_| yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0);
+    // Phase 5.1 — `cow_host_xid` is threaded directly from the
+    // backend's `cow_host_xid()` getter (the well-known protocol
+    // constant whenever the overlay is materialized, else `None`).
+    // It flags the COW top-level in the `top_level_order` walk so
+    // its subtree inherits `alpha_passthrough`. The COW emits via
+    // the normal recursion — there is no special post-walk append.
     let built = build_scene(
         core,
         store,
@@ -3086,7 +3041,14 @@ mod tests {
         let mut telemetry = Telemetry::new();
         let windows = super::super::backend::WindowsV2Map::new();
         let err = scene
-            .tick(&core, &mut store, &mut platform, &windows, &mut telemetry)
+            .tick(
+                &core,
+                &mut store,
+                &mut platform,
+                &windows,
+                &mut telemetry,
+                None,
+            )
             .expect_err("stub must reject tick");
         assert!(matches!(err, SceneError::NoVk));
     }

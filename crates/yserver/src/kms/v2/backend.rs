@@ -1297,42 +1297,6 @@ impl KmsBackendV2 {
     }
 
     /// Test-only read of whether the Composite Overlay Window is
-    /// currently a scene entry. The COW lifecycle splits "store
-    /// allocation" (eager, on `GetOverlayWindow`) from "scene
-    /// registration" (lazy, on first overlay `PresentPixmap`) so a
-    /// compositor that allocates the COW but has not yet published
-    /// a complete frame does not hide the real top-levels behind a
-    /// partial overlay. This accessor lets the regression tests pin
-    /// that lazy registration actually fires.
-    #[doc(hidden)]
-    #[must_use]
-    pub fn test_scene_cow_registered(&self) -> bool {
-        self.scene.is_cow_registered()
-    }
-
-    /// If the compositor presented to the overlay before COW was
-    /// fully wired, arm scene authority as soon as allocation
-    /// completes. This closes the startup race where the first
-    /// overlay frame can arrive before `GetOverlayWindow` finishes,
-    /// leaving the scene in non-authoritative mode even though the
-    /// compositor is already active.
-    fn arm_cow_from_recent_present_if_needed(&mut self) {
-        let Some(cow_id) = self.cow_id else {
-            return;
-        };
-        if self.scene.is_cow_registered() {
-            return;
-        }
-        let cow_xid = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
-        if self
-            .recent_present_pixmaps
-            .iter()
-            .any(|&(_, dst_xid)| dst_xid == cow_xid)
-        {
-            self.scene.register_cow(cow_id);
-        }
-    }
-
     /// Stage 4a — test-only knob to install a COMPOSITE redirect
     /// route directly via the store, bypassing 4b's protocol
     /// surface (`allocate_redirected_backing` / `name_window_pixmap`
@@ -3452,12 +3416,14 @@ impl KmsBackendV2 {
             log::debug!("v2 composite_and_flip: skipped (seat not Active)");
             return Ok(());
         }
+        let cow_host_xid = self.cow_host_xid();
         match self.scene.tick(
             &self.core,
             &mut self.store,
             &mut self.platform,
             &self.windows_v2,
             &mut self.telemetry,
+            cow_host_xid,
         ) {
             Ok(_) => Ok(()),
             Err(e) => Err(io::Error::other(format!("v2 composite_and_flip: {e:?}"))),
@@ -8097,12 +8063,14 @@ impl Backend for KmsBackendV2 {
         let result = if !can_submit_scene {
             Ok(())
         } else {
+            let cow_host_xid = self.cow_host_xid();
             match self.scene.tick(
                 &self.core,
                 &mut self.store,
                 &mut self.platform,
                 &self.windows_v2,
                 &mut self.telemetry,
+                cow_host_xid,
             ) {
                 Ok(composed) => {
                     for i in 0..composed {
@@ -8218,11 +8186,6 @@ impl Backend for KmsBackendV2 {
             .is_some_and(|cow_id| self.store.lookup(dst_window_xid) == Some(cow_id));
         if !is_cow_dst {
             return;
-        }
-        if !self.scene.is_cow_registered()
-            && let Some(cow_id) = self.cow_id
-        {
-            self.scene.register_cow(cow_id);
         }
         // Deduplicate consecutive same-xid presents (marco
         // double-buffers two offscreens so the ring otherwise
@@ -9412,7 +9375,6 @@ impl Backend for KmsBackendV2 {
         }
         self.cow_id = Some(id);
         self.core.cow_refcount = 1;
-        self.arm_cow_from_recent_present_if_needed();
 
         // Phase 2 Task 2.2 — also materialize the backend's window-
         // tree projection so the COW participates in build_scene /
@@ -9485,12 +9447,6 @@ impl Backend for KmsBackendV2 {
                 log::warn!("v2 release_overlay_window: flush_render_batch failed: {e:?}");
             }
             self.drain_render_telemetry();
-            // Drop the scene entry FIRST so subsequent `build_scene`
-            // calls during a still-in-flight retire window can't
-            // sample a destroyed drawable. `decref` may defer the
-            // storage drop on a `PendingFence`, but the scene must
-            // stop referencing COW from this point regardless.
-            self.scene.unregister_cow();
             if let Some(id) = self.cow_id.take() {
                 self.store_decref_with_invalidate(id);
             }
@@ -18616,8 +18572,7 @@ mod tests {
     // ────────────────────────────────────────────────────────────────
 
     /// First call: COW xid resolves in store; refcount = 1;
-    /// backend `cow_id` set. Scene registration stays OFF until
-    /// the first overlay `PresentPixmap`.
+    /// backend `cow_id` set.
     #[test]
     fn cow_get_overlay_first_call_allocates_storage() {
         let mut b = KmsBackendV2::for_tests();
@@ -18657,53 +18612,6 @@ mod tests {
         );
         assert_eq!(cow.storage.extent.width, u32::from(b.platform.fb_w));
         assert_eq!(cow.storage.extent.height, u32::from(b.platform.fb_h));
-        assert!(
-            !b.test_scene_cow_registered(),
-            "GetOverlayWindow alone must not arm cow-authoritative mode",
-        );
-    }
-
-    /// COW-authoritative mode must arm only once the compositor has
-    /// actually published a frame to the overlay via Present.
-    #[test]
-    fn cow_registers_on_first_present_to_overlay() {
-        let mut b = KmsBackendV2::for_tests();
-        b.get_overlay_window(None).expect("get_overlay_window");
-        assert!(
-            !b.test_scene_cow_registered(),
-            "precondition: allocation alone must not register COW",
-        );
-
-        b.note_present_pixmap(
-            0x4000_1234,
-            yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0,
-        );
-
-        assert!(
-            b.test_scene_cow_registered(),
-            "overlay PresentPixmap must arm cow-authoritative mode",
-        );
-    }
-
-    #[test]
-    fn cow_registers_retroactively_when_present_precedes_get_overlay_window() {
-        let mut b = KmsBackendV2::for_tests();
-
-        b.note_present_pixmap(
-            0x4000_1234,
-            yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0,
-        );
-        assert!(
-            !b.test_scene_cow_registered(),
-            "without a COW allocation, PresentPixmap cannot arm scene authority yet",
-        );
-
-        b.get_overlay_window(None).expect("get_overlay_window");
-
-        assert!(
-            b.test_scene_cow_registered(),
-            "a prior PresentPixmap to the overlay must arm COW as soon as allocation completes",
-        );
     }
 
     #[test]
