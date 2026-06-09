@@ -1754,9 +1754,16 @@ Replace the silent fallback at line ~8840:
 With:
 
 ```rust
-        let parent = if host_parent == 0 {
-            // host_parent == 0 is the documented "reparent to root"
-            // convention in windows_v2 (root isn't tracked).
+        let parent = if host_parent == 0 || host_parent == self.core.window_id {
+            // BOTH sentinels mean "top-level under root": `0` is the
+            // legacy convention, and `core.window_id` is root's real
+            // host xid (root is never tracked in `windows_v2`). The
+            // production reparent-to-root path passes
+            // `backend.window_id()` (== core.window_id), NOT 0 — so
+            // this second clause is load-bearing, not cosmetic.
+            // Dropping it panics the server on every
+            // ReparentWindow(child -> ROOT_WINDOW), a routine WM op.
+            // (See backend.rs:1668 for the same root-sentinel check.)
             None
         } else if self.windows_v2.contains_key(&host_parent) {
             Some(host_parent)
@@ -1764,15 +1771,26 @@ With:
             // Per spec §"Remove the missing-parent fallback": backend
             // projection drift after protocol-level validation is a
             // fatal internal-consistency failure, not a silent
-            // recovery. If the resources tree says the parent exists
-            // but windows_v2 doesn't, that's drift — surface it.
+            // recovery. A genuinely-unknown non-root xid that the
+            // resources tree accepted but windows_v2 lacks is drift —
+            // surface it.
             panic!(
                 "reparent_subwindow: host_parent 0x{host_parent:x} missing from \
-                 windows_v2; resources layer must validate ReparentWindow before \
-                 dispatching to backend"
+                 windows_v2 (and is neither 0 nor root/core.window_id); resources \
+                 layer must validate ReparentWindow before dispatching to backend"
             );
         };
 ```
+
+> **CRITICAL (added 2026-06-09 after review caught a server-crash
+> regression):** the root sentinel is `core.window_id` (== 1), NOT just
+> `0`. The reparent-to-root call site in `process_request.rs` passes
+> `Some(backend.window_id())`, so an implementation that only maps
+> `host_parent == 0 → None` will reach the panic branch on every
+> reparent-to-root. The guard MUST treat `host_parent == self.core.window_id`
+> as root too. The old (pre-Phase-4) silent fallback covered this
+> implicitly via `!contains_key(host_parent) → None`; the narrowing to a
+> panic must preserve the root-sentinel case explicitly.
 
 - [ ] **Step 4: Run the panic test**
 
