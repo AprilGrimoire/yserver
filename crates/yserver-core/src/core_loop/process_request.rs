@@ -3972,6 +3972,17 @@ fn handle_composite_request(
         x11composite::REDIRECT_WINDOW | x11composite::REDIRECT_SUBWINDOWS => {
             if let Some((window, update)) = x11composite::parse_window_update(body) {
                 let subwindows = minor == x11composite::REDIRECT_SUBWINDOWS;
+                // Xorg compRedirectWindow (composite/compalloc.c:145-147): a
+                // client request to redirect the overlay window returns
+                // Success without installing any redirect. The COW reaches
+                // scanout via the normal paint path; it is never itself
+                // redirected. Match that exactly — NOT BadMatch (which would
+                // be a yserver-invented error). Scoped to RedirectWindow;
+                // RedirectSubwindows(COW) is benign (COW has no children to
+                // redirect) and Xorg doesn't special-case it either.
+                if !subwindows && ResourceId(window) == COMPOSITE_OVERLAY_WINDOW {
+                    return Ok(RequestOutcome::Handled);
+                }
                 // compositeproto: update=0 → Automatic, update=1 → Manual.
                 // Both wire constants are spec-legal; reject anything else
                 // with BadValue. We don't yet have a compositor consumer
@@ -26662,6 +26673,35 @@ mod tests {
         let n = peer.read(&mut buf).unwrap_or(0);
         assert_eq!(n, 0, "no error bytes expected, got {n} bytes: {buf:02x?}");
         assert_eq!(state.composite_redirects.len(), 1);
+    }
+
+    #[test]
+    fn redirect_window_cow_is_success_noop() {
+        // RedirectWindow(COW) must succeed silently (no X error on the wire)
+        // and must NOT install a redirect — matching Xorg compalloc.c:145-147.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+
+        dispatch_composite_redirect(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            crate::resources::COMPOSITE_OVERLAY_WINDOW.0,
+            1, // Manual
+        );
+
+        // No X11 error should have been queued to the client.
+        peer.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 32];
+        let n = peer.read(&mut buf).unwrap_or(0);
+        assert_eq!(n, 0, "no error bytes expected, got {n} bytes: {buf:02x?}");
+
+        // The COW must not be marked redirected: no redirect record exists.
+        assert!(
+            state.composite_redirects.is_empty(),
+            "RedirectWindow(COW) is a Success no-op, COW stays unredirected"
+        );
     }
 
     #[test]
