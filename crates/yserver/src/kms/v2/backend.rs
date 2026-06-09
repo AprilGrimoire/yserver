@@ -221,15 +221,6 @@ pub struct KmsBackendV2 {
     /// counter increments at least once.
     pub(crate) engine_copy_area_calls: u32,
 
-    /// Diagnostic ring of recent `PRESENT::Pixmap` source xids
-    /// targeted at COW. Captured via `note_present_pixmap` and
-    /// consumed by `do_dump_drawables_v2` so the per-drawable
-    /// dump includes "marco's most-recent offscreen" — the
-    /// pixmap whose content marco PresentPixmap'd to COW most
-    /// recently. Ring capacity 16 to keep memory trivial while
-    /// covering marco's typical double-buffered front/back pair
-    /// plus head-room for short flips of additional sources.
-    pub(crate) present_to_cow_sources: std::collections::VecDeque<u32>,
     /// Diagnostic ring of recent `PRESENT::Pixmap` submissions to
     /// any destination window. Cinnamon's shell menus paint into a
     /// fullscreen Muffin stage pixmap rather than a normal window
@@ -632,7 +623,6 @@ impl KmsBackendV2 {
             kms_outputs_active: true,
             clear_window_area_calls: 0,
             engine_copy_area_calls: 0,
-            present_to_cow_sources: std::collections::VecDeque::with_capacity(16),
             recent_present_pixmaps: std::collections::VecDeque::with_capacity(32),
             dri3_xshmfences: HashMap::new(),
             dri3_sync_resources: HashMap::new(),
@@ -752,7 +742,6 @@ impl KmsBackendV2 {
             kms_outputs_active: true,
             clear_window_area_calls: 0,
             engine_copy_area_calls: 0,
-            present_to_cow_sources: std::collections::VecDeque::with_capacity(16),
             recent_present_pixmaps: std::collections::VecDeque::with_capacity(32),
             dri3_xshmfences: HashMap::new(),
             dri3_sync_resources: HashMap::new(),
@@ -1363,7 +1352,6 @@ impl KmsBackendV2 {
             kms_outputs_active: true,
             clear_window_area_calls: 0,
             engine_copy_area_calls: 0,
-            present_to_cow_sources: std::collections::VecDeque::with_capacity(16),
             recent_present_pixmaps: std::collections::VecDeque::with_capacity(32),
             dri3_xshmfences: HashMap::new(),
             dri3_sync_resources: HashMap::new(),
@@ -1497,23 +1485,6 @@ impl KmsBackendV2 {
             }
         }
         result
-    }
-
-    /// Lazy COW scene registration. Called from every paint method
-    /// after `resolve_paint_target` succeeds: if the resolved target
-    /// is the Composite Overlay Window storage and the scene has
-    /// not yet registered it, register now.
-    ///
-    /// Kept as a no-op compatibility hook: early Stage 4d wired
-    /// COW-authoritative mode on the first raw paint into the
-    /// overlay storage. That turns out to be too early for Marco:
-    /// startup trickles partial paints into COW before the first
-    /// full-frame `PresentPixmap`, so scanout hides the real
-    /// toplevels before the compositor has published a complete
-    /// replacement. Registration now happens on the first overlay
-    /// `PresentPixmap` in `note_present_pixmap`.
-    pub(crate) fn maybe_register_cow_on_paint(&mut self, target_id: super::store::DrawableId) {
-        let _ = target_id;
     }
 
     fn resolve_paint_target_inner(
@@ -7008,32 +6979,12 @@ leaf_id={leaf_id:?} redirected_target={redirected_target:?} resolved={resolved:?
                 });
             }
         }
-        // Recent COW-targeted PresentPixmap sources — the bisect
-        // dump for "is marco's offscreen broken, or only the
-        // copy-to-COW step?" Walk in submission order (oldest
-        // first); dedup against drawables already in the target
-        // list so we don't double-dump if marco's offscreen
-        // happens to coincide with a registered backing.
+        // Dedup recent-Present source dumps against drawables
+        // already in the target list so we don't double-dump if a
+        // recent offscreen happens to coincide with a registered
+        // backing.
         let already: std::collections::HashSet<super::store::DrawableId> =
             targets.iter().map(|t| t.id).collect();
-        for (idx, &src_xid) in backend.present_to_cow_sources.iter().enumerate() {
-            let Some(src_id) = backend.store.lookup(src_xid) else {
-                continue;
-            };
-            if already.contains(&src_id) {
-                continue;
-            }
-            let Some(d) = backend.store.get(src_id) else {
-                continue;
-            };
-            targets.push(DumpTarget {
-                label: format!("present-src-{idx}-0x{src_xid:x}"),
-                id: src_id,
-                depth: d.depth,
-                width: d.storage.extent.width,
-                height: d.storage.extent.height,
-            });
-        }
         // Recent non-COW PresentPixmap sources. This captures
         // compositor-stage pixmaps too, which matter for Cinnamon:
         // the menu can be visible on screen while living only in a
@@ -8156,16 +8107,13 @@ impl Backend for KmsBackendV2 {
         // shape (cow_id set, recent sources non-empty) without
         // having to grep for the per-target log lines.
         log::info!(
-            "v2 dump_drawables: cow_id={:?} present_to_cow_sources_len={} \
-             recent_present_pixmaps_len={}",
+            "v2 dump_drawables: cow_id={:?} recent_present_pixmaps_len={}",
             self.cow_id,
-            self.present_to_cow_sources.len(),
             self.recent_present_pixmaps.len(),
         );
     }
 
     fn note_present_pixmap(&mut self, src_pixmap_xid: u32, dst_window_xid: u32) {
-        const COW_CAP: usize = 16;
         const PRESENT_CAP: usize = 32;
 
         if self.recent_present_pixmaps.back() != Some(&(src_pixmap_xid, dst_window_xid)) {
@@ -8175,30 +8123,6 @@ impl Backend for KmsBackendV2 {
             self.recent_present_pixmaps
                 .push_back((src_pixmap_xid, dst_window_xid));
         }
-
-        // Capture COW-targeted presents too — that's the original
-        // Stage 4d shadow/COW bisect point. On KMS the destination
-        // xid passed here is the backend's drawable xid, not
-        // necessarily the protocol's literal overlay xid, so resolve
-        // it through the store and compare the resulting DrawableId.
-        let is_cow_dst = self
-            .cow_id
-            .is_some_and(|cow_id| self.store.lookup(dst_window_xid) == Some(cow_id));
-        if !is_cow_dst {
-            return;
-        }
-        // Deduplicate consecutive same-xid presents (marco
-        // double-buffers two offscreens so the ring otherwise
-        // alternates between two values; keeping only fresh xids
-        // means a dump of size N captures up to N *distinct*
-        // recent sources).
-        if self.present_to_cow_sources.back() == Some(&src_pixmap_xid) {
-            return;
-        }
-        if self.present_to_cow_sources.len() == COW_CAP {
-            self.present_to_cow_sources.pop_front();
-        }
-        self.present_to_cow_sources.push_back(src_pixmap_xid);
     }
 
     fn wait_present_source_ready(&mut self, src_pixmap_host_xid: u32) {
@@ -10221,7 +10145,6 @@ impl Backend for KmsBackendV2 {
             self.log_v2_gap("copy_area_unknown_xid");
             return Ok(());
         };
-        self.maybe_register_cow_on_paint(dst_target.id);
         // Diagnostic trace (TEMP — Stage 4d "top-left-only CC" investigation).
         // Pins where each CopyArea lands: src store id, dst's resolved
         // PaintTarget (id + offset), and the wire src/dst coords + size.
@@ -10709,7 +10632,6 @@ impl Backend for KmsBackendV2 {
             self.log_v2_gap("put_image_unknown_xid");
             return Ok(());
         };
-        self.maybe_register_cow_on_paint(target.id);
         // GC clipping is honoured upstream by `clear_clip_rectangles`
         // when the dispatcher zeroes the clip (the MIT-SHM /
         // ImageText callers do this); Stage 2c's engine ignores
@@ -11801,7 +11723,6 @@ impl Backend for KmsBackendV2 {
             );
             return Ok(());
         };
-        self.maybe_register_cow_on_paint(dst_target.id);
         let dst_clip = Self::shift_dst_picture_clip(dst_clip, dst_target.offset);
 
         // Audit #2 (2026-05-19) — fold src/mask client clips into
@@ -12057,7 +11978,6 @@ impl Backend for KmsBackendV2 {
             log::debug!("v2 composite_glyphs gap: dst drawable 0x{dst_host_xid:x} not in store");
             return Ok(());
         };
-        self.maybe_register_cow_on_paint(dst_target.id);
         let dst_clip = Self::shift_dst_picture_clip(dst_clip, dst_target.offset);
         if !self.core.glyphsets.contains_key(&host_gs) {
             log::debug!("v2 composite_glyphs gap: glyphset 0x{host_gs:x} not registered");
@@ -12375,7 +12295,6 @@ impl Backend for KmsBackendV2 {
             );
             return Ok(());
         };
-        self.maybe_register_cow_on_paint(dst_target.id);
         let dst_clip = Self::shift_dst_picture_clip(dst_clip, dst_target.offset);
         let (paint_dx, paint_dy) = dst_target.offset;
 
@@ -12531,7 +12450,6 @@ impl Backend for KmsBackendV2 {
             log::debug!("v2 render_trapezoids gap: dst drawable 0x{dst_host_xid:x} not in store");
             return Ok(());
         };
-        self.maybe_register_cow_on_paint(dst_target.id);
         let dst_clip = Self::shift_dst_picture_clip(dst_clip, dst_target.offset);
         let dx = (i32::from(x_off) + dst_target.offset.0) << 16;
         let dy = (i32::from(y_off) + dst_target.offset.1) << 16;
@@ -12734,7 +12652,6 @@ impl Backend for KmsBackendV2 {
             log::debug!("v2 render_triangles gap: dst drawable 0x{dst_host_xid:x} not in store");
             return Ok(());
         };
-        self.maybe_register_cow_on_paint(dst_target.id);
         let dst_clip = Self::shift_dst_picture_clip(dst_clip, dst_target.offset);
         let dx = (i32::from(x_off) + dst_target.offset.0) << 16;
         let dy = (i32::from(y_off) + dst_target.offset.1) << 16;
@@ -18657,10 +18574,6 @@ mod tests {
             b.recent_present_pixmaps.back(),
             Some(&(0x4000_3000, 0x4000_2000)),
             "non-COW PresentPixmap must still land in the general diagnostic ring",
-        );
-        assert!(
-            b.present_to_cow_sources.is_empty(),
-            "non-COW PresentPixmap must not pollute the COW-only ring",
         );
     }
 
