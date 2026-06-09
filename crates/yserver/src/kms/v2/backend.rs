@@ -8821,10 +8821,12 @@ impl Backend for KmsBackendV2 {
     ) -> io::Result<()> {
         // Stage 3f.6: update the parent xid so build_scene's
         // descendant traversal sees the new tree shape on the next
-        // tick. A `host_parent` of 0 (or any xid not in
-        // `windows_v2` — typically root, 0x100) means the window
-        // becomes a top-level under root; we record `None` so the
-        // recurse treats it as a top-level entry.
+        // tick. BOTH `host_parent == 0` and `host_parent ==
+        // core.window_id` (root's real host xid; root is never tracked
+        // in `windows_v2`) mean the window becomes a top-level under
+        // root; we record `None` so the recurse treats it as a top-
+        // level entry. A genuinely-unknown non-root xid is projection
+        // drift between resources and backend and panics below.
         //
         // Stage 3f.11 bug-fix: also reconcile `core.top_level_order`
         // with the new parent. Pre-3f.11, an xid that was originally
@@ -8837,9 +8839,13 @@ impl Backend for KmsBackendV2 {
         // its correct screen position). Observable as MATE's clock
         // applet rendered at BOTH ends of the panel: the right edge
         // is the real position, the left edge is the ghost.
-        let parent = if host_parent == 0 {
-            // host_parent == 0 is the documented "reparent to root"
-            // convention in windows_v2 (root isn't tracked).
+        let parent = if host_parent == 0 || host_parent == self.core.window_id {
+            // BOTH sentinels mean "top-level under root": `0` is the
+            // legacy convention; `core.window_id` is root's real host
+            // xid (root is never tracked in windows_v2). The reparent-
+            // to-root path passes backend.window_id() (== core.window_id),
+            // NOT 0 — so this second clause is load-bearing. (Same root-
+            // sentinel check as backend.rs:1668.)
             None
         } else if self.windows_v2.contains_key(&host_parent) {
             Some(host_parent)
@@ -8851,8 +8857,8 @@ impl Backend for KmsBackendV2 {
             // but windows_v2 doesn't, that's drift — surface it.
             panic!(
                 "reparent_subwindow: host_parent 0x{host_parent:x} missing from \
-                 windows_v2; resources layer must validate ReparentWindow before \
-                 dispatching to backend"
+                 windows_v2 (and is neither 0 nor root/core.window_id); resources \
+                 layer must validate ReparentWindow before dispatching to backend"
             );
         };
         let new_rank = self.alloc_window_stack_rank();
@@ -17536,6 +17542,47 @@ mod tests {
         // 0 is the legitimate "reparent to root" convention; 0xDEADBEEF
         // is genuinely absent and must trip the drift panic.
         let _ = b.reparent_subwindow(None, child_xid, 0xDEAD_BEEF, 0, 0);
+    }
+
+    /// Task 4.1 regression: the production reparent-to-root path
+    /// (`process_request.rs` `handle_reparent_window`) computes
+    /// `host_parent` as `backend.window_id()` (== `core.window_id` == 1)
+    /// for `ReparentWindow(child -> ROOT_WINDOW)`, NOT 0. Root is never
+    /// tracked in `windows_v2`, so the missing-parent panic guard must
+    /// treat `core.window_id` as a root sentinel (-> top-level) instead
+    /// of crashing. Without the fix this panics on every WM window-
+    /// withdraw / frame-teardown.
+    #[test]
+    fn reparent_subwindow_to_root_via_window_id_does_not_panic() {
+        let mut b = KmsBackendV2::for_tests();
+        let root_xid = b.window_id();
+        assert_eq!(root_xid, 1, "core.window_id sentinel changed");
+        let child_xid: u32 = 0x0040_0050;
+        b.windows_v2.insert(
+            child_xid,
+            super::WindowGeometryV2 {
+                x: 5,
+                y: 7,
+                width: 100,
+                height: 100,
+                depth: 24,
+                mapped: true,
+                // Originally a sub-window under some frame; the WM now
+                // reparents it back to root (withdraw / frame teardown).
+                parent: Some(0x0040_0060),
+                stack_rank: 0,
+                bg_pixel: None,
+                bg_pixmap: None,
+                cursor: None,
+            },
+        );
+        // host_parent == root's real host xid (core.window_id), exactly
+        // what the production call site passes for reparent-to-ROOT.
+        let res = b.reparent_subwindow(None, child_xid, root_xid, 0, 0);
+        assert!(res.is_ok(), "reparent-to-root must succeed, got {res:?}");
+        // Child is now a top-level under root.
+        assert_eq!(b.windows_v2.get(&child_xid).unwrap().parent, None);
+        assert!(b.core.top_level_order.contains(&child_xid));
     }
 
     /// Stage 3f.11: `restack_top_level` with `stack_mode=Below` and
