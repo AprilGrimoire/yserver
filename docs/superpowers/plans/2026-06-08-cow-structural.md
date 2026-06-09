@@ -2082,6 +2082,139 @@ Xorg equivalent (feedback_match_xorg_clients_dont_get_patched.md)."
 
 ---
 
+### Task 4.5: The COW is never *actually* redirected (compCheckRedirect guard)
+
+> **Added 2026-06-09 after HW debugging.** bee/cinnamon-mutter rendered
+> only the root wallpaper + cursor — the entire composited desktop was
+> missing. Root-caused from the scene trace (`yserver-hw-cinnamon.log`):
+> ```
+> #386 COMPOSITE::RedirectSubwindows(0x100, mode=Manual)
+> allocate_redirected_backing W=0x103: fresh B=0x400028 (2560x1440, depth=24)
+> set_redirected_target window=DrawableId(22) old=None new=Some(DrawableId(35))
+> scene_walk xid=0x103: SKIP reason=manual_redirect_unconditional_skip scene_participating=false source_id=DrawableId(35)
+> ```
+> The COW (`0x103`) was emitting fine (`WILL_EMIT scene_participating=true`)
+> until mutter issued `RedirectSubwindows(root, Manual)`. Because the COW
+> is now a real child of root (Phase 2), that redirect-subwindows applied
+> to the COW: it got a Manual backing + `scene_participating=false`, and
+> the Phase 3 Manual-skip then dropped it from the scene → blank desktop.
+>
+> Task 4.4 only handled *explicit* `RedirectWindow(COW)`. The
+> `RedirectSubwindows(root)` and auto-redirect-on-map paths were
+> unguarded. Xorg blocks ALL paths at one chokepoint — `compCheckRedirect`
+> (`composite/compwindow.c:156-170`) forces `should = FALSE` for
+> `pWin == cs->pOverlayWin`. yserver's equivalent single chokepoint is
+> `activate_redirect_backing_for` (every redirect-application path funnels
+> through it). Guard it.
+
+**Files:**
+- Modify: `crates/yserver-core/src/core_loop/process_request.rs` (`activate_redirect_backing_for`, ~line 622)
+- Test: same file's tests mod
+
+- [ ] **Step 1: Add a failing test**
+
+The test materializes the COW, then drives `activate_redirect_backing_for(state, backend, None, COMPOSITE_OVERLAY_WINDOW, Manual)` (the call `RedirectSubwindows(root, Manual)`'s child loop makes for each root child) and asserts the COW gained NO redirect backing and its scene participation was NOT flipped:
+
+```rust
+    #[test]
+    fn activate_redirect_on_cow_is_never_applied() {
+        // Mirror Xorg compCheckRedirect: the overlay window is never
+        // actually redirected, regardless of trigger.
+        let mut state = /* fresh ServerState with COW materialized */;
+        let mut backend = KmsBackendV2::for_tests();
+        // Drive the COW first-claim so the resources COW record exists.
+        // (Use whatever GetOverlayWindow dispatch / materialize_cow_resource
+        //  the neighboring tests use.)
+
+        activate_redirect_backing_for(
+            &mut state, &mut backend, None,
+            COMPOSITE_OVERLAY_WINDOW,
+            crate::server::CompositeRedirectMode::Manual,
+        );
+
+        let cow = state.resources.window(COMPOSITE_OVERLAY_WINDOW).expect("COW exists");
+        assert!(cow.redirected_backing.is_none(),
+            "COW must never receive a redirect backing (compCheckRedirect: should=FALSE for pOverlayWin)");
+        // And no scene-participation flip happened on the backend side
+        // (observe via whatever the backend exposes; if RecordingBackend
+        //  is used, assert it recorded no set_window_scene_participation(false)
+        //  for the COW host xid).
+    }
+```
+
+Adapt the fixture + the participation-flip observation to the project's actual conventions (the redirect tests near `activate_redirect_backing_for` in process_request.rs tests mod are the model).
+
+- [ ] **Step 2: Run, confirm it FAILS** — today `activate_redirect_backing_for` allocates a backing for the COW.
+
+- [ ] **Step 3: Add the guard at the top of `activate_redirect_backing_for`**
+
+```rust
+fn activate_redirect_backing_for(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    window: ResourceId,
+    mode: crate::server::CompositeRedirectMode,
+) {
+    // Xorg compCheckRedirect (composite/compwindow.c:156-170): the
+    // overlay window is NEVER actually redirected — `should = FALSE`
+    // for `pWin == cs->pOverlayWin`, regardless of trigger
+    // (RedirectSubwindows(root), explicit RedirectWindow, or
+    // auto-redirect-on-map). The COW is a real child of root (Phase 2),
+    // so RedirectSubwindows(root, Manual) — which every mutter-class
+    // compositor issues — would otherwise hand the COW a Manual backing
+    // + scene_participating=false, and the Phase 3 Manual-skip would
+    // then drop the entire composited desktop from scanout. The COW
+    // reaches scanout via the normal paint path; it is never itself
+    // redirected.
+    if window == COMPOSITE_OVERLAY_WINDOW {
+        return;
+    }
+    // ... existing body ...
+}
+```
+
+- [ ] **Step 4: Run the test + the existing redirect tests**
+
+Run: `cargo test -p yserver-core --lib activate_redirect` and the broader `redirect` / `redirect_subwindows` suites.
+Expected: new test passes; existing redirect tests unaffected (no other window is touched by the guard).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/yserver-core/src/core_loop/process_request.rs
+git commit -m "composite: never redirect the COW (compCheckRedirect guard)
+
+Mirrors Xorg compCheckRedirect (composite/compwindow.c:156-170), which
+forces should=FALSE for the overlay window so it is never actually
+redirected — regardless of trigger.
+
+Since Phase 2 made the COW a real child of root, a compositor's
+CompositeRedirectSubwindows(root, Manual) (mutter/cinnamon-mutter all
+issue it) redirected the COW too: it got a Manual backing +
+scene_participating=false, and the Phase 3 Manual-skip then dropped the
+COW from the scene -> the entire composited desktop vanished, leaving
+only root wallpaper + cursor (observed bee/cinnamon-mutter 2026-06-09).
+
+Task 4.4 only guarded explicit RedirectWindow(COW). This guards the
+single redirect-activation chokepoint (activate_redirect_backing_for),
+covering RedirectSubwindows(root), reapply-on-map, and the
+child-of-redirected reparent hook — every path, like Xorg's single
+compCheckRedirect consult point.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
+```
+
+> **Follow-up noted (NOT this task):** the scene trace also showed the
+> COW sitting mid-`top_level_order` (the backend projection isn't
+> COW-aware the way Phase 1 made `resources.root.children` COW-aware).
+> It's not the blank-desktop blocker — the entries after the COW are
+> Manual-redirected app windows that skip emit, so the COW is still the
+> last *emitted* top-level. Track separately; re-evaluate after 4.5
+> HW-reverifies.
+
+---
+
 ### Phase 4 acceptance
 
 - [ ] `cargo build --locked` — green.

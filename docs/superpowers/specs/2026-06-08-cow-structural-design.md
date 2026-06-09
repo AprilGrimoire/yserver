@@ -307,6 +307,33 @@ The COW's pixels reach scanout via the normal paint path; the
 mistake or reflex) sees the same benign outcome it would on Xorg
 rather than an error yserver made up.
 
+**The explicit-`RedirectWindow` no-op is NOT sufficient on its own.**
+The COW is now a real child of root (§1), so
+`CompositeRedirectSubwindows(root, ...)` — which every mutter-class
+compositor issues — would otherwise redirect the COW along with the
+real top-levels, and the auto-redirect-on-map path would do the same.
+Xorg blocks ALL of these at one chokepoint: `compCheckRedirect`
+(`composite/compwindow.c:156-170`) computes `should = realized &&
+!InputOnly && cw != NULL && parent != NULL`, then unconditionally
+forces `should = FALSE` when `pWin == cs->pOverlayWin`. The COW
+therefore *never* receives a redirect pixmap, no matter how the
+redirect was triggered.
+
+yserver must mirror this at its single redirect-activation chokepoint
+(`process_request.rs::activate_redirect_backing_for`, reached by
+RedirectSubwindows' child loop, explicit RedirectWindow, reapply-on-map,
+and the child-of-redirected reparent hook): **if the target window is
+`COMPOSITE_OVERLAY_WINDOW`, never allocate a redirect backing and never
+flip `scene_participating`.** Without this, `RedirectSubwindows(root,
+Manual)` flips the COW to `scene_participating=false` + a redirected
+backing, the Manual-redirect emit-skip (§4) then drops the COW from the
+scene, and the entire composited desktop vanishes — only the root
+wallpaper and cursor remain. (Observed on bee/cinnamon-mutter
+2026-06-09; root-caused from the scene trace:
+`scene_walk xid=0x103: SKIP reason=manual_redirect_unconditional_skip`
+immediately after `RedirectSubwindows(0x100, Manual)` +
+`allocate_redirected_backing W=0x103`.)
+
 ## State ownership
 
 After this change, ownership becomes:
