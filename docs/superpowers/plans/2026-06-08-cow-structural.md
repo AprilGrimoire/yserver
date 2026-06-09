@@ -26,7 +26,7 @@
 | File | Reason |
 |---|---|
 | `crates/yserver-core/src/resources.rs` | Remove init-time COW seed (line ~242). Add `cow_aware_top_index` helper. Apply to `create_window` (line ~520), `restack_window` `Top`/`AboveSibling` (line ~727-755), `reparent_window` push-to-root (line ~1250), `circulate_window` (line ~1003). Reject reparenting COW away from root. |
-| `crates/yserver-core/src/core_loop/process_request.rs` | Wire `GetOverlayWindow` to create the COW resource + invoke backend materialization. Wire `ReleaseOverlayWindow` teardown. Reject `RedirectWindow(COW, ...)` with `BadMatch`. Reject `ReparentWindow(COW, non-root)` with `BadMatch`. Treat post-validation backend drift as panic (no `let _ = ...`). |
+| `crates/yserver-core/src/core_loop/process_request.rs` | Wire `GetOverlayWindow` to create the COW resource + invoke backend materialization. Wire `ReleaseOverlayWindow` teardown. `RedirectWindow(COW, ...)` → `Success` no-op (matches Xorg `compRedirectWindow`). COW reparents use the existing generic cycle rule — no COW-special rejection (matches Xorg). Treat post-validation backend drift as panic (no `let _ = ...`). |
 | `crates/yserver-core/src/server.rs` | Update `hit_test_children` (line ~1791) to descend through the COW (skipping it as a hit target) instead of the existing "COW not in children" special case (line ~1799-1807, deleted). |
 | `crates/yserver-core/src/backend/trait_def.rs` | Change `get_overlay_window` return type to `io::Result<bool>` (true on 0→1). Add `cow_host_xid() -> Option<u32>` getter (default `None`). No new lifecycle methods — the existing overlay hooks own the full COW lifecycle including windows_v2 / top_level_order. |
 | `crates/yserver/src/kms/v2/backend.rs` | Extend `get_overlay_window` (line ~9363) to also insert COW into `windows_v2` + `top_level_order` on the 0→1 transition; extend `release_overlay_window` (line ~9415) to symmetric teardown. Implement `cow_host_xid()`. Remove missing-parent fallback in `reparent_subwindow` (line ~8840) — panic on drift. Delete `arm_cow_from_recent_present_if_needed` (line ~1319), `present_to_cow_sources` ring, `maybe_register_cow_on_paint` (line ~1551). |
@@ -1549,7 +1549,7 @@ Deleting it removes the footgun."
 
 - [ ] `cargo build --locked` — green.
 - [ ] `cargo test -p yserver-core --lib` and `cargo test -p yserver --lib` — green.
-- [ ] At this point cinnamon should be **visually correct AND interactive**: keyring/seahorse/logout dialogs appear on top of their parents, AND clicks reach the right destinations (stage descendants get input; non-COW siblings get clicks below COW). This phase is the load-bearing fix for the cinnamon symptom. Phases 3-5 are correctness hardening (Manual skip, panic-on-drift, BadMatch guards); HW validation in Phase 6.
+- [ ] At this point cinnamon should be **visually correct AND interactive**: keyring/seahorse/logout dialogs appear on top of their parents, AND clicks reach the right destinations (stage descendants get input; non-COW siblings get clicks below COW). This phase is the load-bearing fix for the cinnamon symptom. Phases 3-5 are correctness hardening (Manual skip, panic-on-drift, Xorg-faithful COW reparent/redirect); HW validation in Phase 6.
 
 ---
 
@@ -1709,7 +1709,7 @@ now matches that behavior, regardless of cow_id state."
 
 ## Phase 4 — Hard failures on drift + protocol-level validation
 
-**Purpose:** delete the silent `reparent_subwindow` missing-parent fallback (so drift is a panic, not a silent corruption); ensure callers don't discard `Err`; reject `ReparentWindow(COW, non-root)` and `RedirectWindow(COW, ...)` with `BadMatch` at the protocol layer.
+**Purpose:** delete the silent `reparent_subwindow` missing-parent fallback (so drift is a panic, not a silent corruption); ensure callers don't discard `Err`; pin the Xorg-faithful COW reparent/redirect behavior at the protocol layer (generic cycle rule covers COW reparents; `RedirectWindow(COW)` → `Success` no-op — no yserver-invented `BadMatch`).
 
 ### Task 4.1: Remove silent missing-parent fallback in `reparent_subwindow`
 
@@ -1853,96 +1853,140 @@ kind of drift the spec wants to surface."
 
 ---
 
-### Task 4.3: Reject `ReparentWindow(COW, non-root)` with `BadMatch`
+### Task 4.3: Verify the generic cycle rule already covers COW reparents (Xorg-faithful)
+
+> **Redesigned 2026-06-09 (Match-Xorg-strictly).** The earlier draft of
+> this task added a COW-specific `BadMatch` for `ReparentWindow(COW,
+> non-root)` and a second COW-specific cycle guard. **Both are wrong:**
+> - Xorg's `compReparentWindow` (`composite/compwindow.c:438`) has **no**
+>   COW-specific reparent check; `ProcReparentWindow` (`dix/dispatch.c:877`)
+>   only applies the generic same-screen / ParentRelative-depth /
+>   InputOnly-parent rules plus the cycle rule in `ReparentWindow`
+>   (`dix/window.c`: `TraverseTree(pWin, CompareWIDs, &pParent->id) ==
+>   WT_STOPWALKING → BadMatch`). There is no "COW can't move from root"
+>   error to mirror.
+> - yserver **already** enforces that exact generic cycle rule in
+>   `ResourceTable::reparent_window` (`resources.rs:1267`):
+>   ```rust
+>   if request.window == ROOT_WINDOW
+>       || request.window == request.parent
+>       || self.is_descendant_of(request.parent, request.window)
+>   {
+>       return Err(ReparentWindowError::BadMatch);
+>   }
+>   ```
+>   When `request.parent == COW`, the third clause reduces to "is COW a
+>   descendant of the moved window?" — identical to the COW cycle guard
+>   the earlier draft proposed. So that guard is **fully redundant**.
+>
+> Per `feedback_match_xorg_clients_dont_get_patched.md`, a compositor that
+> reparents the COW away from root gets the same outcome it would on Xorg
+> (the reparent succeeds; compositing breaks; the compositor's bug). We do
+> NOT invent a new error.
+>
+> **This task therefore adds NO production code.** It adds regression
+> tests that pin the Xorg-faithful behavior so a future change can't
+> silently reintroduce a COW-special rejection or drop the generic cycle
+> check.
 
 **Files:**
-- Modify: `crates/yserver-core/src/core_loop/process_request.rs` (the `ReparentWindow` handler)
-- Test: a new integration-shape test, or unit test in the request handler's tests mod
+- Test only: `crates/yserver-core/src/resources.rs` (`tests` mod) — the cycle rule lives in `ResourceTable::reparent_window`, so test it there directly.
 
-- [ ] **Step 1: Add a failing test**
+- [ ] **Step 1: Confirm the generic cycle rule covers COW**
+
+Read `ResourceTable::reparent_window` (`resources.rs:1263`) and confirm the guard at line 1267 includes `self.is_descendant_of(request.parent, request.window)`. If the guard is missing or shaped differently than the redesign note above assumes, **stop and report BLOCKED** — the premise of this task (no new code needed) is wrong.
+
+- [ ] **Step 2: Add regression tests**
+
+In `resources.rs` `tests` mod (use the existing `materialize_cow_resource` + `make_child` helpers):
 
 ```rust
     #[test]
-    fn reparent_window_cow_to_non_root_returns_bad_match() {
-        // Set up a state with COW materialized and a non-root window W.
-        let mut state = /* fresh ServerState with COW materialized */;
-        let mut backend = KmsBackendV2::for_tests();
+    fn reparent_cow_under_its_own_descendant_is_bad_match() {
+        // Materialize COW (child of root), then create a child C under COW.
+        let mut t = ResourceTable::new();
+        let host_xid = WindowHandle::from_raw_panicking(0x4000_0103);
+        t.materialize_cow_resource(host_xid);
+        make_child(&mut t, 0xC0, COMPOSITE_OVERLAY_WINDOW.0, 0, 0);
 
-        let w = ResourceId(0x0010_0500);
-        state.resources.create_window(
-            ClientId(1),
-            CreateWindowRequest {
-                depth: 24, window: w, parent: ROOT_WINDOW,
-                x: 0, y: 0, width: 100, height: 100, border_width: 0,
-                class: 1, visual: ROOT_VISUAL,
-                ..Default::default()
-            },
-        );
+        // ReparentWindow(window=COW, parent=C) would make COW a descendant
+        // of itself → BadMatch via the GENERIC cycle rule (no COW-special
+        // code). is_descendant_of(parent=C, window=COW) is true because C's
+        // parent chain reaches COW.
+        let err = t.reparent_window(ReparentWindowRequest {
+            window: COMPOSITE_OVERLAY_WINDOW,
+            parent: ResourceId(0xC0),
+            x: 0, y: 0,
+        });
+        assert!(matches!(err, Err(ReparentWindowError::BadMatch)),
+            "reparenting COW under its own child must be BadMatch (generic cycle rule)");
+    }
 
-        // Dispatch ReparentWindow(COW, W) — should error with BadMatch.
-        let result = dispatch_reparent_window(&mut state, &mut backend, COMPOSITE_OVERLAY_WINDOW, w);
-        assert!(matches!(result, Err(x11_error_kind::BadMatch)),
-            "ReparentWindow(COW, non-root) must return BadMatch");
+    #[test]
+    fn reparent_cow_to_a_normal_toplevel_succeeds_xorg_faithful() {
+        // Xorg does NOT reject moving the COW to an unrelated window. yserver
+        // must match: a reparent to a non-descendant, non-root window succeeds.
+        let mut t = ResourceTable::new();
+        make_child(&mut t, 0x200, ROOT_WINDOW.0, 0, 0); // unrelated top-level W
+        let host_xid = WindowHandle::from_raw_panicking(0x4000_0103);
+        t.materialize_cow_resource(host_xid);
 
-        // Verify COW is still a child of root.
-        assert_eq!(state.resources.window(COMPOSITE_OVERLAY_WINDOW).unwrap().parent, ROOT_WINDOW);
+        let res = t.reparent_window(ReparentWindowRequest {
+            window: COMPOSITE_OVERLAY_WINDOW,
+            parent: ResourceId(0x200),
+            x: 0, y: 0,
+        });
+        assert!(res.is_ok(),
+            "reparenting COW to an unrelated window succeeds — matches Xorg \
+             (compositing breaks, but that's the compositor's bug, not ours)");
+        assert_eq!(t.window(COMPOSITE_OVERLAY_WINDOW).unwrap().parent, ResourceId(0x200));
     }
 ```
 
-(Adjust to use the project's actual error-dispatch convention. `dispatch_reparent_window` is a stand-in for the existing test helper — match whatever pattern other tests use.)
+(Match the real field names of `ReparentWindowRequest` — check the struct; the plan assumes `window`, `parent`, `x`, `y`.)
 
-- [ ] **Step 2: Run test to verify it fails**
+- [ ] **Step 3: Run the tests**
 
-Expected: FAIL — current handler accepts the reparent.
+Run: `cargo test -p yserver-core --lib resources::tests::reparent_cow`
+Expected: PASS (both — they exercise existing behavior, so they're green from the start; their value is regression protection, not red→green).
 
-- [ ] **Step 3: Patch the `ReparentWindow` handler**
-
-Find the existing handler (grep for `fn handle_reparent_window` or similar in process_request.rs). At the top of the handler, after parsing the request body, add:
-
-```rust
-    // Spec §6: COW is not reparentable. The compositor uses it via
-    // GetOverlayWindow / ReleaseOverlayWindow; reparenting away from
-    // root would break the COW-at-top invariant.
-    if request.window == COMPOSITE_OVERLAY_WINDOW && request.parent != ROOT_WINDOW {
-        return emit_x11_error(
-            state,
-            client_id,
-            sequence,
-            x11::error::BAD_MATCH,
-            request.window.0,
-            /* reparent opcode */,
-        );
-    }
-    // Spec §6: cannot make COW a descendant of itself.
-    if request.parent == COMPOSITE_OVERLAY_WINDOW
-        && self.is_descendant_of(COMPOSITE_OVERLAY_WINDOW, request.window)
-    {
-        return emit_x11_error(state, client_id, sequence, x11::error::BAD_MATCH, request.window.0, /* opcode */);
-    }
-```
-
-The second guard relies on a `is_descendant_of(ancestor, candidate)` helper — if one doesn't exist, add it as a small helper on `ResourceTable` (walks parent chain from candidate, looking for ancestor; returns false if not found within reasonable depth).
-
-- [ ] **Step 4: Run reparent tests**
-
-Run: `cargo test -p yserver-core --lib reparent_window_cow`
-Expected: PASS.
-
-- [ ] **Step 5: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
-git add crates/yserver-core/src/core_loop/process_request.rs crates/yserver-core/src/resources.rs
-git commit -m "composite: reject ReparentWindow(COW, ...) with BadMatch
+git add crates/yserver-core/src/resources.rs
+git commit -m "resources: pin Xorg-faithful COW reparent behavior (regression tests)
 
-The COW's parent is always ROOT_WINDOW (spec invariant 8). Any reparent
-that would move the COW away from root, or make COW a descendant of
-itself, is BadMatch — same behavior as Xorg's CompositeRealChildHead
-invariant enforcement."
+No production change. Xorg has no COW-specific reparent rejection
+(compReparentWindow, compwindow.c:438); the only rule is the generic
+cycle check (dix/window.c TraverseTree -> BadMatch), which yserver
+already enforces in ResourceTable::reparent_window (is_descendant_of
+guard at resources.rs:1267) and which covers the COW case for free.
+
+These tests pin both halves so a future change can't reintroduce a
+COW-special BadMatch or drop the generic cycle guard:
+ - reparent COW under its own descendant -> BadMatch (cycle rule)
+ - reparent COW to an unrelated top-level -> Ok (Xorg-faithful; broken
+   compositing is the compositor's bug, per
+   feedback_match_xorg_clients_dont_get_patched.md)"
 ```
 
 ---
 
-### Task 4.4: Reject `RedirectWindow(COW, ...)` with `BadMatch`
+### Task 4.4: `RedirectWindow(COW, ...)` is a silent `Success` no-op (Xorg-faithful)
+
+> **Redesigned 2026-06-09 (Match-Xorg-strictly).** The earlier draft
+> returned `BadMatch`, citing `compwindow.c:166-170`. That citation is
+> `compCheckRedirect`'s internal `should = FALSE` short-circuit (the
+> server never *auto*-redirects the COW) — **not** a request-level
+> rejection. A client-issued `CompositeRedirectWindow(COW)` actually hits
+> `compRedirectWindow` (`composite/compalloc.c:145-147`):
+> ```c
+> if (pWin == cs->pOverlayWin) {
+>     return Success;
+> }
+> ```
+> So Xorg returns **`Success`** and installs no redirect. yserver must
+> match: short-circuit to a successful no-op, NOT `BadMatch`.
 
 **Files:**
 - Modify: `crates/yserver-core/src/core_loop/process_request.rs` (the `Composite::RedirectWindow` handler)
@@ -1951,43 +1995,71 @@ invariant enforcement."
 
 ```rust
     #[test]
-    fn redirect_window_cow_returns_bad_match() {
+    fn redirect_window_cow_is_success_noop() {
+        // RedirectWindow(COW) must succeed silently (no X error on the wire)
+        // and must NOT install a redirect — matching Xorg compalloc.c:145.
+        // Use the same dispatch fixture the neighboring redirect tests use
+        // (e.g. dispatch_composite_redirect) and assert NO error byte comes
+        // back, and that the COW did not gain a redirected target.
         let mut state = /* fresh ServerState with COW materialized */;
         let mut backend = KmsBackendV2::for_tests();
-        let result = dispatch_redirect_window(&mut state, &mut backend, COMPOSITE_OVERLAY_WINDOW, /*mode=Manual*/ 1);
-        assert!(matches!(result, Err(x11_error_kind::BadMatch)),
-            "RedirectWindow(COW, ...) must return BadMatch");
+
+        dispatch_composite_redirect(&mut state, &mut backend, COMPOSITE_OVERLAY_WINDOW, /*mode=Manual*/ 1);
+
+        // No X11 error should have been queued to the client (mirror the
+        // assertion style of redirect_window_conflict_* tests in this file:
+        // they read the client socket for an error reply — here assert the
+        // socket has NO pending error).
+        // AND: the COW must not be marked redirected in resources/backend.
+        assert!(/* COW has no redirect state */,
+            "RedirectWindow(COW) is a Success no-op, COW stays unredirected");
     }
 ```
+
+Adapt to the project's actual redirect-dispatch + error-observation convention (the neighboring `redirect_window_conflict_from_different_client_returns_bad_access` test shows how to observe an error reply over the client socket; here you assert the *absence* of one).
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Expected: FAIL.
+Expected: FAIL — a freshly reset tree has no COW handling in the RedirectWindow path and would attempt to actually redirect the COW (installing redirect state / emitting unexpected behavior).
 
 - [ ] **Step 3: Patch the `RedirectWindow` handler**
 
-Find `Composite::RedirectWindow` handling (grep `RedirectWindow` in process_request.rs). At the top, after parsing:
+Find the `RedirectWindow` / `RedirectSubwindows` arm (grep `REDIRECT_WINDOW` / `RedirectWindow` in process_request.rs). After the request body is parsed, before any redirect setup, add the COW short-circuit. Match the handler's actual success-return convention (it returns `io::Result<RequestOutcome>`; a no-op success is whatever the other "nothing to do" arms return — e.g. `Ok(RequestOutcome::…)` with no error queued and no state mutation):
 
 ```rust
-    if request.window == COMPOSITE_OVERLAY_WINDOW {
-        // Mirrors Xorg's compwindow.c:166-170 "Never redirect the overlay window."
-        return emit_x11_error(state, client_id, sequence, x11::error::BAD_MATCH, request.window.0, /*opcode*/);
+    // Xorg compRedirectWindow (composite/compalloc.c:145-147): a client
+    // request to redirect the overlay window returns Success without
+    // installing any redirect. The COW reaches scanout via the normal
+    // paint path; it is never itself redirected. Match that exactly —
+    // NOT BadMatch (which would be a yserver-invented error).
+    if window == COMPOSITE_OVERLAY_WINDOW {
+        return Ok(/* the handler's standard no-op success outcome */);
     }
 ```
 
+Apply only to `RedirectWindow`; `RedirectSubwindows(COW)` is benign on its own (COW has no children to redirect) and Xorg doesn't special-case it either — leave it on the normal path.
+
 - [ ] **Step 4: Run tests**
 
-Expected: PASS.
+Run: `cargo test -p yserver-core --lib redirect_window_cow`
+Expected: PASS. Also run the neighboring redirect tests to confirm no regression: `cargo test -p yserver-core --lib redirect_window`.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add crates/yserver-core/src/core_loop/process_request.rs
-git commit -m "composite: reject RedirectWindow(COW, ...) with BadMatch
+git commit -m "composite: RedirectWindow(COW) is a Success no-op (matches Xorg)
 
-Mirrors compwindow.c:166-170 ('Never redirect the overlay window'). The
-COW's pixels reach scanout via the normal paint path; redirecting it
-would create a recursive composition model that doesn't exist in Xorg."
+Xorg's compRedirectWindow (composite/compalloc.c:145-147) returns
+Success and installs no redirect when the target is the overlay window.
+yserver now matches exactly: short-circuit to a successful no-op.
+
+The earlier draft returned BadMatch, citing compwindow.c:166-170 — but
+that is compCheckRedirect's internal should=FALSE (the server never
+auto-redirects the COW), not a request-level rejection. A client
+CompositeRedirectWindow(COW) hits compRedirectWindow, which returns
+Success. Returning BadMatch would be a yserver-invented error with no
+Xorg equivalent (feedback_match_xorg_clients_dont_get_patched.md)."
 ```
 
 ---
@@ -2297,8 +2369,11 @@ docs/superpowers/specs/2026-06-08-cow-structural-design.md:
 - Scene compose deletes the special COW append; COW emits via the
   normal top_level_order walk. alpha_passthrough is carried by an
   inherited under_cow_subtree recursion flag.
-- ReparentWindow(COW, non-root) and RedirectWindow(COW, ...) rejected
-  with BadMatch.
+- COW reparent/redirect match Xorg exactly: the generic cycle rule
+  (is_descendant_of guard in reparent_window) covers COW reparents
+  with no COW-special rejection, and RedirectWindow(COW) is a Success
+  no-op (compRedirectWindow, compalloc.c:145). No yserver-invented
+  BadMatch.
 - reparent_subwindow's silent missing-parent fallback removed; drift
   between resources and backend now panics (callers no longer discard
   the Err).

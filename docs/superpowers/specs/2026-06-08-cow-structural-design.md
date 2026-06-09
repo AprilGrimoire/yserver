@@ -58,7 +58,10 @@ Xorg's model is simpler than yserver's current one:
 Relevant Xorg references:
 
 - `composite/compoverlay.c`: COW create/destroy lifecycle
-- `composite/compwindow.c`: reject redirecting the COW
+- `composite/compalloc.c:145-147`: `compRedirectWindow` returns
+  `Success` (no-op) when asked to redirect the COW — NOT `BadMatch`
+- `composite/compwindow.c:156-170`: `compCheckRedirect` never
+  *auto*-redirects the COW (internal `should = FALSE`)
 - `composite/compwindow.c`: `CompositeRealChildHead` keeps the COW at
   the top when other root children are inserted/restacked
 
@@ -100,7 +103,12 @@ This design adopts that structure directly.
    root.
 7. The COW is click-through: it may host compositor descendants, but it
    must not become the direct pointer target for root hit-testing.
-8. The COW's parent is always `ROOT_WINDOW`.
+8. The COW's parent is `ROOT_WINDOW` under normal operation — the
+   lifecycle materializes it there and the compositor never reparents
+   it. This is NOT enforced by a COW-specific `BadMatch` (Xorg has no
+   such rejection); a misbehaving client that reparents the COW gets
+   the same broken-compositing outcome it would on Xorg. Only the
+   generic cycle rule applies.
 
 ## Proposed architecture
 
@@ -251,18 +259,53 @@ mutates `root.children` must funnel through the same COW-aware policy.
 Restacking the COW itself is still legal. The invariant is about where
 other windows land, matching Xorg's behavior.
 
-Separately, the COW itself is not reparentable:
+Separately, the COW reparent/redirect rules must **match Xorg
+exactly** — broken compositors are the compositor's problem, not
+something yserver invents new errors to guard against (see
+`feedback_match_xorg_clients_dont_get_patched.md`). Verified against
+the local Xorg tree on 2026-06-09:
 
-- `ReparentWindow(COW, parent != ROOT_WINDOW)` returns `BadMatch`
-- any request that would make the COW a descendant of itself returns
-  `BadMatch`
+- **Reparenting the COW is NOT specially rejected.** Xorg's
+  `compReparentWindow` (`composite/compwindow.c:438`) has no
+  COW-specific check; `ProcReparentWindow` (`dix/dispatch.c:877`)
+  applies only the generic rules (same-screen, ParentRelative-depth,
+  InputOnly-parent) plus the cycle rule in `ReparentWindow`
+  (`dix/window.c`: `TraverseTree(pWin, CompareWIDs, &pParent->id)
+  == WT_STOPWALKING → BadMatch`). yserver already enforces that exact
+  cycle rule generically in `ResourceTable::reparent_window`
+  (`resources.rs:1267`: `is_descendant_of(request.parent,
+  request.window) → BadMatch`), which covers the COW case for free
+  (`request.parent == COW` ⇒ "is COW a descendant of the moved
+  window?"). **No COW-specific reparent guard is added** — the
+  generic path is the spec-faithful behavior. A compositor that
+  reparents the COW away from root gets the same outcome it would on
+  Xorg (the reparent succeeds and compositing breaks — the
+  compositor's bug).
 
-### 7. Reject redirecting the COW
+### 7. Redirecting the COW is a silent no-op (Xorg-faithful)
 
-Once the COW is a real window in the normal model,
-`RedirectWindow(COMPOSITE_OVERLAY_WINDOW, ...)` must return `BadMatch`.
+`RedirectWindow(COMPOSITE_OVERLAY_WINDOW, ...)` returns **`Success`**
+without installing any redirect, matching Xorg's `compRedirectWindow`
+(`composite/compalloc.c:145-147`):
 
-That matches Xorg and prevents a nonsensical recursive redirect model.
+```c
+if (pWin == cs->pOverlayWin) {
+    return Success;
+}
+```
+
+(The earlier draft cited `compwindow.c:166-170` and prescribed
+`BadMatch`. That citation is `compCheckRedirect`'s internal
+`should = FALSE` short-circuit — the server never *auto*-redirects the
+COW — not a request-level rejection. A client-issued
+`CompositeRedirectWindow(COW)` hits `compRedirectWindow`, which returns
+`Success` and skips the redirect. Returning `BadMatch` instead would
+be a yserver-invented error with no Xorg equivalent.)
+
+The COW's pixels reach scanout via the normal paint path; the
+`Success`-no-op ensures a client that redirects the COW (whether by
+mistake or reflex) sees the same benign outcome it would on Xorg
+rather than an error yserver made up.
 
 ## State ownership
 
