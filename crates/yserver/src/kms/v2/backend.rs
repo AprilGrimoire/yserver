@@ -1155,7 +1155,9 @@ impl KmsBackendV2 {
     /// Arm (reset to frame 0) or clear the cursor animation for the
     /// new effective cursor. Arming swaps the canonical maps to
     /// frame 0 under a freshly-minted version so the XFixes serial
-    /// stays monotonic (spec "Version/serial").
+    /// stays monotonic (spec "Version/serial"). Clear fires both for
+    /// `new_xid = None` and for a non-animated cursor (no
+    /// `anim_cursor_records` entry).
     fn sync_cursor_animation(&mut self, new_xid: Option<u32>) {
         let Some(xid) = new_xid else {
             self.active_cursor_anim = None;
@@ -16848,8 +16850,16 @@ mod tests {
             .expect("anim")
             .expect("KMS animates");
 
-        // Bind the anim cursor on root → it becomes effective and arms.
+        // Purely static cursor → anim state stays cleared.
         let root_host = b.core.window_id;
+        b.define_cursor(None, root_host, c1.as_raw())
+            .expect("static before anim");
+        assert!(
+            b.active_cursor_anim.is_none(),
+            "static cursor must not arm animation"
+        );
+
+        // Bind the anim cursor on root → it becomes effective and arms.
         b.define_cursor(None, root_host, anim.as_raw())
             .expect("define anim");
         let st = b.active_cursor_anim.as_ref().expect("armed");
