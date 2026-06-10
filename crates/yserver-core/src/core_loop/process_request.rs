@@ -40160,6 +40160,7 @@ mod tests {
         let bytes = read_all_available(&mut peer);
         assert!(bytes.len() >= 32);
         assert_eq!(bytes[1], x11::error::BAD_LENGTH);
+        assert_eq!(bytes[10], 133);
         assert!(!state.resources.cursor_exists(ResourceId(0x4000)));
     }
 
@@ -40180,6 +40181,7 @@ mod tests {
         let bytes = read_all_available(&mut peer);
         assert!(bytes.len() >= 32);
         assert_eq!(bytes[1], x11::error::BAD_MATCH);
+        assert_eq!(bytes[10], 133);
         assert!(!state.resources.cursor_exists(ResourceId(0x4001)));
     }
 
