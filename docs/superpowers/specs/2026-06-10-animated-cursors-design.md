@@ -22,7 +22,15 @@ needed).
 
 ## Non-goals
 
-- ynest animation (host-forwarding) — deferred.
+- ynest animation (host-forwarding) — deferred; ynest is explicitly
+  not a priority (decision 2026-06-10). Known pre-existing gap there,
+  unchanged by this work: the degenerated anim cursor *aliases*
+  frame 0's host handle while the host-X11 backend forwards real
+  `FreeCursor` (`host_x11/request.rs:242`) — a client freeing its
+  sub-cursors (the standard libXcursor pattern) leaves the anim
+  cursor's handle stale on the host. If ynest ever matters, the fix
+  is forwarding RENDER CreateAnimCursor to the host via the new
+  trait method.
 - Per-device animation state (Xorg keeps anim state per
   `DeviceIntPtr`; yserver has a single effective pointer cursor).
 - Drift-corrected absolute scheduling — spinners don't need it.
