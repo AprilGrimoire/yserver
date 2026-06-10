@@ -386,7 +386,6 @@ cargo +nightly fmt && git add -A && git commit -m "feat(render): CreateAnimCurso
 **Files:**
 - Modify: `crates/yserver/src/kms/v2/cursor.rs` (new structs after `CursorRecord` impl, `:91`)
 - Modify: `crates/yserver/src/kms/v2/backend.rs` (struct fields near `:290`; constructors near `:699`, `:824`, `:1486`; trait impl after `create_glyph_cursor`)
-- Modify: `docs/superpowers/specs/2026-06-10-animated-cursors-design.md` (pixmap becomes `Option` — implementation-driven amendment)
 - Test: `mod tests` in `backend.rs` (pattern: `cursor_record_versions_monotonic` at `:16611`)
 
 - [ ] **Step 1: Write the failing test**
