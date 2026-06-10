@@ -945,6 +945,20 @@ pub trait Backend: Send {
         Ok(())
     }
 
+    /// RENDER `CreateAnimCursor` (opcode 31). `frames` pairs each
+    /// sub-cursor's host handle with its delay in milliseconds.
+    /// Returns the new animated cursor's handle, or `Ok(None)` when
+    /// the backend does not animate — the caller then falls back to
+    /// the static degeneration (cursor aliases frame 0's handle).
+    /// Spec: `docs/superpowers/specs/2026-06-10-animated-cursors-design.md`.
+    fn create_anim_cursor(
+        &mut self,
+        _origin: Option<OriginContext>,
+        _frames: &[(CursorHandle, u32)],
+    ) -> io::Result<Option<CursorHandle>> {
+        Ok(None)
+    }
+
     /// Create a cursor from two glyph indices in two fonts (X11 core
     /// `CreateGlyphCursor`, opcode 94). The protocol does not carry an
     /// explicit hotspot — the backend computes one from the source
