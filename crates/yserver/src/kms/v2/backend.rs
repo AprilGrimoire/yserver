@@ -1140,12 +1140,84 @@ impl KmsBackendV2 {
         let pointer_window = self.core.prev_pointer_window.unwrap_or(self.core.window_id);
         let new_xid = self.effective_cursor_walking_chain(pointer_window);
         if new_xid == self.effective_cursor_xid {
+            // Same effective cursor — a running animation keeps its
+            // frame index (Xorg: "already current → do nothing").
             return;
         }
         self.effective_cursor_xid = new_xid;
+        self.sync_cursor_animation(new_xid);
         let Some(xid) = new_xid else {
             return;
         };
+        self.display_cursor_by_handle(xid);
+    }
+
+    /// Arm (reset to frame 0) or clear the cursor animation for the
+    /// new effective cursor. Arming swaps the canonical maps to
+    /// frame 0 under a freshly-minted version so the XFixes serial
+    /// stays monotonic (spec "Version/serial").
+    fn sync_cursor_animation(&mut self, new_xid: Option<u32>) {
+        let Some(xid) = new_xid else {
+            self.active_cursor_anim = None;
+            return;
+        };
+        let Some(anim) = self.anim_cursor_records.get(&xid) else {
+            self.active_cursor_anim = None;
+            return;
+        };
+        let first = &anim.frames[0];
+        let (record, pixmap, delay) = (
+            std::sync::Arc::clone(&first.record),
+            first.pixmap,
+            first.delay,
+        );
+        self.swap_anim_frame_into_maps(xid, &record, pixmap);
+        self.active_cursor_anim = Some(crate::kms::v2::cursor::ActiveCursorAnim {
+            handle: xid,
+            frame: 0,
+            next_frame: std::time::Instant::now() + delay,
+        });
+    }
+
+    /// Re-point the canonical maps at an animation frame under a
+    /// freshly-minted monotonic version. The byte clone is bounded
+    /// by cursor size (≤16 KiB for HW-plane cursors).
+    fn swap_anim_frame_into_maps(
+        &mut self,
+        xid: u32,
+        record: &std::sync::Arc<crate::kms::v2::cursor::CursorRecord>,
+        pixmap: Option<crate::kms::v2::store::DrawableId>,
+    ) {
+        let version = self.next_cursor_version;
+        self.next_cursor_version = self.next_cursor_version.saturating_add(1);
+        let minted = crate::kms::v2::cursor::CursorRecord::new(
+            record.width,
+            record.height,
+            record.hot_x,
+            record.hot_y,
+            record.bgra_bytes.clone(),
+            version,
+        );
+        self.cursor_records.insert(xid, minted);
+        // Keep cursor_pixmaps truthful per-frame: a `None` frame
+        // REMOVES the entry — leaving the prior frame's pixmap
+        // installed would have the SW scene path sample stale bytes.
+        // (HW upload is unaffected; it consumes record bytes.)
+        match pixmap {
+            Some(p) => {
+                self.cursor_pixmaps.insert(xid, p);
+            }
+            None => {
+                self.cursor_pixmaps.remove(&xid);
+            }
+        }
+    }
+
+    /// Push `cursor_records[xid]` to the scene / HW plane — the
+    /// former tail of `refresh_effective_cursor`, shared with the
+    /// animation tick. Keeps the sample-view readiness guard
+    /// (Vk-less fixtures build records without sprite allocs).
+    fn display_cursor_by_handle(&mut self, xid: u32) {
         let Some(record) = self.cursor_records.get(&xid).cloned() else {
             return;
         };
@@ -16755,6 +16827,57 @@ mod tests {
         assert_eq!(b.anim_cursor_records.len(), before);
         assert_eq!(b.cursor_records.len(), recs_before);
         assert_eq!(b.cursor_pixmaps.len(), pix_before);
+    }
+
+    /// Effective-cursor change arms/clears the animation; re-resolving
+    /// to the same cursor preserves the running frame index.
+    #[test]
+    fn effective_cursor_arms_and_clears_animation() {
+        use yserver_core::backend::{Backend, PixmapHandle};
+
+        let mut b = KmsBackendV2::for_tests();
+        let pix = PixmapHandle::from_raw(0x1234_0040).unwrap();
+        let c1 = b
+            .create_cursor(None, pix, None, (0xFFFF, 0, 0), (0, 0, 0), 0, 0)
+            .expect("c1");
+        let c2 = b
+            .create_cursor(None, pix, None, (0, 0xFFFF, 0), (0, 0, 0), 0, 0)
+            .expect("c2");
+        let anim = b
+            .create_anim_cursor(None, &[(c1, 50), (c2, 75)])
+            .expect("anim")
+            .expect("KMS animates");
+
+        // Bind the anim cursor on root → it becomes effective and arms.
+        let root_host = b.core.window_id;
+        b.define_cursor(None, root_host, anim.as_raw())
+            .expect("define anim");
+        let st = b.active_cursor_anim.as_ref().expect("armed");
+        assert_eq!(st.handle, anim.as_raw());
+        assert_eq!(st.frame, 0);
+        // Arming mints a fresh version for frame 0 (monotonic serial).
+        let v_frame0 = b.cursor_records.get(&c1.as_raw()).unwrap().version;
+        let v_anim = b.cursor_records.get(&anim.as_raw()).unwrap().version;
+        assert!(
+            v_anim > v_frame0,
+            "armed version must be minted, not aliased"
+        );
+
+        // Pretend the animation advanced, then re-resolve to the SAME
+        // cursor: frame index must be preserved (no restart).
+        b.active_cursor_anim.as_mut().unwrap().frame = 1;
+        b.refresh_effective_cursor();
+        assert_eq!(b.active_cursor_anim.as_ref().unwrap().frame, 1);
+
+        // Switch to a static cursor → animation cleared.
+        b.define_cursor(None, root_host, c1.as_raw())
+            .expect("define static");
+        assert!(b.active_cursor_anim.is_none());
+
+        // Switch back → restarts at frame 0.
+        b.define_cursor(None, root_host, anim.as_raw())
+            .expect("re-define anim");
+        assert_eq!(b.active_cursor_anim.as_ref().unwrap().frame, 0);
     }
 
     /// Stage 4d regression: `ChangeWindowAttributes` on a window
