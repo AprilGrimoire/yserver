@@ -298,8 +298,6 @@ pub struct KmsBackendV2 {
     pub(crate) anim_cursor_records: HashMap<u32, crate::kms::v2::cursor::AnimCursorRecord>,
     /// The one running animation (the effective cursor is animated),
     /// or `None`.
-    // consumed by Task 5/6 (sync/tick)
-    #[allow(dead_code)]
     pub(crate) active_cursor_anim: Option<crate::kms::v2::cursor::ActiveCursorAnim>,
 
     /// Phase B.1 Task 21: lifetime-opens count seen at the last
@@ -1210,6 +1208,7 @@ impl KmsBackendV2 {
             frame.delay,
         );
         self.swap_anim_frame_into_maps(handle, &record, pixmap);
+        // Always Some here — checked at the top and nothing in between clears it.
         if let Some(st) = self.active_cursor_anim.as_mut() {
             st.frame = next;
             st.next_frame = now + delay;
@@ -21437,9 +21436,8 @@ mod tests {
             "1-frame anim wraps to same index"
         );
         assert!(
-            b.active_cursor_anim.as_ref().unwrap().next_frame
-                > Instant::now() - Duration::from_millis(5),
-            "re-armed from now",
+            b.active_cursor_anim.as_ref().unwrap().next_frame > Instant::now(),
+            "re-armed from now: next_frame must be a future instant after DPMS restore tick",
         );
     }
 }
