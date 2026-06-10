@@ -257,7 +257,11 @@ Expected: `empty_list` and `odd_pairs` FAIL (current code returns silent `Handle
 
 - [ ] **Step 3: Rewrite the opcode-31 arm**
 
-Replace the body of the `31 => { ... }` arm at `process_request.rs:1880-1960`. Keep the existing leading comment block but update it: animation is now delegated to `backend.create_anim_cursor`; backends returning `None` degenerate to frame 0. Keep lines 1899-1921 (length guard, `cursor_id` parse, `validation_failed` check) exactly as they are, then replace from `let pairs = ...` (line 1922) to the end of the arm with:
+Replace the body of the `31 => { ... }` arm at `process_request.rs:1880-1960`. Keep the existing leading comment block but update it: animation is now delegated to `backend.create_anim_cursor`; backends returning `None` degenerate to frame 0.
+
+**Change the length guard** at `:1899` from `if body.len() < 12` to `if body.len() < 4` — the old `< 12` guard silently swallowed a cid-only body (4 bytes, zero frames), which must now reach the `BadValue` check below. `< 4` keeps the silent-return only for a truly unparseable body (no cid).
+
+Keep the `cursor_id` parse and `validation_failed` check (`:1902-1921`) exactly as they are, then replace from `let pairs = ...` (line 1922) to the end of the arm with:
 
 ```rust
             let pairs = &body[4..];
@@ -320,11 +324,24 @@ Replace the body of the `31 => { ... }` arm at `process_request.rs:1880-1960`. K
                 }
             }
             // Backend-side animation. `Ok(None)` (default impl /
-            // ynest) → static degeneration to frame 0's handle.
+            // ynest) → static degeneration to frame 0's handle. A
+            // backend Err is "can't happen" after the validation
+            // above — log and degenerate rather than swallowing
+            // silently (spec "Error handling").
             let anim_handle = if frames.is_empty() {
                 None
             } else {
-                backend.create_anim_cursor(origin, &frames).ok().flatten()
+                match backend.create_anim_cursor(origin, &frames) {
+                    Ok(handle) => handle,
+                    Err(e) => {
+                        log::warn!(
+                            "client {} RENDER::CreateAnimCursor backend failure ({e}); \
+                             degenerating to first frame",
+                            client_id.0,
+                        );
+                        None
+                    }
+                }
             };
             state.resources.create_glyph_cursor(client_id, cursor_id);
             state.resources.set_cursor_anim(cursor_id);
@@ -532,11 +549,7 @@ Implement the trait method in the `impl Backend for KmsBackendV2` block, after `
 Run: `cargo test -p yserver create_anim_cursor_snapshots`
 Expected: PASS.
 
-- [ ] **Step 5: Amend the spec (implementation-driven)**
-
-In `docs/superpowers/specs/2026-06-10-animated-cursors-design.md`, the `AnimFrame` definition and the `create_anim_cursor` paragraph: `pixmap` is `Option<DrawableId>` (best-effort, mirroring `insert_cursor_record` — Vk-less fixtures have no sprite pixmaps), and only the **record** lookup is an error; a missing pixmap is not. Update both spots.
-
-- [ ] **Step 6: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 cargo +nightly fmt && git add -A && git commit -m "feat(kms): AnimCursorRecord snapshot + create_anim_cursor impl"
@@ -669,8 +682,17 @@ Split `refresh_effective_cursor` (`backend.rs:1122-1197`). The function keeps it
             version,
         );
         self.cursor_records.insert(xid, minted);
-        if let Some(p) = pixmap {
-            self.cursor_pixmaps.insert(xid, p);
+        // Keep cursor_pixmaps truthful per-frame: a `None` frame
+        // REMOVES the entry — leaving the prior frame's pixmap
+        // installed would have the SW scene path sample stale bytes.
+        // (HW upload is unaffected; it consumes record bytes.)
+        match pixmap {
+            Some(p) => {
+                self.cursor_pixmaps.insert(xid, p);
+            }
+            None => {
+                self.cursor_pixmaps.remove(&xid);
+            }
         }
     }
 ```
@@ -1096,5 +1118,5 @@ Branch `feat/anim-cursor` ready: ask the user about HW dogfood on bee (busy curs
 ## Plan self-review notes
 
 - **Spec coverage:** anim flag + errors (T1/T3), trait method (T2), snapshot data model + delay clamp + alias frame 0 (T4), arm/clear/preserve + minted frame-0 version (T5), tick + wakeup + gating + single-advance resume (T6), XFixes serial (T7), keep-alive lifetime exercised by the probe freeing constituents (T8), no `free_cursor` task — deliberate, spec "Frame lifetime" says status-quo no-op.
-- **Type consistency:** `AnimFrame.pixmap: Option<DrawableId>` everywhere (spec amended in T4); `ActiveCursorAnim{handle, frame, next_frame}` used identically in T4-T7; `swap_anim_frame_into_maps` defined in T5, used in T6.
+- **Type consistency:** `AnimFrame.pixmap: Option<DrawableId>` everywhere (spec amended 2026-06-10 after plan review — remove-on-None rule); `ActiveCursorAnim{handle, frame, next_frame}` used identically in T4-T7; `swap_anim_frame_into_maps` defined in T5, used in T6.
 - **Known judgment calls:** `tick_cursor_animation` double-checks the gates internally (defense in depth — `maybe_composite` already gates; the internal check also serves the unit tests, which call the tick directly).

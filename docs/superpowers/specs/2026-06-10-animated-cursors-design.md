@@ -131,7 +131,14 @@ pub(crate) struct AnimCursorRecord {
 
 pub(crate) struct AnimFrame {
     pub(crate) record: std::sync::Arc<CursorRecord>,
-    pub(crate) pixmap: crate::kms::v2::store::DrawableId,
+    /// `None` when the sub-cursor's sprite alloc was skipped or
+    /// failed (Vk-less fixtures; rare production alloc failure) —
+    /// mirrors `insert_cursor_record`'s best-effort
+    /// `cursor_pixmaps` insert. On display, a `None` frame REMOVES
+    /// the anim handle's `cursor_pixmaps` entry (never leaves a
+    /// stale prior-frame pixmap for the SW path to sample); the HW
+    /// upload path is unaffected (it consumes record bytes).
+    pub(crate) pixmap: Option<crate::kms::v2::store::DrawableId>,
     pub(crate) delay: std::time::Duration,
 }
 ```
@@ -144,10 +151,10 @@ existing "static cursor" code path (effective-cursor walk, XFixes,
 scene registration) works untouched for frame 0.
 
 `create_anim_cursor` impl: look up each sub-cursor handle in
-`cursor_records` AND `cursor_pixmaps` (missing → `io::Error` mapped
-to the handler's existing error path; insert nothing on partial
-failure), clone the Arcs/ids, allocate a fresh handle the same way
-`create_cursor` does, insert all three maps.
+`cursor_records` (missing → `io::Error`; insert nothing on partial
+failure) and `cursor_pixmaps` (best-effort `Option`, see
+`AnimFrame.pixmap`), clone the Arcs/ids, allocate a fresh handle the
+same way `create_cursor` does, insert all three maps.
 
 Frame lifetime: KMS v2 keeps the trait's default no-op `free_cursor`
 (`trait_def.rs:944`) for animated handles too — backend-side cursor
@@ -265,10 +272,12 @@ Frame tick). No XFixes-specific changes needed.
   (unchanged); new `BadValue` for an empty frame list, `BadLength`
   for a non-multiple-of-8 list, `BadMatch` for nested animated
   cursors (see Request handler change).
-- `create_anim_cursor` backend failure (sub-cursor record/pixmap
-  missing — "can't happen" after handler validation): propagate as
-  the handler's existing backend-error path; no partial state
-  (insert into maps only after all lookups succeed).
+- `create_anim_cursor` backend failure (sub-cursor record missing —
+  "can't happen" after handler validation): the handler logs a
+  warning and degenerates to the static first frame (same
+  swallow-and-degrade shape as the existing RENDER CreateCursor
+  opcode-27 dispatch). The backend guarantees no partial map state
+  on failure (insert only after all lookups succeed).
 
 ## Testing
 
