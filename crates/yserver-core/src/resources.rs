@@ -5018,5 +5018,8 @@ mod tests {
         let gid = ResourceId(0x502);
         table.create_glyph_cursor(ClientId(1), gid);
         assert!(!table.cursor_is_anim(gid));
+        // After free, the cursor is gone; cursor_is_anim must not return true.
+        table.free_cursor(id);
+        assert!(!table.cursor_is_anim(id), "freed cursor must not be anim");
     }
 }
