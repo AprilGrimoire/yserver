@@ -1886,6 +1886,10 @@ fn handle_render_request(
             // resource so downstream CWA(CWCursor=this) /
             // XFixesSetCursorName / DefineCursor see a live xid.
             //
+            // Validation: odd pair bytes → BadLength; zero frames →
+            // BadValue; nested animated sub-cursor → BadMatch (Xorg
+            // animcur.c:316).
+            //
             // Animation is delegated to `backend.create_anim_cursor`;
             // backends returning `Ok(None)` (default / ynest) degenerate
             // to frame 0's handle. Previously this arm was a stub that
@@ -1906,12 +1910,13 @@ fn handle_render_request(
                 !owned || state.resources.xid_in_use(cursor_id)
             };
             if validation_failed {
-                return emit_x11_error(
+                return emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
                     x11::error::BAD_ID_CHOICE,
                     cursor_id.0,
+                    u16::from(minor),
                     header.opcode,
                 );
             }
@@ -1919,22 +1924,24 @@ fn handle_render_request(
             // Xorg fidelity (render.c:1796,1801): odd request length
             // → BadLength; zero frames → BadValue.
             if !pairs.len().is_multiple_of(8) {
-                return emit_x11_error(
+                return emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
                     x11::error::BAD_LENGTH,
                     0,
+                    u16::from(minor),
                     header.opcode,
                 );
             }
             if pairs.is_empty() {
-                return emit_x11_error(
+                return emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
                     x11::error::BAD_VALUE,
                     0,
+                    u16::from(minor),
                     header.opcode,
                 );
             }
@@ -1945,23 +1952,27 @@ fn handle_render_request(
                 let sub = ResourceId(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
                 let delay = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
                 if !state.resources.cursor_exists(sub) {
-                    return emit_x11_error(
+                    return emit_x11_error_with_minor(
                         state,
                         client_id,
                         sequence,
                         x11::error::BAD_CURSOR,
                         sub.0,
+                        u16::from(minor),
                         header.opcode,
                     );
                 }
                 // Xorg refuses nested animated cursors (animcur.c:316).
+                // bad_value stays 0: AnimCursorCreate returns BadMatch
+                // without setting client->errorValue.
                 if state.resources.cursor_is_anim(sub) {
-                    return emit_x11_error(
+                    return emit_x11_error_with_minor(
                         state,
                         client_id,
                         sequence,
                         x11::error::BAD_MATCH,
-                        sub.0,
+                        0,
+                        u16::from(minor),
                         header.opcode,
                     );
                 }
@@ -1980,6 +1991,12 @@ fn handle_render_request(
             // above — log and degenerate rather than swallowing
             // silently (spec "Error handling").
             let anim_handle = if frames.is_empty() {
+                log::warn!(
+                    "client {} RENDER::CreateAnimCursor: no sub-cursor has a host handle; \
+                     cursor 0x{:x} registered without backend animation",
+                    client_id.0,
+                    cursor_id.0,
+                );
                 None
             } else {
                 match backend.create_anim_cursor(origin, &frames) {
@@ -40143,6 +40160,7 @@ mod tests {
         let bytes = read_all_available(&mut peer);
         assert!(bytes.len() >= 32, "expected error reply, got {bytes:02x?}");
         assert_eq!(bytes[1], x11::error::BAD_VALUE);
+        assert_eq!(&bytes[8..10], &31u16.to_le_bytes());
         assert_eq!(bytes[10], 133);
         assert!(!state.resources.cursor_exists(ResourceId(0x4000)));
     }
@@ -40160,6 +40178,7 @@ mod tests {
         let bytes = read_all_available(&mut peer);
         assert!(bytes.len() >= 32);
         assert_eq!(bytes[1], x11::error::BAD_LENGTH);
+        assert_eq!(&bytes[8..10], &31u16.to_le_bytes());
         assert_eq!(bytes[10], 133);
         assert!(!state.resources.cursor_exists(ResourceId(0x4000)));
     }
@@ -40181,6 +40200,10 @@ mod tests {
         let bytes = read_all_available(&mut peer);
         assert!(bytes.len() >= 32);
         assert_eq!(bytes[1], x11::error::BAD_MATCH);
+        // Xorg's AnimCursorCreate returns BadMatch without setting
+        // client->errorValue → value field must be zero.
+        assert_eq!(&bytes[4..8], &0u32.to_le_bytes());
+        assert_eq!(&bytes[8..10], &31u16.to_le_bytes());
         assert_eq!(bytes[10], 133);
         assert!(!state.resources.cursor_exists(ResourceId(0x4001)));
     }
