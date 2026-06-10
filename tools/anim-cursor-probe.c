@@ -10,7 +10,6 @@
  * Run:   DISPLAY=:7 ./target/anim-cursor-probe
  */
 #include <stdio.h>
-#include <stdlib.h>
 #include <X11/Xlib.h>
 #include <X11/extensions/Xrender.h>
 
