@@ -911,6 +911,16 @@ Validation: `cargo test -p yserver-core --lib` 721/721, `-p yserver --lib`
 MIT-SCREEN-SAVER above), and `vkDestroySemaphore`-in-use VVL errors during
 the live GL-client load.
 
+## Animated cursors (branch `feat/anim-cursor`, 2026-06-10)
+
+**Status: RENDER `CreateAnimCursor` animates on KMS v2, HW-verified on bee
+2026-06-10.** Previously the cursor was frozen on the first frame of an
+animated cursor (the `XFixes::GetCursorImage` static-capture path was the
+only consumer). ynest is unchanged — animated cursors degenerate correctly
+to the static first frame (host X11 does not support animated cursors via
+the same protocol path). Full test suite (`cargo test --locked`) and
+`cargo clippy` + `cargo +nightly fmt --check` clean.
+
 ## v1 → v2 transition
 
 The v1 model (per-window mirrors + scanout-walk) hit a structural
