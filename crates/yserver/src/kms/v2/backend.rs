@@ -289,6 +289,18 @@ pub struct KmsBackendV2 {
     /// `define_cursor` + `update_pointer_window` re-evaluate it.
     pub(crate) effective_cursor_xid: Option<u32>,
 
+    /// Animated-cursor frame lists, keyed by the anim cursor's host
+    /// handle. Same key-space discipline as `cursor_records` /
+    /// `cursor_pixmaps` (see comment at `cursor_records`); entries
+    /// are never removed (status-quo no-op `free_cursor` — spec
+    /// "Frame lifetime").
+    pub(crate) anim_cursor_records: HashMap<u32, crate::kms::v2::cursor::AnimCursorRecord>,
+    /// The one running animation (the effective cursor is animated),
+    /// or `None`.
+    // consumed by Task 5/6 (sync/tick)
+    #[allow(dead_code)]
+    pub(crate) active_cursor_anim: Option<crate::kms::v2::cursor::ActiveCursorAnim>,
+
     /// Phase B.1 Task 21: lifetime-opens count seen at the last
     /// `drain_frame_builder_telemetry` call. Delta tracking lets the
     /// drain helper emit one `record_frame_builder_open` per new open
@@ -701,6 +713,8 @@ impl KmsBackendV2 {
             next_cursor_version: 1,
             default_cursor_xid: None,
             effective_cursor_xid: None,
+            anim_cursor_records: HashMap::new(),
+            active_cursor_anim: None,
             last_drained_fb_opens: 0,
             // Direct mode: seat is a marker, fds are -1 (never polled),
             // no on-core libinput, no core sender.
@@ -826,6 +840,8 @@ impl KmsBackendV2 {
             next_cursor_version: 1,
             default_cursor_xid: None,
             effective_cursor_xid: None,
+            anim_cursor_records: HashMap::new(),
+            active_cursor_anim: None,
             last_drained_fb_opens: 0,
             seat,
             seat_state: crate::seat::state::SeatState::Active,
@@ -1487,6 +1503,8 @@ impl KmsBackendV2 {
             next_cursor_version: 1,
             default_cursor_xid: None,
             effective_cursor_xid: None,
+            anim_cursor_records: HashMap::new(),
+            active_cursor_anim: None,
             last_drained_fb_opens: 0,
             // Test fixtures always run in Direct mode.
             seat: crate::seat::Seat::Direct,
@@ -10049,6 +10067,50 @@ impl Backend for KmsBackendV2 {
         Ok(handle)
     }
 
+    fn create_anim_cursor(
+        &mut self,
+        _origin: Option<OriginContext>,
+        frames: &[(CursorHandle, u32)],
+    ) -> io::Result<Option<CursorHandle>> {
+        // Spec 2026-06-10-animated-cursors-design.md. Snapshot every
+        // frame up front — no partial map state on failure.
+        if frames.is_empty() {
+            return Ok(None);
+        }
+        let mut snap = Vec::with_capacity(frames.len());
+        for (h, delay_ms) in frames {
+            let raw = h.as_raw();
+            let Some(record) = self.cursor_records.get(&raw) else {
+                return Err(io::Error::other(format!(
+                    "create_anim_cursor: unknown sub-cursor handle 0x{raw:x}"
+                )));
+            };
+            // Delay 0 → 16ms: a 0 deadline would busy-spin the
+            // poll loop (explicit Xorg deviation, see spec).
+            let ms = if *delay_ms == 0 { 16 } else { *delay_ms };
+            snap.push(crate::kms::v2::cursor::AnimFrame {
+                record: std::sync::Arc::clone(record),
+                pixmap: self.cursor_pixmaps.get(&raw).copied(),
+                delay: std::time::Duration::from_millis(u64::from(ms)),
+            });
+        }
+        let xid = self.core.next_host_xid();
+        let handle = CursorHandle::from_raw(xid)
+            .ok_or_else(|| io::Error::other("create_anim_cursor: xid was 0"))?;
+        // Alias frame 0 in the canonical maps so every static-cursor
+        // code path (effective walk, XFixes, scene) works untouched.
+        self.cursor_records
+            .insert(xid, std::sync::Arc::clone(&snap[0].record));
+        if let Some(p) = snap[0].pixmap {
+            self.cursor_pixmaps.insert(xid, p);
+        }
+        self.anim_cursor_records.insert(
+            xid,
+            crate::kms::v2::cursor::AnimCursorRecord { frames: snap },
+        );
+        Ok(Some(handle))
+    }
+
     fn define_cursor(
         &mut self,
         _origin: Option<OriginContext>,
@@ -16643,6 +16705,51 @@ mod tests {
             .create_cursor(None, pix, None, (0, 0, 0xFFFF), (0, 0, 0), 0, 0)
             .expect("create_cursor 3");
         assert_eq!(captured.bgra_bytes, snapshot);
+    }
+
+    /// CreateAnimCursor snapshots frames at creation: maps gain an
+    /// entry aliasing frame 0; the AnimCursorRecord holds Arc'd frame
+    /// records + clamped delays.
+    #[test]
+    fn create_anim_cursor_snapshots_frames() {
+        use std::time::Duration;
+        use yserver_core::backend::{Backend, CursorHandle, PixmapHandle};
+
+        let mut b = KmsBackendV2::for_tests();
+        let pix = PixmapHandle::from_raw(0x1234_0030).unwrap();
+        let c1 = b
+            .create_cursor(None, pix, None, (0xFFFF, 0, 0), (0, 0, 0), 1, 2)
+            .expect("c1");
+        let c2 = b
+            .create_cursor(None, pix, None, (0, 0xFFFF, 0), (0, 0, 0), 3, 4)
+            .expect("c2");
+
+        let anim = b
+            .create_anim_cursor(None, &[(c1, 50), (c2, 0)])
+            .expect("create_anim_cursor")
+            .expect("KMS animates");
+
+        let rec = b
+            .anim_cursor_records
+            .get(&anim.as_raw())
+            .expect("anim record");
+        assert_eq!(rec.frames.len(), 2);
+        assert_eq!(rec.frames[0].delay, Duration::from_millis(50));
+        // Delay 0 clamps to 16ms (spec: explicit Xorg deviation).
+        assert_eq!(rec.frames[1].delay, Duration::from_millis(16));
+        // The anim handle aliases frame 0 in the canonical map.
+        assert_eq!(
+            b.cursor_records.get(&anim.as_raw()).unwrap().version,
+            b.cursor_records.get(&c1.as_raw()).unwrap().version,
+        );
+        // Unknown sub-cursor handle → error, no partial state.
+        let bogus = CursorHandle::from_raw(0xDEAD_BEEF).unwrap();
+        let before = b.anim_cursor_records.len();
+        assert!(
+            b.create_anim_cursor(None, &[(c1, 10), (bogus, 10)])
+                .is_err()
+        );
+        assert_eq!(b.anim_cursor_records.len(), before);
     }
 
     /// Stage 4d regression: `ChangeWindowAttributes` on a window

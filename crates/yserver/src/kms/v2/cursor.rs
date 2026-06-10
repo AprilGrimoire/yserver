@@ -90,6 +90,53 @@ impl CursorRecord {
     }
 }
 
+/// One frame of a RENDER animated cursor (spec
+/// `2026-06-10-animated-cursors-design.md`). Snapshotted at
+/// `create_anim_cursor` time so constituent-cursor lifetime is a
+/// non-issue (Xorg refcounts; we snapshot).
+pub(crate) struct AnimFrame {
+    // consumed by Task 5/6 (sync/tick)
+    #[allow(dead_code)]
+    pub(crate) record: Arc<CursorRecord>,
+    /// Sprite pixmap the SW scene path samples. `None` when the
+    /// sub-cursor's sprite alloc was skipped (Vk-less test
+    /// fixtures) — mirrors `insert_cursor_record`'s best-effort
+    /// `cursor_pixmaps` insert.
+    // consumed by Task 5/6 (sync/tick)
+    #[allow(dead_code)]
+    pub(crate) pixmap: Option<crate::kms::v2::store::DrawableId>,
+    // consumed by Task 5/6 (sync/tick)
+    #[allow(dead_code)]
+    pub(crate) delay: std::time::Duration,
+}
+
+/// Frame list for one animated cursor, keyed by the anim cursor's
+/// host handle in `KmsBackendV2::anim_cursor_records`.
+pub(crate) struct AnimCursorRecord {
+    // consumed by Task 5/6 (sync/tick)
+    #[allow(dead_code)]
+    pub(crate) frames: Vec<AnimFrame>,
+}
+
+/// Live animation state — at most one, mirroring the single
+/// effective cursor. Armed/cleared by `sync_cursor_animation`,
+/// advanced by `tick_cursor_animation`.
+pub(crate) struct ActiveCursorAnim {
+    /// Animated cursor (host handle) whose frames are cycling.
+    // consumed by Task 5/6 (sync/tick)
+    #[allow(dead_code)]
+    pub(crate) handle: u32,
+    /// Current frame index into `AnimCursorRecord::frames`.
+    // consumed by Task 5/6 (sync/tick)
+    #[allow(dead_code)]
+    pub(crate) frame: usize,
+    /// Deadline for the next advance. Reported via `next_wakeup()`
+    /// while outputs are active.
+    // consumed by Task 5/6 (sync/tick)
+    #[allow(dead_code)]
+    pub(crate) next_frame: std::time::Instant,
+}
+
 /// 16×16 classic X-shaped default cursor (matches v1's
 /// `install_default_cursor` at `kms/backend.rs:2286-2308`). Both
 /// diagonals of the 16×16 box drawn in black with a 1-pixel white
