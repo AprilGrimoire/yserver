@@ -266,7 +266,8 @@ pub struct KmsBackendV2 {
 
     /// Stage 5 Phase A — canonical cursor xid → immutable record map.
     /// Inserted by `create_cursor` / `create_glyph_cursor` /
-    /// `render_create_cursor`; read by `define_cursor` /
+    /// `render_create_cursor` / `create_anim_cursor` (which aliases
+    /// frame 0 into this map); read by `define_cursor` /
     /// `update_pointer_window` to swap the effective sprite. `Arc`
     /// so anything that captured a reference (a future Phase D
     /// deferred upload, a pointer grab) keeps stable bytes even
@@ -16745,11 +16746,15 @@ mod tests {
         // Unknown sub-cursor handle → error, no partial state.
         let bogus = CursorHandle::from_raw(0xDEAD_BEEF).unwrap();
         let before = b.anim_cursor_records.len();
+        let recs_before = b.cursor_records.len();
+        let pix_before = b.cursor_pixmaps.len();
         assert!(
             b.create_anim_cursor(None, &[(c1, 10), (bogus, 10)])
                 .is_err()
         );
         assert_eq!(b.anim_cursor_records.len(), before);
+        assert_eq!(b.cursor_records.len(), recs_before);
+        assert_eq!(b.cursor_pixmaps.len(), pix_before);
     }
 
     /// Stage 4d regression: `ChangeWindowAttributes` on a window
