@@ -114,17 +114,11 @@ pub(crate) struct AnimCursorRecord {
 /// advanced by `tick_cursor_animation`.
 pub(crate) struct ActiveCursorAnim {
     /// Animated cursor (host handle) whose frames are cycling.
-    // consumed by Task 6 (tick)
-    #[allow(dead_code)]
     pub(crate) handle: u32,
     /// Current frame index into `AnimCursorRecord::frames`.
-    // consumed by Task 6 (tick)
-    #[allow(dead_code)]
     pub(crate) frame: usize,
     /// Deadline for the next advance. Reported via `next_wakeup()`
     /// while outputs are active.
-    // consumed by Task 6 (tick)
-    #[allow(dead_code)]
     pub(crate) next_frame: std::time::Instant,
 }
 

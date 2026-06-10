@@ -1181,6 +1181,51 @@ impl KmsBackendV2 {
         });
     }
 
+    /// Advance the running cursor animation if its deadline elapsed.
+    /// Called from `maybe_composite` AFTER its scanout/DPMS gates
+    /// (spec "Frame tick"). One advance per call — a stale deadline
+    /// after a blank advances a single frame, never fast-forwards.
+    pub(crate) fn tick_cursor_animation(&mut self) {
+        if !self.kms_outputs_active || !self.scanout_allowed() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let Some(st) = self.active_cursor_anim.as_ref() else {
+            return;
+        };
+        if now < st.next_frame {
+            return;
+        }
+        let handle = st.handle;
+        let current = st.frame;
+        let Some(anim) = self.anim_cursor_records.get(&handle) else {
+            self.active_cursor_anim = None;
+            return;
+        };
+        let next = (current + 1) % anim.frames.len();
+        let frame = &anim.frames[next];
+        let (record, pixmap, delay) = (
+            std::sync::Arc::clone(&frame.record),
+            frame.pixmap,
+            frame.delay,
+        );
+        self.swap_anim_frame_into_maps(handle, &record, pixmap);
+        if let Some(st) = self.active_cursor_anim.as_mut() {
+            st.frame = next;
+            st.next_frame = now + delay;
+        }
+        self.display_cursor_by_handle(handle);
+    }
+
+    /// Deadline for `next_wakeup`: the animation's next frame, only
+    /// while it could actually be displayed (same gates as the tick).
+    fn cursor_anim_deadline(&self) -> Option<std::time::Instant> {
+        if !self.kms_outputs_active || !self.scanout_allowed() {
+            return None;
+        }
+        self.active_cursor_anim.as_ref().map(|st| st.next_frame)
+    }
+
     /// Re-point the canonical maps at an animation frame under a
     /// freshly-minted monotonic version. The byte clone is bounded
     /// by cursor size (≤16 KiB for HW-plane cursors).
@@ -8329,7 +8374,11 @@ impl Backend for KmsBackendV2 {
         } else {
             None
         };
-        scene_deadline.into_iter().chain(present_deadline).min()
+        scene_deadline
+            .into_iter()
+            .chain(present_deadline)
+            .chain(self.cursor_anim_deadline())
+            .min()
     }
 
     fn maybe_composite(&mut self) -> io::Result<()> {
@@ -8357,6 +8406,9 @@ impl Backend for KmsBackendV2 {
         if !self.kms_outputs_active {
             return Ok(());
         }
+        // Animated-cursor frame advance — after both gates above so
+        // DPMS-off / VT-away never uploads (spec "DPMS / VT gating").
+        self.tick_cursor_animation();
         // Phase B.1 close trigger 4: if a frame has been open past the
         // timeout (16 ms default), force a close to release pinned
         // resources. No-op if no frame open or below threshold.
@@ -21279,6 +21331,115 @@ mod tests {
         assert!(
             b.cow_host_xid().is_none(),
             "cow_host_xid getter returns None after final release"
+        );
+    }
+
+    /// Frame tick: advances mod n, re-arms relative, mints strictly
+    /// increasing versions across a full wraparound (XFixes serial
+    /// contract — naive Arc-swapping would repeat v1,v2,v1).
+    #[test]
+    fn anim_tick_advances_wraps_and_stays_monotonic() {
+        use std::time::{Duration, Instant};
+        use yserver_core::backend::{Backend, PixmapHandle};
+
+        let mut b = KmsBackendV2::for_tests();
+        let pix = PixmapHandle::from_raw(0x1234_0050).unwrap();
+        let c1 = b
+            .create_cursor(None, pix, None, (0xFFFF, 0, 0), (0, 0, 0), 0, 0)
+            .expect("c1");
+        let c2 = b
+            .create_cursor(None, pix, None, (0, 0xFFFF, 0), (0, 0, 0), 0, 0)
+            .expect("c2");
+        let anim = b
+            .create_anim_cursor(None, &[(c1, 50), (c2, 75)])
+            .expect("anim")
+            .expect("KMS animates");
+        let root_host = b.core.window_id;
+        b.define_cursor(None, root_host, anim.as_raw())
+            .expect("define");
+
+        let mut last_version = b.cursor_records.get(&anim.as_raw()).unwrap().version;
+        let mut expected_frame = 0usize;
+        // 5 ticks over 2 frames = two full wraparounds.
+        for i in 0..5 {
+            // Force the deadline into the past, then tick.
+            b.active_cursor_anim.as_mut().unwrap().next_frame =
+                Instant::now() - Duration::from_millis(1);
+            b.tick_cursor_animation();
+            expected_frame = (expected_frame + 1) % 2;
+            let st = b.active_cursor_anim.as_ref().expect("still armed");
+            assert_eq!(st.frame, expected_frame, "tick {i}");
+            assert!(st.next_frame > Instant::now() - Duration::from_millis(1));
+            let v = b.cursor_records.get(&anim.as_raw()).unwrap().version;
+            assert!(v > last_version, "tick {i}: version {v} !> {last_version}");
+            last_version = v;
+            // The canonical record now carries the frame's bytes.
+            let frame_rec =
+                &b.anim_cursor_records.get(&anim.as_raw()).unwrap().frames[expected_frame].record;
+            assert_eq!(
+                b.cursor_records.get(&anim.as_raw()).unwrap().bgra_bytes,
+                frame_rec.bgra_bytes,
+            );
+        }
+        // Tick before the deadline → no advance.
+        let frame_before = b.active_cursor_anim.as_ref().unwrap().frame;
+        b.tick_cursor_animation();
+        assert_eq!(b.active_cursor_anim.as_ref().unwrap().frame, frame_before);
+    }
+
+    /// next_wakeup reports the anim deadline only while outputs are
+    /// active and scanout is allowed (EINVAL-storm discipline).
+    #[test]
+    fn anim_deadline_gated_on_outputs_active() {
+        use std::time::{Duration, Instant};
+        use yserver_core::backend::{Backend, PixmapHandle};
+
+        let mut b = KmsBackendV2::for_tests();
+        let pix = PixmapHandle::from_raw(0x1234_0060).unwrap();
+        let c1 = b
+            .create_cursor(None, pix, None, (0xFFFF, 0, 0), (0, 0, 0), 0, 0)
+            .expect("c1");
+        let anim = b
+            .create_anim_cursor(None, &[(c1, 50)])
+            .expect("anim")
+            .expect("KMS animates");
+        let root_host = b.core.window_id;
+        b.define_cursor(None, root_host, anim.as_raw())
+            .expect("define");
+        let deadline = b.active_cursor_anim.as_ref().unwrap().next_frame;
+
+        let wake = b.next_wakeup().expect("deadline reported");
+        assert!(wake <= deadline);
+
+        // DPMS off → deadline not reported, tick is a no-op.
+        b.kms_outputs_active = false;
+        let frame = b.active_cursor_anim.as_ref().unwrap().frame;
+        b.active_cursor_anim.as_mut().unwrap().next_frame =
+            Instant::now() - Duration::from_millis(1);
+        assert!(
+            b.next_wakeup().is_none_or(|w| w > Instant::now()),
+            "stale anim deadline must not be reported while outputs are off",
+        );
+        b.tick_cursor_animation();
+        assert_eq!(
+            b.active_cursor_anim.as_ref().unwrap().frame,
+            frame,
+            "tick must not advance while outputs are off",
+        );
+
+        // Outputs back on with the deadline in the past → exactly one
+        // immediate advance (spec: no fast-forward through missed frames).
+        b.kms_outputs_active = true;
+        b.tick_cursor_animation();
+        assert_eq!(
+            b.active_cursor_anim.as_ref().unwrap().frame,
+            frame,
+            "1-frame anim wraps to same index"
+        );
+        assert!(
+            b.active_cursor_anim.as_ref().unwrap().next_frame
+                > Instant::now() - Duration::from_millis(5),
+            "re-armed from now",
         );
     }
 }
