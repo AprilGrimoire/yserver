@@ -1886,17 +1886,13 @@ fn handle_render_request(
             // resource so downstream CWA(CWCursor=this) /
             // XFixesSetCursorName / DefineCursor see a live xid.
             //
-            // Frame animation is not implemented yet: the new cursor
-            // inherits the FIRST sub-cursor's host_xid (static
-            // degeneration). The user sees the first frame instead of
-            // a spinning sequence, but the resource semantics are
-            // correct and there is no BadCursor on subsequent CWA.
-            // Previously this arm was a stub that silently dropped
-            // the xid — combined with the BadCursor gate in
-            // handle_change_window_attributes, that wedged caja /
-            // thunar on every app launch via marco's busy-cursor
-            // path.
-            if body.len() < 12 {
+            // Animation is delegated to `backend.create_anim_cursor`;
+            // backends returning `Ok(None)` (default / ynest) degenerate
+            // to frame 0's handle. Previously this arm was a stub that
+            // silently dropped the xid — combined with the BadCursor gate
+            // in handle_change_window_attributes, that wedged caja /
+            // thunar on every app launch via marco's busy-cursor path.
+            if body.len() < 4 {
                 return Ok(RequestOutcome::Handled);
             }
             let cursor_id = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
@@ -1920,16 +1916,34 @@ fn handle_render_request(
                 );
             }
             let pairs = &body[4..];
-            if pairs.is_empty() || !pairs.len().is_multiple_of(8) {
-                // Malformed list — match Xorg's `BadLength` shape via
-                // the existing length validator above (`request_lengths`).
-                // Falling through preserves prior behaviour for malformed
-                // bodies without inventing a new error path.
-                return Ok(RequestOutcome::Handled);
+            // Xorg fidelity (render.c:1796,1801): odd request length
+            // → BadLength; zero frames → BadValue.
+            if !pairs.len().is_multiple_of(8) {
+                return emit_x11_error(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    header.opcode,
+                );
+            }
+            if pairs.is_empty() {
+                return emit_x11_error(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    0,
+                    header.opcode,
+                );
             }
             let mut first_host: Option<u32> = None;
+            let mut frames: Vec<(crate::backend::CursorHandle, u32)> =
+                Vec::with_capacity(pairs.len() / 8);
             for chunk in pairs.chunks_exact(8) {
                 let sub = ResourceId(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+                let delay = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
                 if !state.resources.cursor_exists(sub) {
                     return emit_x11_error(
                         state,
@@ -1940,23 +1954,69 @@ fn handle_render_request(
                         header.opcode,
                     );
                 }
-                if first_host.is_none() {
-                    first_host = state.resources.cursor_host_xid(sub);
+                // Xorg refuses nested animated cursors (animcur.c:316).
+                if state.resources.cursor_is_anim(sub) {
+                    return emit_x11_error(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_MATCH,
+                        sub.0,
+                        header.opcode,
+                    );
+                }
+                if let Some(host_raw) = state.resources.cursor_host_xid(sub) {
+                    if first_host.is_none() {
+                        first_host = Some(host_raw);
+                    }
+                    if let Some(h) = crate::backend::CursorHandle::from_raw(host_raw) {
+                        frames.push((h, delay));
+                    }
                 }
             }
+            // Backend-side animation. `Ok(None)` (default impl /
+            // ynest) → static degeneration to frame 0's handle. A
+            // backend Err is "can't happen" after the validation
+            // above — log and degenerate rather than swallowing
+            // silently (spec "Error handling").
+            let anim_handle = if frames.is_empty() {
+                None
+            } else {
+                match backend.create_anim_cursor(origin, &frames) {
+                    Ok(handle) => handle,
+                    Err(e) => {
+                        log::warn!(
+                            "client {} RENDER::CreateAnimCursor backend failure ({e}); \
+                             degenerating to first frame",
+                            client_id.0,
+                        );
+                        None
+                    }
+                }
+            };
             state.resources.create_glyph_cursor(client_id, cursor_id);
-            if let Some(host_raw) = first_host
+            state.resources.set_cursor_anim(cursor_id);
+            if let Some(handle) = anim_handle {
+                state.resources.set_cursor_host_xid(cursor_id, handle);
+                log::debug!(
+                    "client {} RENDER::CreateAnimCursor cursor=0x{:x} animated \
+                     ({} frames, backend handle 0x{:x})",
+                    client_id.0,
+                    cursor_id.0,
+                    frames.len(),
+                    handle.as_raw(),
+                );
+            } else if let Some(host_raw) = first_host
                 && let Some(handle) = crate::backend::CursorHandle::from_raw(host_raw)
             {
                 state.resources.set_cursor_host_xid(cursor_id, handle);
+                log::debug!(
+                    "client {} RENDER::CreateAnimCursor cursor=0x{:x} (static \
+                     degeneration to first sub-cursor host_xid=0x{host_raw:x})",
+                    client_id.0,
+                    cursor_id.0,
+                );
             }
-            log::debug!(
-                "client {} RENDER::CreateAnimCursor cursor=0x{:x} (static \
-                 degeneration to first sub-cursor host_xid={:?})",
-                client_id.0,
-                cursor_id.0,
-                first_host,
-            );
         }
         36 => {
             // CreateConicalGradient — stub.
@@ -40030,5 +40090,114 @@ mod tests {
             "ReleaseTexImageEXT must NOT call release_glx_pixmap_export \
              (lifetime ref untouched; backing survives until glXDestroyPixmap)"
         );
+    }
+
+    // ── RENDER::CreateAnimCursor (opcode 133 / minor 31) helpers ─────────────
+
+    fn anim_cursor_body(cid: u32, elts: &[(u32, u32)]) -> Vec<u8> {
+        let mut b = cid.to_le_bytes().to_vec();
+        for (cur, delay) in elts {
+            b.extend_from_slice(&cur.to_le_bytes());
+            b.extend_from_slice(&delay.to_le_bytes());
+        }
+        b
+    }
+
+    fn seed_cursor(state: &mut ServerState, raw: u32, host: u32) {
+        state.resources.create_cursor(ClientId(1), ResourceId(raw));
+        state.resources.set_cursor_host_xid(
+            ResourceId(raw),
+            crate::backend::CursorHandle::from_raw(host).unwrap(),
+        );
+    }
+
+    fn send_anim_cursor(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        seq: u16,
+        body: &[u8],
+    ) {
+        process_request(
+            state,
+            backend,
+            ClientId(1),
+            SequenceNumber(seq),
+            RequestHeader {
+                opcode: 133,
+                data: 31,
+                length_units: u32::try_from(1 + body.len().div_ceil(4)).unwrap(),
+            },
+            body,
+            None,
+        )
+        .expect("process_request");
+    }
+
+    #[test]
+    fn create_anim_cursor_empty_list_returns_bad_value() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let body = anim_cursor_body(0x4000, &[]);
+        send_anim_cursor(&mut state, &mut backend, 1, &body);
+        let bytes = read_all_available(&mut peer);
+        assert!(bytes.len() >= 32, "expected error reply, got {bytes:02x?}");
+        assert_eq!(bytes[1], x11::error::BAD_VALUE);
+        assert_eq!(bytes[10], 133);
+        assert!(!state.resources.cursor_exists(ResourceId(0x4000)));
+    }
+
+    #[test]
+    fn create_anim_cursor_odd_pairs_returns_bad_length() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        seed_cursor(&mut state, 0x3000, 0x77);
+        // One full pair + 4 trailing bytes = not a multiple of 8.
+        let mut body = anim_cursor_body(0x4000, &[(0x3000, 50)]);
+        body.extend_from_slice(&0x3000u32.to_le_bytes());
+        send_anim_cursor(&mut state, &mut backend, 1, &body);
+        let bytes = read_all_available(&mut peer);
+        assert!(bytes.len() >= 32);
+        assert_eq!(bytes[1], x11::error::BAD_LENGTH);
+        assert!(!state.resources.cursor_exists(ResourceId(0x4000)));
+    }
+
+    #[test]
+    fn create_anim_cursor_nested_anim_returns_bad_match() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        seed_cursor(&mut state, 0x3000, 0x77);
+        // First anim cursor (fallback path on RecordingBackend).
+        let body = anim_cursor_body(0x4000, &[(0x3000, 50)]);
+        send_anim_cursor(&mut state, &mut backend, 1, &body);
+        let _ = read_all_available(&mut peer); // no error expected
+        assert!(state.resources.cursor_is_anim(ResourceId(0x4000)));
+        // Second anim cursor referencing the first → BadMatch.
+        let body2 = anim_cursor_body(0x4001, &[(0x4000, 50)]);
+        send_anim_cursor(&mut state, &mut backend, 2, &body2);
+        let bytes = read_all_available(&mut peer);
+        assert!(bytes.len() >= 32);
+        assert_eq!(bytes[1], x11::error::BAD_MATCH);
+        assert!(!state.resources.cursor_exists(ResourceId(0x4001)));
+    }
+
+    #[test]
+    fn create_anim_cursor_fallback_aliases_first_frame_and_sets_anim() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        seed_cursor(&mut state, 0x3000, 0x77);
+        seed_cursor(&mut state, 0x3001, 0x78);
+        let body = anim_cursor_body(0x4000, &[(0x3000, 50), (0x3001, 75)]);
+        send_anim_cursor(&mut state, &mut backend, 1, &body);
+        let bytes = read_all_available(&mut peer);
+        assert!(bytes.is_empty(), "no error expected, got {bytes:02x?}");
+        assert_eq!(
+            state.resources.cursor_host_xid(ResourceId(0x4000)),
+            Some(0x77)
+        );
+        assert!(state.resources.cursor_is_anim(ResourceId(0x4000)));
     }
 }
