@@ -2146,6 +2146,7 @@ impl ResourceTable {
                 owner,
                 host_xid: None,
                 name_atom: None,
+                anim: false,
             },
         );
     }
@@ -2158,6 +2159,7 @@ impl ResourceTable {
                 owner,
                 host_xid: None,
                 name_atom: None,
+                anim: false,
             },
         );
     }
@@ -2200,6 +2202,19 @@ impl ResourceTable {
         let host_xid = self.cursors.get(&id.0).and_then(|c| c.host_xid);
         self.cursors.remove(&id.0);
         host_xid.map(|h| h.as_raw())
+    }
+
+    /// Mark a cursor as animated (RENDER CreateAnimCursor product).
+    pub fn set_cursor_anim(&mut self, id: ResourceId) {
+        if let Some(c) = self.cursors.get_mut(&id.0) {
+            c.anim = true;
+        }
+    }
+
+    /// True iff `id` is a live animated cursor. Unknown ids are false.
+    #[must_use]
+    pub fn cursor_is_anim(&self, id: ResourceId) -> bool {
+        self.cursors.get(&id.0).is_some_and(|c| c.anim)
     }
 
     /// Windows whose `attributes.colormap` references `cmap`. Used by
@@ -2805,6 +2820,12 @@ pub struct Cursor {
     /// (xid 0) on get, matching Xorg `xfixes/cursor.c`'s
     /// `pCursor->name == 0` initial state.
     pub name_atom: Option<yserver_protocol::x11::AtomId>,
+    /// True iff this cursor was created by RENDER `CreateAnimCursor`.
+    /// Consulted to reject nested animated cursors with `BadMatch`
+    /// (Xorg `render/animcur.c:316` refuses them). Set on EVERY
+    /// successful CreateAnimCursor — including backends that
+    /// degenerate to the static first frame.
+    pub anim: bool,
 }
 
 #[cfg(test)]
@@ -2941,6 +2962,7 @@ mod tests {
                 owner,
                 host_xid: Some(CursorHandle::from_raw_for_test(0xa04)),
                 name_atom: None,
+                anim: false,
             },
         );
 
@@ -4980,5 +5002,21 @@ mod tests {
             t.window(COMPOSITE_OVERLAY_WINDOW).unwrap().parent,
             ResourceId(0x200)
         );
+    }
+
+    #[test]
+    fn cursor_anim_flag_default_false_settable_and_freed() {
+        let mut table = ResourceTable::new();
+        let id = ResourceId(0x500);
+        table.create_cursor(ClientId(1), id);
+        assert!(!table.cursor_is_anim(id), "fresh cursor must not be anim");
+        table.set_cursor_anim(id);
+        assert!(table.cursor_is_anim(id));
+        // Unknown id is never anim.
+        assert!(!table.cursor_is_anim(ResourceId(0x501)));
+        // create_glyph_cursor also defaults to false.
+        let gid = ResourceId(0x502);
+        table.create_glyph_cursor(ClientId(1), gid);
+        assert!(!table.cursor_is_anim(gid));
     }
 }
