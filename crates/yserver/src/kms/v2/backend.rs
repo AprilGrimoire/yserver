@@ -21339,16 +21339,19 @@ mod tests {
     #[test]
     fn anim_tick_advances_wraps_and_stays_monotonic() {
         use std::time::{Duration, Instant};
-        use yserver_core::backend::{Backend, PixmapHandle};
+        use yserver_core::backend::{Backend, CursorHandle};
 
         let mut b = KmsBackendV2::for_tests();
-        let pix = PixmapHandle::from_raw(0x1234_0050).unwrap();
-        let c1 = b
-            .create_cursor(None, pix, None, (0xFFFF, 0, 0), (0, 0, 0), 0, 0)
-            .expect("c1");
-        let c2 = b
-            .create_cursor(None, pix, None, (0, 0xFFFF, 0), (0, 0, 0), 0, 0)
-            .expect("c2");
+        // Insert records directly with DISTINCT bytes per frame —
+        // `create_cursor` on an unreadable test pixmap degenerates to
+        // identical 1×1 transparent bytes, making the bytes assert
+        // below vacuous.
+        let c1_xid = b.core.next_host_xid();
+        b.insert_cursor_record(c1_xid, 1, 1, 0, 0, vec![0xAA, 0x00, 0x00, 0xFF]);
+        let c1 = CursorHandle::from_raw(c1_xid).unwrap();
+        let c2_xid = b.core.next_host_xid();
+        b.insert_cursor_record(c2_xid, 1, 1, 0, 0, vec![0x00, 0xBB, 0x00, 0xFF]);
+        let c2 = CursorHandle::from_raw(c2_xid).unwrap();
         let anim = b
             .create_anim_cursor(None, &[(c1, 50), (c2, 75)])
             .expect("anim")
@@ -21446,16 +21449,19 @@ mod tests {
     #[test]
     fn xfixes_cursor_image_follows_animation_frames() {
         use std::time::{Duration, Instant};
-        use yserver_core::backend::{Backend, PixmapHandle};
+        use yserver_core::backend::{Backend, CursorHandle};
 
         let mut b = KmsBackendV2::for_tests();
-        let pix = PixmapHandle::from_raw(0x1234_0070).unwrap();
-        let c1 = b
-            .create_cursor(None, pix, None, (0xFFFF, 0, 0), (0, 0, 0), 0, 0)
-            .expect("c1");
-        let c2 = b
-            .create_cursor(None, pix, None, (0, 0xFFFF, 0), (0, 0, 0), 0, 0)
-            .expect("c2");
+        // Insert records directly with DISTINCT bytes per frame —
+        // `create_cursor` on an unreadable test pixmap degenerates to
+        // identical 1×1 transparent bytes, making the bytes assert
+        // below vacuous.
+        let c1_xid = b.core.next_host_xid();
+        b.insert_cursor_record(c1_xid, 1, 1, 0, 0, vec![0xAA, 0x00, 0x00, 0xFF]);
+        let c1 = CursorHandle::from_raw(c1_xid).unwrap();
+        let c2_xid = b.core.next_host_xid();
+        b.insert_cursor_record(c2_xid, 1, 1, 0, 0, vec![0x00, 0xBB, 0x00, 0xFF]);
+        let c2 = CursorHandle::from_raw(c2_xid).unwrap();
         let anim = b
             .create_anim_cursor(None, &[(c1, 50), (c2, 75)])
             .expect("anim")
