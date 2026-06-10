@@ -80,49 +80,85 @@ backend need no changes.
 
 ### Request handler change
 
-`process_request.rs` CreateAnimCursor handler: after the existing
-validation (unchanged — client-owned fresh id, non-empty 8-byte-
-aligned list, every sub-cursor exists), call
+`process_request.rs` CreateAnimCursor handler keeps the existing
+id-ownership and sub-cursor-exists checks, then calls
 `backend.create_anim_cursor(...)`. On `Some(handle)` store that as
 the cursor's `host_xid`; on `None` keep today's first-frame path.
 
-Validation gap to close while here (matches Xorg): reject a
-sub-cursor that is itself animated with `BadMatch` (Xorg refuses
-nested animated cursors; we currently would silently treat the
-nested cursor as one frame).
+Two validation gaps to close while here (today's handler returns a
+silent `Handled` for both — `process_request.rs:1922-1928`):
+
+- empty frame list → `BadValue` (Xorg: `ncursor <= 0`,
+  `render.c:1801`); list length not a multiple of 8 bytes →
+  `BadLength` (Xorg: odd `req_len`, `render.c:1796`).
+- a sub-cursor that is itself animated → `BadMatch` (Xorg refuses
+  nested animated cursors, `animcur.c:316`). The core resource
+  table does not currently track animatedness, so the core `Cursor`
+  resource (`resources.rs:2142`) gains an `anim: bool` flag, set
+  when CreateAnimCursor succeeds; the handler checks the flag on
+  each sub-cursor. No backend round-trip needed.
 
 ### KMS backend: data model
 
+Namespace note (these are different `u32` spaces — do not mix):
+client cursor *xids* live in the core resource table, which maps
+them to backend-allocated *host handles* (`CursorHandle`). All KMS
+cursor maps — `cursor_records`, `cursor_pixmaps`,
+`effective_cursor_xid` — are keyed by **host handle** raw values
+(`kms/v2/backend.rs:274-278`). Everything below is in host-handle
+space; "handle" means host handle.
+
 ```rust
 pub(crate) struct AnimCursorRecord {
-    /// Frame snapshots taken at creation time. Holding the Arcs
-    /// makes sub-cursor lifetime a non-issue: the client may free
-    /// the constituent cursors immediately (Xorg refcounts them; we
-    /// snapshot instead).
-    pub(crate) frames: Vec<(std::sync::Arc<CursorRecord>, std::time::Duration)>,
+    /// Frame snapshots taken at creation time: the frame's record,
+    /// its sprite pixmap (what the scene samples in SW-cursor
+    /// mode), and its delay.
+    pub(crate) frames: Vec<AnimFrame>,
+}
+
+pub(crate) struct AnimFrame {
+    pub(crate) record: std::sync::Arc<CursorRecord>,
+    pub(crate) pixmap: crate::kms::v2::store::DrawableId,
+    pub(crate) delay: std::time::Duration,
 }
 ```
 
-Stored in a new `anim_cursor_records: HashMap<u32 /*xid*/,
-AnimCursorRecord>` beside the existing
-`cursor_records: HashMap<u32, Arc<CursorRecord>>`
-(`kms/v2/backend.rs:274`). The animated cursor also gets an entry in
-`cursor_records` pointing at frame 0's record so every existing
-"static cursor" code path (effective-cursor walk, XFixes, scene
-registration) works untouched for frame 0.
+Stored in a new `anim_cursor_records: HashMap<u32 /*handle*/,
+AnimCursorRecord>` beside `cursor_records` / `cursor_pixmaps`. The
+animated cursor also gets entries in `cursor_records` and
+`cursor_pixmaps` pointing at frame 0's record/pixmap so every
+existing "static cursor" code path (effective-cursor walk, XFixes,
+scene registration) works untouched for frame 0.
 
-`create_anim_cursor` impl: look up each sub-cursor xid in
-`cursor_records` (missing xid → `io::Error` mapped to the handler's
-existing error path), clone the Arcs, allocate a fresh cursor xid the
-same way `create_cursor` does, insert both maps. A delay of 0 ms is
-clamped to 16 ms (degenerate spin-loop guard; Xorg lets 0 through and
-busy-loops the timer — we don't).
+`create_anim_cursor` impl: look up each sub-cursor handle in
+`cursor_records` AND `cursor_pixmaps` (missing → `io::Error` mapped
+to the handler's existing error path; insert nothing on partial
+failure), clone the Arcs/ids, allocate a fresh handle the same way
+`create_cursor` does, insert all three maps.
+
+Frame lifetime: KMS v2 currently inherits the trait's default no-op
+`free_cursor` (`trait_def.rs:944`) — cursor records and sprite
+pixmaps are never freed backend-side, so a client freeing the
+constituent cursors after CreateAnimCursor cannot invalidate the
+snapshot (status quo; functionally equivalent to Xorg's refcounting).
+KMS gains a real `free_cursor` impl **only** for animated handles:
+remove the `anim_cursor_records` entry plus the anim handle's
+`cursor_records`/`cursor_pixmaps` entries, and clear
+`ActiveCursorAnim` if it points at that handle. Sub-cursor handles
+keep the no-op behavior. (A general cursor-free pass is a separate,
+pre-existing concern — out of scope.)
+
+Delay of 0 ms is clamped to 16 ms. **Explicit Xorg deviation:** Xorg
+stores 0 as-is (`animcur.c:359`) and lets the timer re-fire
+immediately; in our deadline-driven loop a 0 delay would make
+`next_wakeup()` return `now` forever — a poll busy-spin. 16 ms ≈ one
+display frame; no client-visible behavior difference at that rate.
 
 ### Animation state (one active animation)
 
 ```rust
 struct ActiveCursorAnim {
-    xid: u32,            // animated cursor whose frames are cycling
+    handle: u32,         // animated cursor (host handle) cycling
     frame: usize,        // current index
     next_frame: Instant, // deadline for the next advance
 }
@@ -132,35 +168,56 @@ One `Option<ActiveCursorAnim>` on the backend — matches the
 single-effective-cursor model.
 
 - `refresh_effective_cursor()` resolves the effective cursor; if its
-  xid has an `AnimCursorRecord`, set/replace `ActiveCursorAnim`
+  handle has an `AnimCursorRecord`, set/replace `ActiveCursorAnim`
   (frame 0, `now + delay[0]`). If the effective cursor is not
   animated, clear it. Re-resolving to the *same* animated cursor must
   NOT restart the animation (Xorg: "already current → do nothing");
-  only a change of effective cursor xid resets to frame 0.
-- Free of the animated cursor (`free_cursor`) drops both map entries
-  and clears `ActiveCursorAnim` if it points at that xid.
+  only a change of effective cursor handle resets to frame 0. (The
+  existing early-return at `backend.rs:1125` when the handle is
+  unchanged already gives this.)
+- `free_cursor` of the animated handle drops the map entries and
+  clears `ActiveCursorAnim` if it points at that handle (see data
+  model section).
 
 ### Frame tick
 
 - `next_wakeup()` (`kms/v2/backend.rs:8217`) additionally chains
   `ActiveCursorAnim.next_frame` — but only when outputs are active
-  (see gating below).
-- The tick runs in the backend's wakeup/housekeeping path that the
-  core loop already drives after poll returns: if
-  `now >= next_frame`, advance `frame = (frame + 1) % n`, then push
-  the new frame's `Arc<CursorRecord>` through the existing
-  cursor-changed path — same code `refresh_effective_cursor` uses:
-  scene `register_cursor` (SW path) or
-  `queue_steady_state_cursor_upload()` (HW plane path, ≤64×64 memcpy
-  into the dumb buffer). Re-arm `next_frame = now + delay[frame]`
-  (relative re-arm, self-heals after a stall; if multiple frames'
-  deadlines were missed while stalled, advance once and re-arm — do
-  not fast-forward through missed frames).
-- Implementation detail: frame swap must bump through the existing
-  `CursorRecord.version` dedup mechanism so the upload path sees a
-  change. Each frame's record already has a distinct version
-  (created by separate `create_cursor` calls), so swapping Arcs
-  suffices; verify in tests.
+  (see gating below). This bounds the core loop's poll timeout
+  (`run.rs:409-437`) so the loop wakes by the deadline.
+- **Concrete tick site:** there is no generic "deadline fired"
+  backend callback after poll; the only unconditional per-iteration
+  backend hook is `maybe_composite()` (`run.rs:741`). The tick runs
+  at the top of `maybe_composite()`, *after* its existing
+  `scanout_allowed()` / `kms_outputs_active` gates — which gives the
+  DPMS/VT gating below for free: if `now >= next_frame`, advance
+  `frame = (frame + 1) % n` and display the new frame (below), then
+  re-arm `next_frame = now + delay[frame]` (relative re-arm,
+  self-heals after a stall; if multiple deadlines were missed while
+  stalled, advance once — do not fast-forward through missed
+  frames).
+- **Displaying a frame** mirrors the tail of
+  `refresh_effective_cursor()` (`backend.rs:1149-1193`), for the new
+  frame's record + pixmap: update `cursor_records[handle]` and
+  `cursor_pixmaps[handle]` to the frame's entries (keeps XFixes and
+  any other reader frame-correct), then scene
+  `register_cursor(CursorEntry { id: frame.pixmap, .. })` (SW path
+  samples the pixmap — updating the record alone would leave SW
+  compositing on frame 0) and `queue_steady_state_cursor_upload()`
+  when in Hw/Mixed plane mode and ≤64×64. Factor this shared tail
+  into a helper rather than duplicating it.
+- **Version/serial:** XFixes' `ActiveCursorImage.serial` is
+  contractually monotonic (`trait_def.rs:71-74`), and the upload
+  path dedups on version. Reusing each frame record's own version
+  would repeat `v1,v2,v3,v1,…` on wraparound — backwards. Each tick
+  therefore mints a **fresh** version from the same monotonic
+  counter that stamps new `CursorRecord`s, and passes it as
+  `record_version` / upload version / XFixes serial. The frame
+  records themselves stay immutable. Mechanically: the tick inserts
+  `cursor_records[handle] = Arc::new(CursorRecord { version: fresh,
+  ..frame.record's fields })` — a ≤16 KiB clone per tick for HW-size
+  cursors — so every reader picks up the minted version with no new
+  branches.
 
 ### DPMS / VT gating
 
@@ -174,40 +231,49 @@ after resume.
 
 ### XFixes GetCursorImage
 
-Must return the *current frame* (Xorg behavior). The KMS paths that
-serve cursor images out of `cursor_records`
-(`kms/v2/backend.rs:4167,14030,14390`) read the animated cursor's
-`cursor_records` entry — so the tick also updates
-`cursor_records[anim_xid]` to the current frame's Arc. That one
-update keeps every existing reader (XFixes, scene, HW upload)
-frame-correct without new branches.
+Must return the *current frame* with a monotonic serial (Xorg
+behavior). The KMS paths that serve cursor images out of
+`cursor_records` (`kms/v2/backend.rs:4167,14030,14390`) read the
+animated cursor's `cursor_records` entry — which the tick replaces
+with the current frame's bytes under a freshly-minted version (see
+Frame tick). No XFixes-specific changes needed.
 
 ### Error handling
 
-- Handler validation errors: unchanged (`BadCursor` for unknown
-  sub-cursor, length errors), plus new `BadMatch` for nested
-  animated cursors.
-- `create_anim_cursor` backend failure (sub-cursor record missing —
-  "can't happen" after handler validation): propagate as the
-  handler's existing backend-error path; no partial state (insert
-  into maps only after all lookups succeed).
+- Handler validation errors: `BadCursor` for unknown sub-cursor
+  (unchanged); new `BadValue` for an empty frame list, `BadLength`
+  for a non-multiple-of-8 list, `BadMatch` for nested animated
+  cursors (see Request handler change).
+- `create_anim_cursor` backend failure (sub-cursor record/pixmap
+  missing — "can't happen" after handler validation): propagate as
+  the handler's existing backend-error path; no partial state
+  (insert into maps only after all lookups succeed).
 
 ## Testing
 
 1. **Unit (KMS backend, no display):** existing test harness at
    `kms/v2/backend.rs:16476+` style —
-   - create 3 cursors, create anim cursor → `cursor_records[anim]`
-     is frame 0; `next_wakeup()` includes the deadline.
+   - create 3 cursors, create anim cursor → `cursor_records[anim]` /
+     `cursor_pixmaps[anim]` are frame 0; `next_wakeup()` includes
+     the deadline.
    - simulate tick past deadline → frame advances, wraps mod n,
-     `cursor_records[anim]` follows, versions differ across ticks.
+     `cursor_records[anim]` and `cursor_pixmaps[anim]` follow.
+   - **serial monotonicity across wraparound:** versions strictly
+     increase over ≥ 2n ticks (the regression Codex flagged: naive
+     Arc-swapping repeats `v1,v2,v3,v1`).
+   - **SW path:** the `CursorEntry.id` registered with the scene
+     changes to each frame's pixmap across ticks (not just the
+     record bytes).
    - effective cursor switches away → anim cleared, `next_wakeup()`
      no longer reports it; switch back → restarts at frame 0;
      re-resolve to same cursor → frame index preserved.
-   - free anim cursor mid-animation → no dangling state.
+   - free anim cursor mid-animation → maps + `ActiveCursorAnim`
+     cleared, no dangling state.
    - sub-cursors freed after creation → frames still cycle
-     (Arc snapshot).
-   - delay 0 clamped.
-   - nested anim cursor → handler returns `BadMatch`.
+     (backend-side records survive; status-quo no-op free).
+   - delay 0 clamped to 16 ms.
+   - handler errors: empty list → `BadValue`; odd pair bytes →
+     `BadLength`; nested anim cursor → `BadMatch`.
 2. **vng smoke (iteration signal, not release gate):** small xcb
    test client that builds a 2-frame anim cursor with visually
    distinct frames + 200 ms delays and sets it on a window; verify
@@ -225,6 +291,11 @@ frame-correct without new branches.
   changes — watch for log spam or per-upload allocations; the
   version-dedup mechanism must not treat alternating frames as
   "unchanged".
-- Two maps keyed by the same xid must stay in sync on free/replace
-  (same discipline as the existing `cursor_records` sibling-map
+- Three maps keyed by the same host handle (`cursor_records`,
+  `cursor_pixmaps`, `anim_cursor_records`) must stay in sync on
+  create/tick/free (same discipline as the existing sibling-map
   comment at `backend.rs:277`).
+- The per-tick record clone (fresh-version mechanism) allocates;
+  bounded at cursor size (≤16 KiB HW, larger for SW cursors) per
+  frame at 30–100 ms cadence — acceptable, but keep it out of any
+  hotter path.
