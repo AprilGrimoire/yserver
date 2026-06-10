@@ -21440,4 +21440,42 @@ mod tests {
             "re-armed from now: next_frame must be a future instant after DPMS restore tick",
         );
     }
+
+    /// XFixes GetCursorImage tracks the animation: bytes follow the
+    /// current frame, serial strictly increases across a wraparound.
+    #[test]
+    fn xfixes_cursor_image_follows_animation_frames() {
+        use std::time::{Duration, Instant};
+        use yserver_core::backend::{Backend, PixmapHandle};
+
+        let mut b = KmsBackendV2::for_tests();
+        let pix = PixmapHandle::from_raw(0x1234_0070).unwrap();
+        let c1 = b
+            .create_cursor(None, pix, None, (0xFFFF, 0, 0), (0, 0, 0), 0, 0)
+            .expect("c1");
+        let c2 = b
+            .create_cursor(None, pix, None, (0, 0xFFFF, 0), (0, 0, 0), 0, 0)
+            .expect("c2");
+        let anim = b
+            .create_anim_cursor(None, &[(c1, 50), (c2, 75)])
+            .expect("anim")
+            .expect("KMS animates");
+        let root_host = b.core.window_id;
+        b.define_cursor(None, root_host, anim.as_raw())
+            .expect("define");
+
+        let mut last_serial = b.get_active_cursor_image().expect("image").serial;
+        for _ in 0..4 {
+            b.active_cursor_anim.as_mut().unwrap().next_frame =
+                Instant::now() - Duration::from_millis(1);
+            b.tick_cursor_animation();
+            let img = b.get_active_cursor_image().expect("image");
+            assert!(img.serial > last_serial, "serial must strictly increase");
+            last_serial = img.serial;
+            let frame_idx = b.active_cursor_anim.as_ref().unwrap().frame;
+            let frame_rec =
+                &b.anim_cursor_records.get(&anim.as_raw()).unwrap().frames[frame_idx].record;
+            assert_eq!(*img.bgra_bytes, frame_rec.bgra_bytes);
+        }
+    }
 }
