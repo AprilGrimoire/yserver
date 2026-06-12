@@ -880,6 +880,13 @@ xts-yserver-hw scenario="Xproto" timeout="1200":
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null'
 
+# Run xts5 against Xephyr through x11trace on the host. This gives a
+# compact Xorg-family wire trace for XI debugging without the vng/KMS
+# layer. Use with `scenario=XI` for the full bucket, or another xts5
+# scenario if you want to narrow the trace.
+xts-xephyr-trace scenario="XI" timeout="1200" screen="1600x900":
+    tools/xts-xephyr-trace.sh {{scenario}} {{timeout}} {{screen}}
+
 # Run rendercheck against yserver (KMS) inside virtme-ng.
 rendercheck-yserver timeout="600" tests="fill,dcoords,scoords,mcoords,tscoords,tmcoords,blend,composite,cacomposite,gradients,repeat,triangles,bug7366":
     cargo build --release --bin yserver

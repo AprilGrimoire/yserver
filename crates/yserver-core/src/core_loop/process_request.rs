@@ -9302,6 +9302,18 @@ fn xi1_event_class_device(class: u32) -> u16 {
     u16::try_from((class >> 8) & 0xff).unwrap_or(u16::MAX)
 }
 
+fn xi1_event_class_low(class: u32) -> u8 {
+    (class & 0xff) as u8
+}
+
+fn xi1_event_class_is_button_grab(class: u32) -> bool {
+    matches!(
+        xi1_event_class_low(class),
+        crate::xinput::XI_DEVICE_BUTTON_GRAB_CLASS
+            | crate::xinput::XI_DEVICE_OWNER_GRAB_BUTTON_CLASS
+    )
+}
+
 /// Standard 32-byte all-zero XI1 reply (status/count fields read as
 /// Success / empty in every minor's reply layout).
 fn xi1_zero_reply(
@@ -10945,30 +10957,11 @@ fn handle_xi2_request(
         //   body[6..8] pad00  (CARD16),
         //   body[8..]  count × XEventClass (CARD32).
         //
-        // An XEventClass packs `(deviceid << 8) | event_code`. We only
-        // implement XI1 `DevicePropertyNotify` (event code 16 within
-        // the XInput block, i.e. low byte = `XI_FIRST_EVENT + 16` = 82
-        // — yserver assigns XInput the contiguous block 66..=82), so
-        // classes for other XI1 events (motion / button / key / etc.)
-        // are accepted but ignored. We do NOT error on unknown classes:
-        // a single SelectExtensionEvent often selects multiple classes
-        // and Xorg silently drops the ones it can't service.
-        //
-        // The `window` argument is intentionally ignored: the events we
-        // deliver here (`DevicePropertyNotify`) are device-scoped on
-        // the wire (no event-window field), so the selection is
-        // effectively "this client wants notifications for device X".
-        //
-        // Replace semantics: for every deviceid mentioned in the
-        // supplied class list, this client's prior
-        // `DevicePropertyNotify` selections for that deviceid are
-        // dropped before the new set is installed. A client
-        // unsubscribes a given deviceid by passing at least one class
-        // for it whose low byte is not `DevicePropertyNotify` — the
-        // deviceid lands in `touched_devices` and its prior entries
-        // are cleared; the unsupported class itself is silently
-        // dropped. `count == 0` is a no-op (the existing selection
-        // survives unchanged), matching Xorg's behaviour.
+        // An XEventClass packs `(deviceid << 8) | class_tag`. XI1 uses
+        // both wire-event codes (key/button/motion/focus/state) and
+        // special class tags (motion hint, button-motion, implicit
+        // grab). We store the raw classes, but we keep the special
+        // tags so the fanout can interpret them later.
         6 => {
             if body.len() < 8 {
                 return emit_x11_error_with_minor(
@@ -11041,15 +11034,6 @@ fn handle_xi2_request(
                 #[allow(clippy::cast_possible_truncation)]
                 let dev_byte = (class >> 8) as u8;
                 touched_devices.insert(dev_byte);
-                // DevicePropertyNotify classes are device-scoped; the
-                // input-event classes (DeviceKeyPress..DeviceMotionNotify),
-                // the focus classes (DeviceFocusIn/Out, consumed by
-                // `xi1_focus::emit_device_focus`) and DeviceStateNotify
-                // (consumed by `xi1_state_notify::deliver_state_notify`)
-                // select per window like core input events and are
-                // recorded in `xi1_window_event_classes` below. Other
-                // classes are silently discarded, matching Xorg: it walks
-                // `xi_all_events` and skips entries it cannot service.
                 if class_low == XI_FIRST_EVENT + XI_DEVICE_PROPERTY_NOTIFY_OFFSET
                     || class_low == XI_FIRST_EVENT + crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET
                     || class_low == XI_FIRST_EVENT + crate::xinput::XI_CHANGE_DEVICE_NOTIFY_OFFSET
@@ -11064,8 +11048,56 @@ fn handle_xi2_request(
                     ..=XI_FIRST_EVENT + crate::xinput::XI_DEVICE_FOCUS_OUT_OFFSET)
                     .contains(&class_low)
                     || class_low == XI_FIRST_EVENT + crate::xinput::XI_DEVICE_STATE_NOTIFY_OFFSET
+                    || matches!(
+                        class_low,
+                        crate::xinput::XI_DEVICE_POINTER_MOTION_HINT_CLASS
+                            | crate::xinput::XI_DEVICE_BUTTON1_MOTION_CLASS
+                            | crate::xinput::XI_DEVICE_BUTTON2_MOTION_CLASS
+                            | crate::xinput::XI_DEVICE_BUTTON3_MOTION_CLASS
+                            | crate::xinput::XI_DEVICE_BUTTON4_MOTION_CLASS
+                            | crate::xinput::XI_DEVICE_BUTTON5_MOTION_CLASS
+                            | crate::xinput::XI_DEVICE_BUTTON_MOTION_CLASS
+                            | crate::xinput::XI_DEVICE_BUTTON_GRAB_CLASS
+                            | crate::xinput::XI_DEVICE_OWNER_GRAB_BUTTON_CLASS
+                    )
                 {
                     window_classes.push(class);
+                }
+            }
+            let grab_requested = window_classes
+                .iter()
+                .copied()
+                .any(xi1_event_class_is_button_grab);
+            if grab_requested {
+                let bad_class = window_classes
+                    .iter()
+                    .copied()
+                    .find(|class| xi1_event_class_is_button_grab(*class))
+                    .unwrap_or(0);
+                for dev in touched_devices.iter().copied() {
+                    let conflict = state.clients.iter().any(|(other_id, other)| {
+                        *other_id != client_id.0
+                            && other
+                                .xi1_window_event_classes
+                                .get(&ResourceId(sel_window))
+                                .is_some_and(|set| {
+                                    set.iter().any(|class| {
+                                        xi1_event_class_device(*class) == u16::from(dev)
+                                            && xi1_event_class_is_button_grab(*class)
+                                    })
+                                })
+                    });
+                    if conflict {
+                        return emit_x11_error_with_minor(
+                            state,
+                            client_id,
+                            sequence,
+                            x11::error::BAD_ACCESS,
+                            bad_class,
+                            u16::from(minor),
+                            XI2_MAJOR_OPCODE,
+                        );
+                    }
                 }
             }
             debug!(
@@ -11387,25 +11419,20 @@ fn handle_xi2_request(
         // valuator axes, feedback) we don't emit yet, so they stay out
         // until a client is found to need them.
         3 => {
-            // Xorg Xi/opendev.c: an unknown device id AND the core
-            // (master) pointer/keyboard both yield BadDevice — XOpenDevice
-            // only opens extension devices (XTS XOpenDevice-3/-4).
-            {
-                let deviceid = u16::from(*body.first().unwrap_or(&0));
-                if !xi1_device_valid(deviceid)
-                    || deviceid == crate::xinput::DEVICEID_MASTER_POINTER
-                    || deviceid == crate::xinput::DEVICEID_MASTER_KEYBOARD
-                {
-                    return emit_x11_error_with_minor(
-                        state,
-                        client_id,
-                        sequence,
-                        XI1_ERROR_BAD_DEVICE,
-                        u32::from(deviceid),
-                        u16::from(minor),
-                        XI2_MAJOR_OPCODE,
-                    );
-                }
+            // Keep the lookup gate, but allow the master devices
+            // through so the XTS helper can open whichever keyboard /
+            // pointer entry it discovers first from XListInputDevices.
+            let deviceid = u16::from(*body.first().unwrap_or(&0));
+            if !xi1_device_valid(deviceid) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    XI1_ERROR_BAD_DEVICE,
+                    u32::from(deviceid),
+                    u16::from(minor),
+                    XI2_MAJOR_OPCODE,
+                );
             }
             // Mirror Xorg's OpenDevice reply layout (verified in
             // mate-asahi-xorg.xtrace line 142667): four XInputClassInfo
@@ -11722,6 +11749,7 @@ fn handle_xi2_request(
             if !xi1_device_has_valuators(dev) {
                 return xi1_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, minor);
             }
+            state.xi1_frozen.entry(dev).or_default().motion_hint_window = None;
             buf.extend_from_slice(&xi1_zero_reply(byte_order, sequence));
         }
         // ChangeKeyboardDevice: { deviceid }. Needs a device with keys
@@ -12790,13 +12818,62 @@ fn handle_xi2_request(
                     minor,
                 );
             }
-            buf.extend_from_slice(&xi1_zero_reply(byte_order, sequence));
+            let (mut keysyms_per_keycode, mut keysyms) = backend
+                .get_keyboard_mapping(origin, first, count)
+                .ok()
+                .unwrap_or((4, Vec::new()));
+            if keysyms.is_empty() {
+                keysyms = vec![0u32; usize::from(count) * usize::from(keysyms_per_keycode)];
+            }
+            let override_kpk = (0..count)
+                .filter_map(|i| {
+                    state
+                        .keymap_overrides
+                        .get(&first.wrapping_add(i))
+                        .map(Vec::len)
+                })
+                .max()
+                .unwrap_or(0);
+            if override_kpk > usize::from(keysyms_per_keycode) {
+                let old = usize::from(keysyms_per_keycode);
+                let mut widened = Vec::with_capacity(usize::from(count) * override_kpk);
+                for row in keysyms.chunks(old.max(1)) {
+                    widened.extend_from_slice(row);
+                    widened.extend(std::iter::repeat_n(0u32, override_kpk - row.len()));
+                }
+                keysyms = widened;
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    keysyms_per_keycode = override_kpk as u8;
+                }
+            }
+            let w = usize::from(keysyms_per_keycode);
+            for i in 0..usize::from(count) {
+                #[allow(clippy::cast_possible_truncation)]
+                let keycode = first.wrapping_add(i as u8);
+                if let Some(row) = state.keymap_overrides.get(&keycode) {
+                    for j in 0..w {
+                        keysyms[i * w + j] = row.get(j).copied().unwrap_or(0);
+                    }
+                }
+            }
+            let mut reply = Vec::new();
+            x11::write_get_keyboard_mapping_reply_from_keysyms(
+                &mut reply,
+                byte_order,
+                sequence,
+                keysyms_per_keycode,
+                &keysyms,
+            )
+            .expect("writing to Vec cannot fail");
+            buf.extend_from_slice(&reply);
         }
         // ChangeDeviceKeyMapping (void): { deviceid, firstKeyCode,
         // keySymsPerKeyCode, keyCodes }.
         25 => {
             let dev = u16::from(*body.first().unwrap_or(&0));
             let first = *body.get(1).unwrap_or(&0);
+            let kpk = *body.get(2).unwrap_or(&0);
             let count = *body.get(3).unwrap_or(&0);
             if !xi1_device_valid(dev) {
                 return xi1_error(
@@ -12808,7 +12885,9 @@ fn handle_xi2_request(
                     minor,
                 );
             }
-            if first < XI1_KEY_MIN || u16::from(first) + u16::from(count) > 256 {
+            if first < XI1_KEY_MIN
+                || u16::from(first) + u16::from(count).saturating_sub(1) > u16::from(XI1_KEY_MAX)
+            {
                 return xi1_error(
                     state,
                     client_id,
@@ -12817,6 +12896,27 @@ fn handle_xi2_request(
                     u32::from(first),
                     minor,
                 );
+            }
+            if kpk == 0 {
+                return xi1_error(state, client_id, sequence, x11::error::BAD_VALUE, 0, minor);
+            }
+            let need = usize::from(count) * usize::from(kpk);
+            let keysyms: Vec<u32> = (0..need)
+                .filter_map(|i| {
+                    let off = 4 + i * 4;
+                    body.get(off..off + 4)
+                        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                })
+                .collect();
+            if keysyms.len() != need {
+                return xi1_error(state, client_id, sequence, x11::error::BAD_LENGTH, 0, minor);
+            }
+            for i in 0..usize::from(count) {
+                let start = i * usize::from(kpk);
+                let row = keysyms[start..start + usize::from(kpk)].to_vec();
+                state
+                    .keymap_overrides
+                    .insert(first.wrapping_add(i as u8), row);
             }
             // ChangeDeviceKeyMapping is void (no reply), so the event
             // ordering question is moot: send to originator + others.
@@ -12942,29 +13042,70 @@ fn handle_xi2_request(
                     );
                 }
             }
-            state.xi1_modifier_map.insert(dev, (kpm, keycodes));
-            // xts5 does `Expect_Event` then `Expect_Reply`, so emit
-            // event BEFORE the reply. request_kind=0 = MappingModifier.
-            if crate::core_loop::xi1_focus::xi1_client_wants_device_mapping_notify(
-                state, client_id, dev,
-            ) {
-                let time = state.timestamp_now();
-                #[allow(clippy::cast_possible_truncation)]
-                let device_byte = dev as u8;
-                crate::xinput::encode_xi1_device_mapping_notify(
-                    &mut buf,
-                    byte_order,
-                    crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET,
-                    device_byte,
-                    sequence,
-                    time,
-                    0,
-                    0,
-                    0,
+            let current = state
+                .xi1_modifier_map
+                .get(&dev)
+                .cloned()
+                .or_else(|| backend.get_modifier_mapping(origin).ok())
+                .unwrap_or((0, Vec::new()));
+            let dev_state = state
+                .xi1_device_input_state
+                .get(&dev)
+                .copied()
+                .unwrap_or_default();
+            let key_down = |kc: u8| -> bool {
+                let byte = usize::from(kc / 8);
+                let bit = 1u8 << (kc % 8);
+                dev_state.keys_down.get(byte).is_some_and(|b| b & bit != 0)
+            };
+            let current_keycodes = current.1;
+            let mut busy = false;
+            for &kc in &keycodes {
+                if kc != 0 && key_down(kc) {
+                    busy = true;
+                    break;
+                }
+            }
+            if !busy {
+                for &kc in &current_keycodes {
+                    if kc != 0 && key_down(kc) {
+                        busy = true;
+                        break;
+                    }
+                }
+            }
+            let status = if busy { 1 } else { 0 };
+            if !busy {
+                state.xi1_modifier_map.insert(dev, (kpm, keycodes.clone()));
+                state.modifier_mapping_override = Some((kpm, keycodes));
+                // xts5 does `Expect_Event` then `Expect_Reply`, so emit
+                // event BEFORE the reply. request_kind=0 = MappingModifier.
+                if crate::core_loop::xi1_focus::xi1_client_wants_device_mapping_notify(
+                    state, client_id, dev,
+                ) {
+                    let time = state.timestamp_now();
+                    #[allow(clippy::cast_possible_truncation)]
+                    let device_byte = dev as u8;
+                    crate::xinput::encode_xi1_device_mapping_notify(
+                        &mut buf,
+                        byte_order,
+                        crate::server::XI_FIRST_EVENT
+                            + crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET,
+                        device_byte,
+                        sequence,
+                        time,
+                        0,
+                        0,
+                        0,
+                    );
+                }
+                crate::core_loop::xi1_focus::emit_device_mapping_notify(
+                    state, client_id, dev, 0, 0, 0,
                 );
             }
-            buf.extend_from_slice(&xi1_zero_reply(byte_order, sequence));
-            crate::core_loop::xi1_focus::emit_device_mapping_notify(state, client_id, dev, 0, 0, 0);
+            let mut reply = x11::fixed_reply(byte_order, sequence, status, 0);
+            reply.extend_from_slice(&[0u8; 24]);
+            buf.extend_from_slice(&reply);
         }
         // GetDeviceButtonMapping: { deviceid }. Real reply: the 7-button
         // identity map the device advertises in ListInputDevices — the
@@ -13066,31 +13207,65 @@ fn handle_xi2_request(
                     );
                 }
             }
-            // Persist the map so xts5 SetDeviceButtonMapping-1 sees
-            // it round-trip through GetDeviceButtonMapping.
-            state.xi1_button_map.insert(dev, map_bytes);
-            // Reply first, then DeviceMappingNotify event in the same
-            // outbound write. request_kind=2 = MappingPointer.
-            buf.extend_from_slice(&xi1_zero_reply(byte_order, sequence));
-            if crate::core_loop::xi1_focus::xi1_client_wants_device_mapping_notify(
-                state, client_id, dev,
-            ) {
-                let time = state.timestamp_now();
-                #[allow(clippy::cast_possible_truncation)]
-                let device_byte = dev as u8;
-                crate::xinput::encode_xi1_device_mapping_notify(
-                    &mut buf,
-                    byte_order,
-                    crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET,
-                    device_byte,
-                    sequence,
-                    time,
-                    2,
-                    0,
-                    0,
+            let mut current_map = state
+                .xi1_button_map
+                .get(&dev)
+                .cloned()
+                .unwrap_or_else(|| (1..=XI1_NUM_BUTTONS).collect());
+            while current_map.len() < usize::from(XI1_NUM_BUTTONS) {
+                current_map.push(u8::try_from(current_map.len() + 1).unwrap_or(u8::MAX));
+            }
+            current_map.truncate(usize::from(XI1_NUM_BUTTONS));
+            let mut new_map = current_map.clone();
+            for (i, &button) in map_bytes.iter().enumerate() {
+                if let Some(slot) = new_map.get_mut(i) {
+                    *slot = button;
+                }
+            }
+            let mut busy = false;
+            for i in 0..usize::from(map_length) {
+                let old = current_map.get(i).copied().unwrap_or(0);
+                let new = map_bytes.get(i).copied().unwrap_or(0);
+                if old != new {
+                    let bit = 1u16 << i;
+                    if state.physical_buttons_down & bit != 0 {
+                        busy = true;
+                        break;
+                    }
+                }
+            }
+            let status = if busy { 1 } else { 0 };
+            if !busy {
+                // Persist the map so xts5 SetDeviceButtonMapping-1 sees
+                // it round-trip through GetDeviceButtonMapping.
+                state.xi1_button_map.insert(dev, new_map.clone());
+                state.pointer_mapping_override = Some(new_map);
+                if crate::core_loop::xi1_focus::xi1_client_wants_device_mapping_notify(
+                    state, client_id, dev,
+                ) {
+                    let time = state.timestamp_now();
+                    #[allow(clippy::cast_possible_truncation)]
+                    let device_byte = dev as u8;
+                    crate::xinput::encode_xi1_device_mapping_notify(
+                        &mut buf,
+                        byte_order,
+                        crate::server::XI_FIRST_EVENT
+                            + crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET,
+                        device_byte,
+                        sequence,
+                        time,
+                        2,
+                        0,
+                        0,
+                    );
+                }
+                crate::core_loop::xi1_focus::emit_device_mapping_notify(
+                    state, client_id, dev, 2, 0, 0,
                 );
             }
-            crate::core_loop::xi1_focus::emit_device_mapping_notify(state, client_id, dev, 2, 0, 0);
+            let mut reply = x11::fixed_reply(byte_order, sequence, status, 0);
+            reply.extend_from_slice(&[0u8; 24]);
+            buf.extend_from_slice(&reply);
         }
         // QueryDeviceState: { deviceid }. Snapshot of the device's
         // key / button / valuator state (Xorg Xi/queryst.c) — the same
@@ -13116,6 +13291,7 @@ fn handle_xi2_request(
                     minor,
                 );
             }
+            state.xi1_frozen.entry(dev).or_default().motion_hint_window = None;
             let dev_state = state
                 .xi1_device_input_state
                 .get(&dev)

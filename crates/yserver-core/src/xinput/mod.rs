@@ -103,6 +103,20 @@ pub const XI_CHANGE_DEVICE_NOTIFY_OFFSET: u8 = 12;
 pub const XI_DEVICE_KEY_STATE_NOTIFY_OFFSET: u8 = 13;
 pub const XI_DEVICE_BUTTON_STATE_NOTIFY_OFFSET: u8 = 14;
 
+/// XI 1.x special `XEventClass` low-byte selectors used by
+/// `SelectExtensionEvent`/`CreateMaskFromList`. These are not wire
+/// event codes; they are the class tags from XInput.h.
+pub const XI_DEVICE_POINTER_MOTION_HINT_CLASS: u8 = 0;
+pub const XI_DEVICE_BUTTON1_MOTION_CLASS: u8 = 1;
+pub const XI_DEVICE_BUTTON2_MOTION_CLASS: u8 = 2;
+pub const XI_DEVICE_BUTTON3_MOTION_CLASS: u8 = 3;
+pub const XI_DEVICE_BUTTON4_MOTION_CLASS: u8 = 4;
+pub const XI_DEVICE_BUTTON5_MOTION_CLASS: u8 = 5;
+pub const XI_DEVICE_BUTTON_MOTION_CLASS: u8 = 6;
+pub const XI_DEVICE_BUTTON_GRAB_CLASS: u8 = 7;
+pub const XI_DEVICE_OWNER_GRAB_BUTTON_CLASS: u8 = 8;
+pub const XI_NO_EXTENSION_EVENT_CLASS: u8 = 9;
+
 /// `deviceid` high bit marking "another event of this logical event
 /// follows" in DeviceStateNotify / DeviceValuator chains
 /// (XIproto.h:67). libXi buffers a chain until it sees a deviceid

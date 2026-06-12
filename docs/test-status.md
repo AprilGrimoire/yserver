@@ -64,9 +64,9 @@ Total UNRES collapsed from 116 (run #4) to **80**.
 | XtC       |    29 |   147 |   88 |    0 |     2 |    56 |     1 |     0 |      0 |
 | XtE       |     1 |     1 |    1 |    0 |     0 |     0 |     0 |     0 |      0 |
 | ShapeExt  |    11 |    11 |   11 |    0 |     0 |     0 |     0 |     0 |      0 |
-| XI        |    36 |   316 |  221 |   42 |    13 |    33 |     2 |     5 |    +10 |
+| XI        |    36 |   316 |  226 |   37 |    13 |    33 |     2 |     5 |    +10 |
 | XIproto   |    35 |   107 |   95 |    0 |     0 |    12 |     0 |     0 |      0 |
-| **total** | **1078** | **5987** | **3961** | **818** | **80** | **705** | **137** | **273** | **+214** |
+| **total** | **1078** | **5987** | **3966** | **818** | **80** | **705** | **137** | **268** | **+219** |
 
 ShapeExt, Xlib16, XIproto and Xt3/4/5/10/14 are fully clean (zero
 FAIL/UNRES). yserver survived the whole sweep with zero panics in
@@ -92,7 +92,7 @@ Largest FAIL buckets / next targets:
    needed), colormap visual-type checks, bit-gravity pixel cluster,
    stacking-order pixel checks, BadAccess event-mask conflicts.
 3. **Xlib11 (49)** — residual grab semantics.
-4. **XI (42)** — XTest-input-through-XI1-freeze gap.
+4. **XI (37)** — XTest-input-through-XI1-freeze gap.
 5. **Xlib7 (31)** — colormap section (mostly UNSUPPORTED on
    non-PseudoColor).
 

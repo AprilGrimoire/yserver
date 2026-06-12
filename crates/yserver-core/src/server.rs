@@ -327,6 +327,11 @@ pub struct Xi1Freeze {
     /// this (core POINTER events deliberately keep flowing for now —
     /// desktop interactivity risk outweighs XTS fidelity there).
     pub core_key_queue: std::collections::VecDeque<crate::host_x11::HostKeyEvent>,
+    /// XI1 `DevicePointerMotionHint` state for this device. Mirrors
+    /// Xorg's `valuator->motionHintWindow`: once a motion hint is sent
+    /// for a window, further motion is suppressed until a query path
+    /// resets it.
+    pub motion_hint_window: Option<ResourceId>,
 }
 
 impl Xi1Freeze {
@@ -825,6 +830,10 @@ pub struct ServerState {
     /// (XTest) events and gates passive-grab activation ("no other
     /// buttons down").
     pub buttons_down: u16,
+    /// Raw physical pointer buttons currently down, independent of the
+    /// current pointer mapping. Used for XI button-mapping busy checks,
+    /// which Xorg evaluates against physical button numbers.
+    pub physical_buttons_down: u16,
     /// Re-entrancy guard for the confinement warp: `warp_pointer_root`
     /// synchronously re-enters the pointer fanout with the generated
     /// motion; a coordinate mismatch between the clamp target and the
@@ -1131,6 +1140,7 @@ impl ServerState {
             keys_down: [0u8; 32],
             pointer_confine_to: ResourceId(0),
             buttons_down: 0,
+            physical_buttons_down: 0,
             confine_warp_active: false,
             xi1_last_input_time: 0,
             xi1_frozen: HashMap::new(),

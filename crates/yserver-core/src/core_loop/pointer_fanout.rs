@@ -54,16 +54,27 @@ pub fn pointer_event_fanout_to_state(
     // routing (Xorg UpdateDeviceState applies b->map at event
     // generation). A 0 entry disables the button — the event vanishes.
     let mut event = event;
+    let raw_button = event.detail;
     if matches!(
         event.kind,
         PointerEventKind::ButtonPress | PointerEventKind::ButtonRelease
-    ) && let Some(map) = &state.pointer_mapping_override
-        && let Some(&mapped) = map.get(usize::from(event.detail).wrapping_sub(1))
-    {
-        if mapped == 0 {
-            return Vec::new();
+    ) {
+        if (1..=16).contains(&raw_button) {
+            let bit = 1u16 << (raw_button - 1);
+            if event.kind == PointerEventKind::ButtonPress {
+                state.physical_buttons_down |= bit;
+            } else {
+                state.physical_buttons_down &= !bit;
+            }
         }
-        event.detail = mapped;
+        if let Some(map) = &state.pointer_mapping_override
+            && let Some(&mapped) = map.get(usize::from(event.detail).wrapping_sub(1))
+        {
+            if mapped == 0 {
+                return Vec::new();
+            }
+            event.detail = mapped;
+        }
     }
     // Track logical buttons-down for the passive-grab activation
     // predicate (`find_passive_grab` rejects a grab when another
@@ -919,6 +930,9 @@ pub(crate) fn xi1_route_device_event(
         || q.evcode == first + XI_DEVICE_BUTTON_PRESS_OFFSET;
     let is_release = q.evcode == first + XI_DEVICE_KEY_RELEASE_OFFSET
         || q.evcode == first + XI_DEVICE_BUTTON_RELEASE_OFFSET;
+    let is_button_press = q.evcode == first + XI_DEVICE_BUTTON_PRESS_OFFSET;
+    let is_button_release = q.evcode == first + XI_DEVICE_BUTTON_RELEASE_OFFSET;
+    let is_motion = q.evcode == first + crate::xinput::XI_DEVICE_MOTION_NOTIFY_OFFSET;
 
     // 1. Frozen → queue (Xorg FreezeThaw switching processInputProc
     // to the enqueue proc: NOTHING is delivered while frozen, not
@@ -979,6 +993,11 @@ pub(crate) fn xi1_route_device_event(
             bits[byte] |= 1 << bit;
         } else {
             bits[byte] &= !(1 << bit);
+        }
+        if is_button_press || is_button_release {
+            if let Some(freeze) = state.xi1_frozen.get_mut(&q.deviceid) {
+                freeze.motion_hint_window = None;
+            }
         }
     }
 
@@ -1083,8 +1102,67 @@ pub(crate) fn xi1_route_device_event(
         hit.as_ref()
             .map(|(t, w)| (t.iter().map(|c| c.0).collect::<Vec<_>>(), w.0)),
     );
+    let mut q = q;
     let dropped = match hit {
-        Some((targets, w)) => xi1_fan_device_event(state, &targets, w, &q),
+        Some((targets, w)) => {
+            if is_motion {
+                let hint_selected = xi1_window_has_motion_hint(state, w, q.deviceid);
+                let hint_window = xi1_motion_hint_window(state, q.deviceid);
+                if hint_selected && hint_window == Some(w) {
+                    return Vec::new();
+                }
+                if hint_selected {
+                    q.detail = 1; // NotifyHint
+                    state
+                        .xi1_frozen
+                        .entry(q.deviceid)
+                        .or_default()
+                        .motion_hint_window = Some(w);
+                } else {
+                    q.detail = 0; // NotifyNormal
+                }
+            }
+            let dropped = xi1_fan_device_event(state, &targets, w, &q);
+            if is_button_press && state.xi1_active_grabs.get(&q.deviceid).is_none() {
+                let grab_owner = targets.iter().copied().find(|client| {
+                    state.clients.get(&client.0).is_some_and(|c| {
+                        c.xi1_window_event_classes.get(&w).is_some_and(|set| {
+                            set.contains(
+                                &((u32::from(q.deviceid) << 8)
+                                    | u32::from(crate::xinput::XI_DEVICE_BUTTON_GRAB_CLASS)),
+                            ) || set.contains(
+                                &((u32::from(q.deviceid) << 8)
+                                    | u32::from(crate::xinput::XI_DEVICE_OWNER_GRAB_BUTTON_CLASS)),
+                            )
+                        })
+                    })
+                });
+                if let Some(owner) = grab_owner {
+                    let owner_events = state.clients.get(&owner.0).is_some_and(|c| {
+                        c.xi1_window_event_classes.get(&w).is_some_and(|set| {
+                            set.contains(
+                                &((u32::from(q.deviceid) << 8)
+                                    | u32::from(crate::xinput::XI_DEVICE_OWNER_GRAB_BUTTON_CLASS)),
+                            )
+                        })
+                    });
+                    state.xi1_active_grabs.insert(
+                        q.deviceid,
+                        crate::server::Xi1ActiveGrab {
+                            owner,
+                            deviceid: q.deviceid,
+                            grab_window: w,
+                            owner_events,
+                            this_mode: 1,
+                            other_mode: 1,
+                            passive_detail: Some(q.detail),
+                        },
+                    );
+                    state.xi1_last_grab_time = q.time;
+                }
+            }
+            dropped
+        }
         None => Vec::new(),
     };
     // A BRIDGED core grab (no XI1 grab, but the core pointer/keyboard
@@ -1109,14 +1187,24 @@ fn compute_xi1_route_targets(
     q: &crate::server::Xi1QueuedEvent,
 ) -> Option<(Vec<ClientId>, ResourceId)> {
     match q.focus_route {
-        crate::server::Xi1FocusRoute::Walk => {
-            compute_xi1_targets_bounded(state, q.natural_target, q.evcode, q.deviceid, None)
-        }
-        crate::server::Xi1FocusRoute::WalkUpTo(stop) => {
-            compute_xi1_targets_bounded(state, q.natural_target, q.evcode, q.deviceid, Some(stop))
-        }
+        crate::server::Xi1FocusRoute::Walk => compute_xi1_targets_bounded(
+            state,
+            q.natural_target,
+            q.evcode,
+            q.deviceid,
+            q.state_mask,
+            None,
+        ),
+        crate::server::Xi1FocusRoute::WalkUpTo(stop) => compute_xi1_targets_bounded(
+            state,
+            q.natural_target,
+            q.evcode,
+            q.deviceid,
+            q.state_mask,
+            Some(stop),
+        ),
         crate::server::Xi1FocusRoute::WindowOnly(w) => {
-            let targets = xi1_window_selectors(state, w, q.evcode, q.deviceid);
+            let targets = xi1_window_selectors(state, w, q.evcode, q.deviceid, q.state_mask);
             if targets.is_empty() {
                 None
             } else {
@@ -1127,24 +1215,108 @@ fn compute_xi1_route_targets(
     }
 }
 
-/// Clients that selected `(deviceid << 8) | evcode` on exactly `window`.
+/// Clients that selected the event represented by `(deviceid << 8) |
+/// evcode` on exactly `window`. Motion events also honour the XI1
+/// button-motion selectors and motion-hint modifier classes.
 fn xi1_window_selectors(
     state: &ServerState,
     window: ResourceId,
     evcode: u8,
     deviceid: u16,
+    state_mask: u16,
 ) -> Vec<ClientId> {
     let class = (u32::from(deviceid) << 8) | u32::from(evcode);
+    let held_buttons = ((state_mask >> 8) & 0x1f) as u8;
     state
         .clients
         .iter()
         .filter(|(_, c)| {
-            c.xi1_window_event_classes
-                .get(&window)
-                .is_some_and(|set| set.contains(&class))
+            let Some(set) = c.xi1_window_event_classes.get(&window) else {
+                return false;
+            };
+            if evcode
+                == crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_MOTION_NOTIFY_OFFSET
+            {
+                if set.contains(&class) {
+                    return true;
+                }
+                let motion_hint = (u32::from(deviceid) << 8)
+                    | u32::from(crate::xinput::XI_DEVICE_POINTER_MOTION_HINT_CLASS);
+                if set.contains(&motion_hint) {
+                    return true;
+                }
+                if held_buttons == 0 {
+                    return false;
+                }
+                let button_motion = (u32::from(deviceid) << 8)
+                    | u32::from(crate::xinput::XI_DEVICE_BUTTON_MOTION_CLASS);
+                if set.contains(&button_motion) {
+                    return true;
+                }
+                if held_buttons & 0x01 != 0
+                    && set.contains(
+                        &((u32::from(deviceid) << 8)
+                            | u32::from(crate::xinput::XI_DEVICE_BUTTON1_MOTION_CLASS)),
+                    )
+                {
+                    return true;
+                }
+                if held_buttons & 0x02 != 0
+                    && set.contains(
+                        &((u32::from(deviceid) << 8)
+                            | u32::from(crate::xinput::XI_DEVICE_BUTTON2_MOTION_CLASS)),
+                    )
+                {
+                    return true;
+                }
+                if held_buttons & 0x04 != 0
+                    && set.contains(
+                        &((u32::from(deviceid) << 8)
+                            | u32::from(crate::xinput::XI_DEVICE_BUTTON3_MOTION_CLASS)),
+                    )
+                {
+                    return true;
+                }
+                if held_buttons & 0x08 != 0
+                    && set.contains(
+                        &((u32::from(deviceid) << 8)
+                            | u32::from(crate::xinput::XI_DEVICE_BUTTON4_MOTION_CLASS)),
+                    )
+                {
+                    return true;
+                }
+                if held_buttons & 0x10 != 0
+                    && set.contains(
+                        &((u32::from(deviceid) << 8)
+                            | u32::from(crate::xinput::XI_DEVICE_BUTTON5_MOTION_CLASS)),
+                    )
+                {
+                    return true;
+                }
+                false
+            } else {
+                set.contains(&class)
+            }
         })
         .map(|(id, _)| ClientId(*id))
         .collect()
+}
+
+fn xi1_window_has_motion_hint(state: &ServerState, window: ResourceId, deviceid: u16) -> bool {
+    let class =
+        (u32::from(deviceid) << 8) | u32::from(crate::xinput::XI_DEVICE_POINTER_MOTION_HINT_CLASS);
+    state.clients.iter().any(|(_, c)| {
+        c.xi1_window_event_classes
+            .get(&window)
+            .is_some_and(|set| set.contains(&class))
+    })
+}
+
+fn xi1_motion_hint_window(state: &ServerState, deviceid: u16) -> Option<ResourceId> {
+    state
+        .xi1_frozen
+        .get(&deviceid)
+        .and_then(|freeze| freeze.motion_hint_window)
 }
 
 /// True when `grab_window` is `target` or one of its ancestors.
@@ -1448,6 +1620,7 @@ fn compute_xi1_targets_bounded(
     target: ResourceId,
     evcode: u8,
     deviceid: u16,
+    state_mask: u16,
     stop_at: Option<ResourceId>,
 ) -> Option<(Vec<ClientId>, ResourceId)> {
     let class = (u32::from(deviceid) << 8) | u32::from(evcode);
@@ -1457,9 +1630,75 @@ fn compute_xi1_targets_bounded(
             .clients
             .iter()
             .filter(|(_, c)| {
-                c.xi1_window_event_classes
-                    .get(&window)
-                    .is_some_and(|set| set.contains(&class))
+                c.xi1_window_event_classes.get(&window).is_some_and(|set| {
+                    if evcode
+                        == crate::server::XI_FIRST_EVENT
+                            + crate::xinput::XI_DEVICE_MOTION_NOTIFY_OFFSET
+                    {
+                        let held_buttons = ((state_mask >> 8) & 0x1f) as u8;
+                        if set.contains(&class) {
+                            return true;
+                        }
+                        if set.contains(
+                            &((u32::from(deviceid) << 8)
+                                | u32::from(crate::xinput::XI_DEVICE_POINTER_MOTION_HINT_CLASS)),
+                        ) {
+                            return true;
+                        }
+                        if held_buttons == 0 {
+                            return false;
+                        }
+                        if set.contains(
+                            &((u32::from(deviceid) << 8)
+                                | u32::from(crate::xinput::XI_DEVICE_BUTTON_MOTION_CLASS)),
+                        ) {
+                            return true;
+                        }
+                        if held_buttons & 0x01 != 0
+                            && set.contains(
+                                &((u32::from(deviceid) << 8)
+                                    | u32::from(crate::xinput::XI_DEVICE_BUTTON1_MOTION_CLASS)),
+                            )
+                        {
+                            return true;
+                        }
+                        if held_buttons & 0x02 != 0
+                            && set.contains(
+                                &((u32::from(deviceid) << 8)
+                                    | u32::from(crate::xinput::XI_DEVICE_BUTTON2_MOTION_CLASS)),
+                            )
+                        {
+                            return true;
+                        }
+                        if held_buttons & 0x04 != 0
+                            && set.contains(
+                                &((u32::from(deviceid) << 8)
+                                    | u32::from(crate::xinput::XI_DEVICE_BUTTON3_MOTION_CLASS)),
+                            )
+                        {
+                            return true;
+                        }
+                        if held_buttons & 0x08 != 0
+                            && set.contains(
+                                &((u32::from(deviceid) << 8)
+                                    | u32::from(crate::xinput::XI_DEVICE_BUTTON4_MOTION_CLASS)),
+                            )
+                        {
+                            return true;
+                        }
+                        if held_buttons & 0x10 != 0
+                            && set.contains(
+                                &((u32::from(deviceid) << 8)
+                                    | u32::from(crate::xinput::XI_DEVICE_BUTTON5_MOTION_CLASS)),
+                            )
+                        {
+                            return true;
+                        }
+                        false
+                    } else {
+                        set.contains(&class)
+                    }
+                })
             })
             .map(|(id, _)| ClientId(*id))
             .collect();
