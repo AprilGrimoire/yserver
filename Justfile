@@ -887,6 +887,13 @@ xts-yserver-hw scenario="Xproto" timeout="1200":
 xts-xephyr-trace scenario="XI" timeout="1200" screen="1600x900":
     tools/xts-xephyr-trace.sh {{scenario}} {{timeout}} {{screen}}
 
+# Run xts5 against Xorg inside vng through x11trace. This avoids host
+# X access control and gives a real Xorg reference for XI traces.
+xts-xorg-trace scenario="XI" timeout="1200" screen="1600x900":
+    vng -r {{KERNEL}} --disable-microvm --rw --user root \
+        --qemu-opts="-display egl-headless,gl=on -vga none -device virtio-vga-gl,hostmem=4G,blob=true,venus=true -device virtio-tablet-pci -device virtio-keyboard-pci" \
+        -- tools/xts-xorg-trace.sh {{scenario}} {{timeout}} {{screen}}
+
 # Run rendercheck against yserver (KMS) inside virtme-ng.
 rendercheck-yserver timeout="600" tests="fill,dcoords,scoords,mcoords,tscoords,tmcoords,blend,composite,cacomposite,gradients,repeat,triangles,bug7366":
     cargo build --release --bin yserver

@@ -195,6 +195,205 @@ pub(super) fn modifier_mapping_from_keymap(keymap: &Keymap) -> (u8, Vec<u8>) {
     (u8::try_from(kpm).unwrap_or(u8::MAX), data)
 }
 
+fn core_key_groups_for_key(keymap: &Keymap, kc: Keycode) -> Vec<Vec<u32>> {
+    let n_groups = usize::try_from(keymap.num_layouts_for_key(kc)).unwrap_or(0);
+    let mut groups = Vec::with_capacity(n_groups);
+    for group in 0..n_groups {
+        let group = u32::try_from(group).unwrap_or(u32::MAX);
+        let width = usize::try_from(keymap.num_levels_for_key(kc, group)).unwrap_or(0);
+        let mut syms = Vec::with_capacity(width);
+        for level in 0..u32::try_from(width).unwrap_or(0) {
+            let level_syms = keymap.key_get_syms_by_level(kc, group, level);
+            syms.push(level_syms.first().map_or(0, |s| s.raw()));
+        }
+        groups.push(syms);
+    }
+    groups
+}
+
+fn core_keyboard_map_width(keymap: &Keymap) -> u8 {
+    let raw_min = keymap.min_keycode().raw();
+    let raw_max = keymap.max_keycode().raw();
+    let min_kc: u8 = u8::try_from(raw_min).unwrap_or(8).max(8);
+    let max_kc: u8 = u8::try_from(raw_max.min(255)).unwrap_or(255).max(min_kc);
+
+    let mut max_syms_per_key: usize = 0;
+    let mut max_group1_width: usize = 0;
+    let mut max_number_of_groups: usize = 0;
+
+    for kc_raw in min_kc..=max_kc {
+        let kc = Keycode::new(u32::from(kc_raw));
+        if keymap.num_layouts_for_key(kc) == 0 {
+            continue;
+        }
+        let n_groups = usize::try_from(keymap.num_layouts_for_key(kc)).unwrap_or(0);
+        let mut tmp = 0usize;
+
+        if n_groups > 0 {
+            let w = usize::try_from(keymap.num_levels_for_key(kc, 0)).unwrap_or(0);
+            tmp += if w <= 2 { 2 } else { w + 2 };
+            max_group1_width = max_group1_width.max(w);
+        }
+        if n_groups > 1 {
+            let w = usize::try_from(keymap.num_levels_for_key(kc, 1)).unwrap_or(0);
+            if tmp <= 2 {
+                tmp += if w < 2 { 2 } else { w };
+            } else if w > 2 {
+                tmp += w - 2;
+            }
+        }
+        if n_groups > 2 {
+            tmp += usize::try_from(keymap.num_levels_for_key(kc, 2)).unwrap_or(0);
+        }
+        if n_groups > 3 {
+            tmp += usize::try_from(keymap.num_levels_for_key(kc, 3)).unwrap_or(0);
+        }
+
+        max_syms_per_key = max_syms_per_key.max(tmp);
+        max_number_of_groups = max_number_of_groups.max(n_groups);
+    }
+
+    if max_syms_per_key == 0 {
+        return 0;
+    }
+    let min_required = max_number_of_groups.saturating_mul(max_group1_width);
+    if max_syms_per_key < min_required {
+        max_syms_per_key = min_required;
+    }
+    u8::try_from(max_syms_per_key).unwrap_or(u8::MAX)
+}
+
+fn core_keyboard_mapping_row(
+    keymap: &Keymap,
+    kc: Keycode,
+    map_width: usize,
+    max_number_of_groups: usize,
+) -> Vec<u32> {
+    let groups = core_key_groups_for_key(keymap, kc);
+    let mut row = vec![0u32; map_width];
+    if groups.is_empty() {
+        return row;
+    }
+
+    let group1 = &groups[0];
+    let group1_width = group1.len();
+    if group1_width > 0 {
+        row[0] = group1[0];
+    }
+    if group1_width > 1 {
+        row[1] = group1[1];
+    }
+    for n in 2..group1_width {
+        let dst = 2 + n;
+        if dst < map_width {
+            row[dst] = group1[n];
+        }
+    }
+
+    let mut nout = 2usize;
+    if groups.len() == 1 {
+        if group1_width > 0 && map_width >= 3 {
+            row[2] = row[0];
+        }
+        if group1_width > 1 && map_width >= 4 {
+            row[3] = row[1];
+        }
+
+        let mut idx = 2 + group1_width;
+        while group1_width > 2 && idx < map_width && idx < group1_width * 2 {
+            row[idx] = row[idx - group1_width + 2];
+            idx += 1;
+        }
+
+        idx = 2 * group1_width;
+        if idx < 4 {
+            idx = 4;
+        }
+        for _ in 3..=max_number_of_groups {
+            for &sym in group1 {
+                if idx >= map_width {
+                    break;
+                }
+                row[idx] = sym;
+                idx += 1;
+            }
+        }
+        return row;
+    }
+
+    if let Some(group2) = groups.get(1) {
+        if !group2.is_empty() {
+            row[2] = group2[0];
+        }
+        if group2.len() > 1 {
+            row[3] = group2[1];
+        }
+        for n in 2..group2.len() {
+            let dst = nout + (n - 2);
+            if dst < map_width {
+                row[dst] = group2[n];
+            }
+        }
+        if group2.len() > 2 {
+            nout += group2.len() - 2;
+        }
+    }
+
+    for group in groups.iter().skip(2) {
+        for &sym in group {
+            if nout >= map_width {
+                return row;
+            }
+            row[nout] = sym;
+            nout += 1;
+        }
+    }
+
+    row
+}
+
+/// Build the core keyboard mapping used by `GetKeyboardMapping` and
+/// XI 1.x `GetDeviceKeyMapping`.
+pub(super) fn core_keyboard_mapping_from_keymap(
+    keymap: &Keymap,
+    first_keycode: u8,
+    count: u8,
+) -> (u8, Vec<u32>) {
+    let raw_min = keymap.min_keycode().raw();
+    let raw_max = keymap.max_keycode().raw();
+    let min_kc: u8 = u8::try_from(raw_min).unwrap_or(8).max(8);
+    let max_kc: u8 = u8::try_from(raw_max.min(255)).unwrap_or(255).max(min_kc);
+    let map_width = core_keyboard_map_width(keymap);
+    if map_width == 0 {
+        return (0, Vec::new());
+    }
+
+    let mut max_number_of_groups: usize = 0;
+    for kc_raw in min_kc..=max_kc {
+        let kc = Keycode::new(u32::from(kc_raw));
+        max_number_of_groups = max_number_of_groups
+            .max(usize::try_from(keymap.num_layouts_for_key(kc)).unwrap_or(0));
+    }
+
+    let mut flat = Vec::with_capacity(usize::from(count) * usize::from(map_width));
+    for i in 0..count {
+        let kc_raw = first_keycode.wrapping_add(i);
+        let kc = Keycode::new(u32::from(kc_raw));
+        if kc_raw < min_kc || kc_raw > max_kc || keymap.num_layouts_for_key(kc) == 0 {
+            flat.extend(std::iter::repeat_n(0u32, usize::from(map_width)));
+            continue;
+        }
+        flat.extend(core_keyboard_mapping_row(
+            keymap,
+            kc,
+            usize::from(map_width),
+            max_number_of_groups,
+        ));
+    }
+
+    (map_width, flat)
+}
+
 /// X11 modifier-map bitmask that picks `Shift` — used by the
 /// `TWO_LEVEL` `KeyType`'s map entry to say "Shift selects level 1".
 const SHIFT_MASK: u8 = 0x01;
@@ -1011,6 +1210,18 @@ mod tests {
         assert!(
             found_shift,
             "expected at least one Shift modifier-map entry"
+        );
+    }
+
+    #[test]
+    fn core_keyboard_mapping_uses_real_width() {
+        let km = test_keymap();
+        let (kpc, rows) = core_keyboard_mapping_from_keymap(&km, 8, 4);
+        assert!(kpc > 0, "core map width must not be zero");
+        assert_eq!(rows.len(), 4 * usize::from(kpc));
+        assert!(
+            rows.iter().any(|&sym| sym != 0),
+            "core keymap should contain real keysyms"
         );
     }
 
