@@ -4999,14 +4999,13 @@ impl KmsBackendV2 {
     /// single window. `local_x`/`local_y` are the pointer position
     /// in the window's own coordinate space (origin = window's top-
     /// left). Returns `true` when no SHAPE is set or the cursor lies
-    /// inside at least one rectangle; an empty rect list means the
-    /// window is unhittable.
+    /// inside at least one rectangle. An explicit empty input region
+    /// is empty and must not fall back to the bounding box.
     fn cursor_inside_shape(&self, window_id: u32, local_x: f64, local_y: f64) -> bool {
-        let shape = self
-            .core
-            .shape_input
-            .get(&window_id)
-            .or_else(|| self.core.shape_bounding.get(&window_id));
+        let shape = match self.core.shape_input.get(&window_id) {
+            Some(rects) => Some(rects.as_slice()),
+            None => self.core.shape_bounding.get(&window_id).map(Vec::as_slice),
+        };
         let Some(rects) = shape else {
             return true;
         };
@@ -5089,7 +5088,7 @@ impl KmsBackendV2 {
     /// Spec-correct Normal-mode crossing chain for a top-level
     /// transition. Direct v1 port (kms/backend.rs:6630-6695) —
     /// the body only touches KmsCore + nested-resource look-ups.
-    fn update_pointer_window(&mut self, server_state: &ServerState, new_xid: u32, mask: u16) {
+    fn update_pointer_window(&mut self, server_state: &mut ServerState, new_xid: u32, mask: u16) {
         if self.core.prev_pointer_window == Some(new_xid) {
             log::trace!(
                 target: "yserver::kms::v2::pointer",
@@ -5159,12 +5158,13 @@ impl KmsBackendV2 {
             self.emit_crossing(new_xid, PointerEventKind::EnterNotify, 0, 0, 0, mask);
         }
         self.core.prev_pointer_window = Some(new_xid);
+        server_state.pointer_window = new_id;
         // Stage 5 Phase A: cross-in may change the effective cursor
         // (per-window DefineCursor walks up the parent chain).
         self.refresh_effective_cursor();
     }
 
-    fn dispatch_motion_event(&mut self, server_state: &ServerState) {
+    fn dispatch_motion_event(&mut self, server_state: &mut ServerState) {
         // Fall back to the root container so root-window subscribers
         // (e16's right-click-desktop menu, fvwm3's root bindings) can
         // see motion when the cursor is over the wallpaper.
@@ -5179,7 +5179,7 @@ impl KmsBackendV2 {
         self.emit_motion_only(host_xid, mask);
     }
 
-    fn process_pointer_absolute(&mut self, server_state: &ServerState, x: f32, y: f32) {
+    fn process_pointer_absolute(&mut self, server_state: &mut ServerState, x: f32, y: f32) {
         // Clamp to the UNION framebuffer extent (`fb_w`/`fb_h`),
         // not the first output's box. `core_platform_init`
         // (`kms/backend.rs:1063-1072`) computes this as
@@ -15094,6 +15094,7 @@ impl Backend for KmsBackendV2 {
             #[allow(clippy::cast_possible_truncation)]
             win_y: self.core.cursor_y as i16,
             mask: self.core.button_mask | self.serialize_modifiers(),
+            host_xid: self.window_under_cursor(),
         })
     }
 
@@ -18648,13 +18649,13 @@ mod tests {
     fn process_pointer_absolute_clamps_to_output() {
         use yserver_core::server::ServerState;
         let mut b = KmsBackendV2::for_tests();
-        let state = ServerState::new();
+        let mut state = ServerState::new();
         // Inside extent.
-        b.process_pointer_absolute(&state, 100.0, 200.0);
+        b.process_pointer_absolute(&mut state, 100.0, 200.0);
         assert_eq!(b.core.cursor_x, 100.0);
         assert_eq!(b.core.cursor_y, 200.0);
         // Past extent → clamped to (extent - 1).
-        b.process_pointer_absolute(&state, 5000.0, 5000.0);
+        b.process_pointer_absolute(&mut state, 5000.0, 5000.0);
         assert_eq!(b.core.cursor_x, 799.0);
         assert_eq!(b.core.cursor_y, 599.0);
     }
@@ -18681,10 +18682,10 @@ mod tests {
         let mut b = KmsBackendV2::for_tests();
         b.platform.fb_w = 5120;
         b.platform.fb_h = 1440;
-        let state = ServerState::new();
+        let mut state = ServerState::new();
         // Point on monitor 1 (x=4000 is past output[0]'s 800-wide
         // fixture extent but well within the 5120 union extent).
-        b.process_pointer_absolute(&state, 4000.0, 1000.0);
+        b.process_pointer_absolute(&mut state, 4000.0, 1000.0);
         assert_eq!(
             b.core.cursor_x, 4000.0,
             "pointer must be able to cross past the first output's \
@@ -18693,7 +18694,7 @@ mod tests {
         );
         assert_eq!(b.core.cursor_y, 1000.0);
         // Past the union extent → clamped to (union - 1).
-        b.process_pointer_absolute(&state, 9999.0, 9999.0);
+        b.process_pointer_absolute(&mut state, 9999.0, 9999.0);
         assert_eq!(b.core.cursor_x, 5119.0);
         assert_eq!(b.core.cursor_y, 1439.0);
     }
@@ -18869,6 +18870,72 @@ mod tests {
         // Unmap the topmost overlap entry — sibling beneath wins.
         b.windows_v2.get_mut(&0x1003).unwrap().mapped = false;
         assert_eq!(b.window_under_cursor(), Some(0x1001));
+    }
+
+    /// An explicit empty input region must exclude the window from
+    /// backend hover tracking so the sibling below can win.
+    #[test]
+    fn window_under_cursor_empty_input_region_excludes_window() {
+        let mut b = KmsBackendV2::for_tests();
+        b.windows_v2.insert(
+            0x1000,
+            super::WindowGeometryV2 {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                depth: 24,
+                mapped: true,
+                parent: None,
+                stack_rank: 0,
+                bg_pixel: None,
+                bg_pixmap: None,
+                cursor: None,
+            },
+        );
+        b.windows_v2.insert(
+            0x2000,
+            super::WindowGeometryV2 {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                depth: 24,
+                mapped: true,
+                parent: None,
+                stack_rank: 1,
+                bg_pixel: None,
+                bg_pixmap: None,
+                cursor: None,
+            },
+        );
+        b.core.top_level_order.push(0x1000);
+        b.core.top_level_order.push(0x2000);
+
+        // Topmost window has an explicit empty input region, but its
+        // bounding box still covers the pointer. We should keep it as
+        // the backend hit instead of dropping to 0x1000.
+        b.core.shape_input.insert(
+            0x2000,
+            Vec::<yserver_protocol::x11::xfixes::RegionRect>::new(),
+        );
+        b.core.shape_bounding.insert(
+            0x2000,
+            vec![yserver_protocol::x11::xfixes::RegionRect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            }],
+        );
+
+        b.core.cursor_x = 50.0;
+        b.core.cursor_y = 50.0;
+        assert_eq!(
+            b.window_under_cursor(),
+            Some(0x1000),
+            "empty input region must not keep the topmost window"
+        );
     }
 
     /// `on_host_input` no longer logs the `v2: on_host_input not

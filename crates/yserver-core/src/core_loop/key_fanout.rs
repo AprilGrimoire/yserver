@@ -688,6 +688,12 @@ fn key_grabbed_natural_target(
 /// the PointerRoot key-delivery target. Descends `direct_child_at`
 /// from the root using `state.pointer_root`.
 pub(crate) fn deepest_window_at_pointer(state: &ServerState) -> ResourceId {
+    match state.pointer_window {
+        Some(window) if window == ROOT_WINDOW || state.resources.window(window).is_some() => {
+            return window;
+        }
+        _ => {}
+    }
     let (root_x, root_y) = state.pointer_root;
     let mut window = ROOT_WINDOW;
     loop {
@@ -698,6 +704,72 @@ pub(crate) fn deepest_window_at_pointer(state: &ServerState) -> ResourceId {
             Some(child) if child != window => window = child,
             _ => return window,
         }
+    }
+}
+
+#[cfg(test)]
+mod pointer_window_tests {
+    use super::deepest_window_at_pointer;
+    use crate::{
+        resources::ROOT_WINDOW,
+        server::{ClientState, ServerState},
+    };
+    use std::{
+        collections::{HashMap, HashSet, VecDeque},
+        os::unix::net::UnixStream,
+        sync::{Arc, Mutex, atomic::AtomicU16},
+    };
+    use yserver_protocol::x11::{ClientByteOrder, ClientId, CreateWindowRequest, ResourceId};
+
+    fn install_client(state: &mut ServerState, id: u32) {
+        let (server_side, _peer) = UnixStream::pair().unwrap();
+        state.clients.insert(
+            id,
+            ClientState {
+                writer: Arc::new(Mutex::new(server_side)),
+                byte_order: ClientByteOrder::LittleEndian,
+                last_sequence: Arc::new(AtomicU16::new(0)),
+                resource_id_base: 0,
+                resource_id_mask: u32::MAX,
+                event_masks: HashMap::new(),
+                save_set: HashSet::new(),
+                big_requests_enabled: false,
+                xi2_masks: HashMap::new(),
+                xi1_event_classes: HashSet::new(),
+                xi1_window_event_classes: HashMap::new(),
+                outbound: VecDeque::new(),
+                watching_writable: false,
+                focused_window: ROOT_WINDOW,
+                reader_control: None,
+            },
+        );
+    }
+
+    #[test]
+    fn pointer_window_cache_overrides_pointer_root_walk() {
+        let mut state = ServerState::new();
+        install_client(&mut state, 7);
+        let child = ResourceId(0x0020_0001);
+        state.resources.create_window(
+            ClientId(7),
+            CreateWindowRequest {
+                depth: 24,
+                window: child,
+                parent: ROOT_WINDOW,
+                x: 100,
+                y: 100,
+                width: 50,
+                height: 50,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        state.pointer_root = (10, 10);
+        state.pointer_window = Some(child);
+
+        assert_eq!(deepest_window_at_pointer(&state), child);
     }
 }
 

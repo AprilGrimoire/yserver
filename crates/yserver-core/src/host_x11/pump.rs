@@ -293,6 +293,10 @@ pub struct PointerPosition {
     pub win_x: i16,
     pub win_y: i16,
     pub mask: u16,
+    /// Optional host-side window under the pointer. Backends that can
+    /// identify the host target should fill this so QueryPointer and
+    /// XIQueryPointer can preserve the host hit-test split.
+    pub host_xid: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

@@ -4584,7 +4584,6 @@ fn handle_composite_request(
                 state.resources.materialize_cow_resource(
                     crate::backend::WindowHandle::from_raw_panicking(cow_host_xid),
                 );
-                state.materialize_cow_input_shape();
             }
             debug!(
                 "client {} #{} COMPOSITE::GetOverlayWindow -> 0x{:x}",
@@ -4631,7 +4630,6 @@ fn handle_composite_request(
             };
             if was_one_to_zero {
                 state.resources.destroy_cow_resource();
-                state.destroy_cow_input_shape();
             }
         }
         other => {
@@ -10270,6 +10268,11 @@ fn handle_xi2_request(
                 ROOT_WINDOW
             };
             let pointer = backend.query_pointer(origin).ok();
+            if let Some(pointer) = pointer.filter(|p| p.same_screen) {
+                cache_pointer_window(state, backend, pointer.host_xid);
+            } else {
+                state.pointer_window = None;
+            }
             let (root_x_int, root_y_int, mask, same_screen) =
                 if let Some(p) = pointer.filter(|p| p.same_screen) {
                     (p.win_x, p.win_y, p.mask, 1u8)
@@ -10281,8 +10284,18 @@ fn handle_xi2_request(
                 i16::try_from(i32::from(root_x_int).saturating_sub(origin_x)).unwrap_or(i16::MAX);
             let win_y_int =
                 i16::try_from(i32::from(root_y_int).saturating_sub(origin_y)).unwrap_or(i16::MAX);
-            let child = state
-                .direct_child_at(queried_window, win_x_int, win_y_int)
+            let child = pointer
+                .filter(|p| p.same_screen)
+                .map(|p| {
+                    query_pointer_child(
+                        state,
+                        backend.xid_map(),
+                        queried_window,
+                        win_x_int,
+                        win_y_int,
+                        p.host_xid,
+                    )
+                })
                 .unwrap_or(ResourceId(0));
             debug!(
                 "client {} #{} XIQueryPointer window=0x{:x} -> root=({},{}) win=({},{}) child=0x{:x} mask=0x{:x}",
@@ -21419,6 +21432,53 @@ fn handle_get_atom_name(
     }
 }
 
+fn query_pointer_child_from_target(
+    state: &ServerState,
+    queried_window: ResourceId,
+    target: ResourceId,
+) -> Option<ResourceId> {
+    if target == queried_window {
+        return Some(ResourceId(0));
+    }
+    let mut current = target;
+    for _ in 0..256 {
+        let window = state.resources.window(current)?;
+        if window.parent == queried_window {
+            return Some(current);
+        }
+        if window.parent == current {
+            return None;
+        }
+        current = window.parent;
+    }
+    None
+}
+
+fn query_pointer_child(
+    state: &ServerState,
+    xid_map: &crate::host_x11::HostXidMap,
+    queried_window: ResourceId,
+    win_x: i16,
+    win_y: i16,
+    host_xid: Option<u32>,
+) -> ResourceId {
+    host_xid
+        .and_then(|xid| xid_map.get(&xid).copied())
+        .and_then(|target| query_pointer_child_from_target(state, queried_window, target))
+        .or_else(|| state.direct_child_at(queried_window, win_x, win_y))
+        .unwrap_or(ResourceId(0))
+}
+
+fn cache_pointer_window(state: &mut ServerState, backend: &dyn Backend, host_xid: Option<u32>) {
+    state.pointer_window = host_xid.and_then(|xid| {
+        if xid == backend.window_id() {
+            Some(ROOT_WINDOW)
+        } else {
+            backend.xid_map().get(&xid).copied()
+        }
+    });
+}
+
 fn handle_query_pointer(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -21433,6 +21493,7 @@ fn handle_query_pointer(
         ROOT_WINDOW
     };
     let pointer = backend.query_pointer(origin).ok().filter(|p| p.same_screen);
+    cache_pointer_window(state, backend, pointer.and_then(|p| p.host_xid));
     let reply_data = if let Some(pointer) = pointer {
         // The KMS backend's PointerPosition carries cursor coordinates
         // in root-absolute screen space (win_x/win_y are misnamed
@@ -21448,15 +21509,18 @@ fn handle_query_pointer(
         let win_y = i16::try_from(i32::from(root_y).saturating_sub(origin_y)).unwrap_or(i16::MAX);
         // Per X11 spec, `child` is the direct child of `queried_window`
         // that contains the pointer, or None (0) if the pointer is on
-        // the queried window itself or on no descendant. Previously
-        // this was hardcoded to ROOT_WINDOW, which made GTK's
-        // QueryPointer-based hover/tooltip polling never see a
-        // transition between children — xfce4-panel spun 3500 times
-        // per second on QueryPointer, starving its event loop and
-        // dropping clicks on every panel applet.
-        let child = state
-            .direct_child_at(queried_window, win_x, win_y)
-            .unwrap_or(ResourceId(0));
+        // the queried window itself or on no descendant. Prefer the
+        // backend host target when available so a shape-aware backend
+        // hit can still resolve to the right protocol child even if
+        // the protocol tree would otherwise fall through to a sibling.
+        let child = query_pointer_child(
+            state,
+            backend.xid_map(),
+            queried_window,
+            win_x,
+            win_y,
+            pointer.host_xid,
+        );
         x11::QueryPointerReply {
             root: ROOT_WINDOW,
             child,
@@ -32268,6 +32332,147 @@ mod tests {
                  _NET_WM_MOVERESIZE move aborts on an empty mask",
             );
         }
+    }
+
+    /// `XIQueryPointer` must prefer the backend host target when a
+    /// host-backed COW is involved. The protocol root still sees the
+    /// guard window below the empty-input COW, but the query reply for
+    /// root and for the COW itself must follow the host-backed stage
+    /// path instead of the guard.
+    #[test]
+    fn xi_query_pointer_prefers_backend_host_target_over_guard_window_protocol_hit() {
+        use crate::{
+            backend::Backend,
+            resources::{COMPOSITE_OVERLAY_WINDOW, ROOT_VISUAL, ROOT_WINDOW},
+        };
+        use yserver_protocol::x11::{CreateWindowRequest, ResourceId, xfixes};
+
+        const CLIENT_ID: u32 = 1;
+        const STAGE_XID: u32 = 0x0020_0050;
+        const STAGE_HOST_XID: u32 = 0xCAFE_0009;
+        const COW_HOST_XID: u32 = 0xCAFE_0103;
+        const GUARD_XID: u32 = 0x0020_0060;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, CLIENT_ID);
+        peer.set_nonblocking(true).unwrap();
+        let mut backend = RecordingBackend::new();
+
+        state
+            .resources
+            .materialize_cow_resource(crate::backend::WindowHandle::from_raw_panicking(
+                COW_HOST_XID,
+            ));
+        state.resources.create_window(
+            ClientId(CLIENT_ID),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(STAGE_XID),
+                parent: COMPOSITE_OVERLAY_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(ResourceId(STAGE_XID));
+        Backend::register_subwindow(&mut backend, None, ResourceId(STAGE_XID), STAGE_HOST_XID)
+            .expect("register stage host xid");
+
+        state.resources.create_window(
+            ClientId(CLIENT_ID),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(GUARD_XID),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 2,
+                visual: ROOT_VISUAL,
+                override_redirect: Some(true),
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(ResourceId(GUARD_XID));
+
+        state
+            .shape_windows
+            .entry(COMPOSITE_OVERLAY_WINDOW)
+            .or_default()
+            .input = Some(Vec::<xfixes::RegionRect>::new());
+        state
+            .shape_windows
+            .entry(ResourceId(STAGE_XID))
+            .or_default()
+            .input = Some(Vec::<xfixes::RegionRect>::new());
+
+        assert_eq!(
+            state.direct_child_at(ROOT_WINDOW, 50, 50),
+            Some(ResourceId(GUARD_XID)),
+            "protocol root hit-test should still fall through to the guard in this repro",
+        );
+
+        backend.query_pointer_host_xid = Some(STAGE_HOST_XID);
+
+        let header = yserver_protocol::x11::RequestHeader {
+            opcode: 131,
+            data: 40,
+            length_units: 3,
+        };
+
+        let mut body = Vec::with_capacity(8);
+        body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+        body.extend_from_slice(&2u16.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(CLIENT_ID),
+            SequenceNumber(1),
+            header,
+            &body,
+        )
+        .expect("root xi query pointer");
+
+        let mut buf = [0u8; 128];
+        let n = peer.read(&mut buf).expect("root reply");
+        assert!(n >= 16, "short XIQueryPointer root reply ({n})");
+        assert_eq!(
+            u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]),
+            COMPOSITE_OVERLAY_WINDOW.0,
+            "root XIQueryPointer must report the COW path implied by the backend host target, not the guard window",
+        );
+
+        body.clear();
+        body.extend_from_slice(&COMPOSITE_OVERLAY_WINDOW.0.to_le_bytes());
+        body.extend_from_slice(&2u16.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(CLIENT_ID),
+            SequenceNumber(2),
+            header,
+            &body,
+        )
+        .expect("cow xi query pointer");
+
+        let n = peer.read(&mut buf).expect("cow reply");
+        assert!(n >= 16, "short XIQueryPointer COW reply ({n})");
+        assert_eq!(
+            u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]),
+            STAGE_XID,
+            "XIQueryPointer on the COW must report the stage child from the backend host target",
+        );
     }
 
     /// Cinnamon alt-tab regression #2 (2026-06-10): `XIQueryPointer`
