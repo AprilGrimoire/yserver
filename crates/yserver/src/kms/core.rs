@@ -1535,7 +1535,12 @@ pub(crate) struct KmsCore {
     pub(crate) cursor_y: f32,
     pub(crate) active_cursor: Option<u32>,
     pub(crate) button_mask: u16,
-    pub(crate) prev_pointer_window: Option<u32>,
+    /// The window currently under the pointer, in **`ResourceId`
+    /// (core-resource) space** — the single pointer authority. Derived
+    /// once per motion via `ServerState::root_pointer_target_at` and
+    /// threaded through the crossing/cursor path; `host_xid` is derived
+    /// only at wire emit. `None` before the first motion.
+    pub(crate) prev_pointer_window: Option<ResourceId>,
     pub(crate) pending_pointer_events: Vec<HostPointerEvent>,
 
     // Default GC state (the in-progress GC values feeding paint paths)
@@ -1571,7 +1576,8 @@ pub(crate) struct KmsCore {
     // None entry = no shape (full rectangle). Some(vec![]) = empty region.
     pub(crate) shape_bounding: HashMap<u32, Vec<xfixes::RegionRect>>, // kind=0
     pub(crate) shape_clip: HashMap<u32, Vec<xfixes::RegionRect>>,     // kind=1
-    pub(crate) shape_input: HashMap<u32, Vec<xfixes::RegionRect>>,    // kind=2
+    // kind=2 (Input) is NOT stored here: pointer hit-testing resolves
+    // through the single core authority (ServerState.shape_windows).
 
     // COMPOSITE redirect records
     pub(crate) alias_registry: AliasRegistry,
@@ -1688,7 +1694,6 @@ impl KmsCore {
             current_arc_mode: ArcMode::PieSlice,
             shape_bounding: HashMap::new(),
             shape_clip: HashMap::new(),
-            shape_input: HashMap::new(),
             alias_registry: AliasRegistry::default(),
             host_window_to_backing: HashMap::new(),
             cow_refcount: 0,
@@ -1768,7 +1773,6 @@ impl KmsCore {
             current_arc_mode: ArcMode::PieSlice,
             shape_bounding: HashMap::new(),
             shape_clip: HashMap::new(),
-            shape_input: HashMap::new(),
             alias_registry: AliasRegistry::default(),
             host_window_to_backing: HashMap::new(),
             cow_refcount: 0,

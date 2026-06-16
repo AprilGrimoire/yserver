@@ -427,25 +427,16 @@ fn mirror_shape_to_host_state(
     kind: u8,
 ) {
     use yserver_protocol::x11::shape as x11shape;
-    // Mirror Bounding, Clip, AND Input shapes to the backend. Pre-fix
-    // (2026-05-26 adapta-nokto investigation): only Bounding/Clip were
-    // mirrored, so the backend's `core.shape_input` never reflected a
-    // window's SHAPE Input region. That broke v2's `cursor_inside_shape`
-    // hit-test for windows with non-default Input shapes — notably
-    // adapta-nokto's MATE panel menu, which sets a shrunken Input shape
-    // (`{x=16, y=12, w=188, h=227}` inside a 220x260 window) to make
-    // the CSS box-shadow margin click-through. Without the Input shape
-    // in the backend, `window_under_cursor` HIT the menu in its shadow
-    // zone (window-local Y < 12), the protocol-layer fanout's hit-test
-    // disagreed (it correctly excluded the shadow), and the Enter
-    // event yserver emitted on the menu's host xid got re-routed by
-    // the fanout to whatever's structurally under the cursor (the
-    // panel) — never reaching the menu's client. GTK menu hover
-    // state machine never engaged → no highlight, no click.
-    if kind != x11shape::KIND_BOUNDING
-        && kind != x11shape::KIND_CLIP
-        && kind != x11shape::KIND_INPUT
-    {
+    // Mirror only Bounding and Clip to the backend — those feed the
+    // renderer (scene clip / damage). The Input shape is NOT mirrored:
+    // pointer hit-testing now resolves through the single core authority
+    // (`ServerState::window_input_contains` over `shape_windows`), so the
+    // backend keeps no parallel input-shape store. The pre-fix mirror of
+    // Input existed only to feed the deleted backend `cursor_inside_shape`
+    // hit-test, whose divergence from the core walk was the dual-authority
+    // bug this change removes (empty Input region read as opaque in the
+    // backend store but click-through in core → sloppy focus failed).
+    if kind != x11shape::KIND_BOUNDING && kind != x11shape::KIND_CLIP {
         return;
     }
     let Some(w) = state.resources.window(window) else {
@@ -4082,6 +4073,32 @@ fn handle_xfixes_request(
                         .unwrap_or_default();
                     let source = crate::nested::offset_rects(rects, req.x_offset, req.y_offset);
                     crate::nested::set_shape_rects(state, window, req.dest_kind, source);
+                }
+                // TEMP COWDIAG (2026-06-16): log every COW input-shape
+                // transition with timestamp so we can see why/when the
+                // overlay sits opaque. Remove once COW input semantics fixed.
+                if window == crate::resources::COMPOSITE_OVERLAY_WINDOW
+                    && req.dest_kind == yserver_protocol::x11::shape::KIND_INPUT
+                {
+                    let st = state
+                        .shape_windows
+                        .get(&window)
+                        .and_then(|s| s.input.as_ref())
+                        .map(std::vec::Vec::len);
+                    let region_rects = if req.region == 0 {
+                        None
+                    } else {
+                        state.xfixes_regions.get(&req.region).map(|r| r.rects.len())
+                    };
+                    log::warn!(
+                        "COWDIAG SetWindowShapeRegion COW input region=0x{:x} (region_rects={region_rects:?}) -> input_slot_rects={st:?} ({})",
+                        req.region,
+                        match st {
+                            None => "OPAQUE (no input shape)",
+                            Some(0) => "click-through (empty)",
+                            Some(_) => "partial (has rects)",
+                        }
+                    );
                 }
                 mirror_shape_to_host_state(state, backend, origin, window, req.dest_kind);
             }
@@ -9512,7 +9529,7 @@ fn handle_xi2_request(
                 client_id.0, sequence.0, window.0, cursor.0
             );
             if let (Some(hw), Some(ch)) = (host_window_raw, cursor_host_xid) {
-                let _ = backend.define_cursor(origin, hw, ch);
+                let _ = backend.define_cursor(origin, state, hw, ch);
             }
             return Ok(RequestOutcome::Handled);
         }
@@ -14499,7 +14516,7 @@ fn handle_change_window_attributes(
             state.resources.cursor_host_xid(cid)
         };
         if let (Some(hw), Some(ch)) = (host_window_raw, cursor_host_xid) {
-            let _ = backend.define_cursor(origin, hw, ch);
+            let _ = backend.define_cursor(origin, state, hw, ch);
         }
     }
     debug!(

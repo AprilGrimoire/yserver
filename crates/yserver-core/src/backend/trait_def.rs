@@ -557,8 +557,8 @@ pub trait Backend: Send {
 
     /// Phase 6.3 Step 4: register a freshly-created host top-level so
     /// pointer / expose events on it route to `nested_id` through
-    /// `pointer_event_fanout` / `expose_event_fanout`. Replaces the
-    /// pre-Step-4 pump-handle `register_top_level`.
+    /// `pointer_event_fanout_to_state` / `expose_event_fanout`. Replaces
+    /// the pre-Step-4 pump-handle `register_top_level`.
     fn register_top_level(
         &mut self,
         origin: Option<OriginContext>,
@@ -1008,6 +1008,7 @@ pub trait Backend: Send {
     fn define_cursor(
         &mut self,
         origin: Option<OriginContext>,
+        server_state: &crate::server::ServerState,
         host_window_xid: u32,
         cursor_host_xid: u32,
     ) -> io::Result<()>;

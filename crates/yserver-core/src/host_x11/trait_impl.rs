@@ -405,6 +405,7 @@ impl Backend for HostX11Backend {
     fn define_cursor(
         &mut self,
         origin: Option<OriginContext>,
+        _server_state: &crate::server::ServerState,
         host_window_xid: u32,
         cursor_host_xid: u32,
     ) -> io::Result<()> {

@@ -86,11 +86,6 @@ pub(crate) struct WindowGeometryV2 {
     pub(crate) stack_rank: u64,
     pub(crate) bg_pixel: Option<u32>,
     pub(crate) bg_pixmap: Option<u32>,
-    /// Stage 5 Phase A — per-window X11 cursor attribute. `None`
-    /// means inherit from the parent chain; `Some(xid)` pins a
-    /// specific cursor on hover-in. Mutated by `define_cursor` /
-    /// `change_subwindow_attributes` (CWCursor mask bit).
-    pub(crate) cursor: Option<u32>,
 }
 
 pub(crate) type WindowsV2Map = HashMap<u32, WindowGeometryV2>;
@@ -974,7 +969,7 @@ impl KmsBackendV2 {
         // refresh_effective_cursor short-circuits on
         // pre-default `effective_cursor_xid == None == new_xid`).
         self.effective_cursor_xid = None;
-        self.refresh_effective_cursor();
+        self.apply_default_effective_cursor();
         log::info!("v2: default cursor sprite registered (xid 0x{xid:x})");
         Ok(())
     }
@@ -1035,7 +1030,12 @@ impl KmsBackendV2 {
             self.cursor_pixmaps.insert(xid, pixmap_id);
         }
         self.cursor_records.insert(xid, record);
-        self.refresh_effective_cursor();
+        // If this xid is already the effective cursor, its sprite bytes
+        // may have changed — re-display. No chain re-evaluation needed
+        // (the attribute->window mapping is unchanged), so no ServerState.
+        if Some(xid) == self.effective_cursor_xid {
+            self.display_cursor_by_handle(xid);
+        }
     }
 
     /// Allocate a v2 store Pixmap matching `record`'s dims, depth-32,
@@ -1216,35 +1216,66 @@ impl KmsBackendV2 {
     /// `core.active_cursor` (the sticky DefineCursor-on-root) if
     /// the chain runs out — that is, no window on the chain bound a
     /// cursor.
-    fn effective_cursor_walking_chain(&self, host_xid: u32) -> Option<u32> {
-        let mut cur = host_xid;
+    /// Walk the **core resource** parent chain from `start`
+    /// (`ResourceId`), returning the host xid of the first window with a
+    /// non-None cursor attribute (mapped through
+    /// `Resources::cursor_host_xid`). Falls back to `core.active_cursor`
+    /// (the sticky DefineCursor-on-root) / `default_cursor_xid` when the
+    /// chain runs out. Walks the single core authority — not the
+    /// host-space `windows_v2` ancestry, which can lag the resource tree.
+    fn effective_cursor_walking_chain(
+        &self,
+        server_state: &ServerState,
+        start: ResourceId,
+    ) -> Option<u32> {
+        let mut cur = start;
         // Bound the walk so a corrupted parent loop can't burn the
-        // event loop. windows_v2 fits in u32 xids; 64 is generous.
+        // event loop. 64 is generous for any real window depth.
         for _ in 0..64 {
-            if let Some(geom) = self.windows_v2.get(&cur) {
-                if let Some(c) = geom.cursor {
-                    return Some(c);
-                }
-                if let Some(p) = geom.parent {
-                    cur = p;
-                    continue;
-                }
+            let Some(w) = server_state.resources.window(cur) else {
+                break;
+            };
+            if let Some(cursor_id) = w.cursor
+                && let Some(host) = server_state.resources.cursor_host_xid(cursor_id)
+            {
+                return Some(host);
             }
-            break;
+            if w.parent == cur {
+                break; // root self-parent — chain exhausted
+            }
+            cur = w.parent;
         }
         self.core.active_cursor.or(self.default_cursor_xid)
     }
 
     /// Recompute the effective cursor for the window currently under
-    /// the pointer and swap the scene `CursorEntry` if it changed.
-    /// Cheap when the choice is stable (HashMap lookup + Option
-    /// compare).
-    fn refresh_effective_cursor(&mut self) {
-        let pointer_window = self.core.prev_pointer_window.unwrap_or(self.core.window_id);
-        let new_xid = self.effective_cursor_walking_chain(pointer_window);
+    /// the pointer (the `ResourceId` `prev_pointer_window`) and swap the
+    /// scene `CursorEntry` if it changed. Cheap when the choice is
+    /// stable. Requires `ServerState` to walk the core cursor chain;
+    /// state-free callers (init) use `apply_default_effective_cursor`,
+    /// and `define_cursor` passes its own `ServerState`.
+    fn refresh_effective_cursor(&mut self, server_state: &ServerState) {
+        let start = self
+            .core
+            .prev_pointer_window
+            .unwrap_or(yserver_core::resources::ROOT_WINDOW);
+        let new_xid = self.effective_cursor_walking_chain(server_state, start);
+        self.set_effective_cursor(new_xid);
+    }
+
+    /// Apply the fallback effective cursor (`active_cursor` /
+    /// `default_cursor_xid`) without a chain walk. For init-time callers
+    /// that run before any pointer window or `ServerState` exists.
+    fn apply_default_effective_cursor(&mut self) {
+        let new_xid = self.core.active_cursor.or(self.default_cursor_xid);
+        self.set_effective_cursor(new_xid);
+    }
+
+    /// Shared tail: swap the effective cursor + scene `CursorEntry` if it
+    /// changed. A running animation keeps its frame index when the
+    /// choice is stable (Xorg: "already current → do nothing").
+    fn set_effective_cursor(&mut self, new_xid: Option<u32>) {
         if new_xid == self.effective_cursor_xid {
-            // Same effective cursor — a running animation keeps its
-            // frame index (Xorg: "already current → do nothing").
             return;
         }
         self.effective_cursor_xid = new_xid;
@@ -4890,152 +4921,38 @@ impl KmsBackendV2 {
         self.drive_seat_event(state, ev);
     }
 
-    /// Deepest mapped window under the cursor. Walks
-    /// `core.top_level_order` back-to-front for the topmost top-level
-    /// match, then descends the sub-window tree picking the topmost
-    /// mapped child at each level whose screen-coords box contains
-    /// the cursor. SHAPE-input (or bounding) trims the hittable
-    /// region at every level.
-    ///
-    /// Why descend: xfwm4 attaches resize-edge cursors to thin frame
-    /// sub-windows (one child per edge under each frame top-level),
-    /// not to the frame top-level itself. Without sub-window descent
-    /// the pointer-window stays pinned to the frame, the cursor walk
-    /// in `effective_cursor_walking_chain` picks up only the frame's
-    /// (`None`) cursor + the root fallback, and the resize sprites
-    /// never become effective — the cursor stays as the default
-    /// arrow over xfwm4 frame edges. Matches Xorg `dix/events.c`'s
-    /// `XYToWindow` descent. The depth bound mirrors the cursor
-    /// walk's 64.
-    fn window_under_cursor(&self) -> Option<u32> {
-        let cx = f64::from(self.core.cursor_x);
-        let cy = f64::from(self.core.cursor_y);
-        let mut hit: Option<(u32, f64, f64)> = None;
-        for &window_id in self.core.top_level_order.iter().rev() {
-            let Some(w) = self.windows_v2.get(&window_id) else {
-                log::trace!(
-                    target: "yserver::kms::v2::pointer",
-                    "wuc: skip 0x{window_id:x} (not in windows_v2)"
-                );
-                continue;
-            };
-            if !w.mapped {
-                log::trace!(
-                    target: "yserver::kms::v2::pointer",
-                    "wuc: skip 0x{window_id:x} (unmapped)"
-                );
-                continue;
-            }
-            let wx = f64::from(w.x);
-            let wy = f64::from(w.y);
-            if cx < wx || cx >= wx + f64::from(w.width) || cy < wy || cy >= wy + f64::from(w.height)
-            {
-                log::trace!(
-                    target: "yserver::kms::v2::pointer",
-                    "wuc: skip 0x{window_id:x} cursor=({cx},{cy}) outside geom=({},{} {}x{})",
-                    w.x, w.y, w.width, w.height
-                );
-                continue;
-            }
-            if !self.cursor_inside_shape(window_id, cx - wx, cy - wy) {
-                log::trace!(
-                    target: "yserver::kms::v2::pointer",
-                    "wuc: skip 0x{window_id:x} local=({},{}) SHAPE-excluded (geom={},{} {}x{})",
-                    cx - wx, cy - wy, w.x, w.y, w.width, w.height
-                );
-                continue;
-            }
-            log::trace!(
-                target: "yserver::kms::v2::pointer",
-                "wuc: HIT 0x{window_id:x} cursor=({cx},{cy}) local=({},{}) geom=({},{} {}x{})",
-                cx - wx, cy - wy, w.x, w.y, w.width, w.height
-            );
-            hit = Some((window_id, wx, wy));
-            break;
-        }
-        let (mut parent_xid, mut parent_x, mut parent_y) = hit?;
-        for _ in 0..64 {
-            let mut children: Vec<(u32, u64, i16, i16, u16, u16)> = self
-                .windows_v2
-                .iter()
-                .filter_map(|(xid, g)| {
-                    (g.parent == Some(parent_xid) && g.mapped).then_some((
-                        *xid,
-                        g.stack_rank,
-                        g.x,
-                        g.y,
-                        g.width,
-                        g.height,
-                    ))
-                })
-                .collect();
-            children.sort_by_key(|c| std::cmp::Reverse(c.1));
-            let mut next: Option<(u32, f64, f64)> = None;
-            for (child_id, _rank, cxoff, cyoff, cw, ch) in children {
-                let cax = parent_x + f64::from(cxoff);
-                let cay = parent_y + f64::from(cyoff);
-                if cx < cax || cx >= cax + f64::from(cw) || cy < cay || cy >= cay + f64::from(ch) {
-                    continue;
-                }
-                if !self.cursor_inside_shape(child_id, cx - cax, cy - cay) {
-                    continue;
-                }
-                next = Some((child_id, cax, cay));
-                break;
-            }
-            match next {
-                Some((child, cax, cay)) => {
-                    parent_xid = child;
-                    parent_x = cax;
-                    parent_y = cay;
-                }
-                None => break,
-            }
-        }
-        Some(parent_xid)
+    /// Event-window-relative coords for `window` (a `ResourceId`),
+    /// derived from the **core** resource tree's absolute window
+    /// position — the single pointer authority. Computed at wire-emit
+    /// time; `host_xid` is never consulted for coordinates (the prior
+    /// `windows_v2` lookup is exactly the host-space island this change
+    /// removes).
+    fn event_relative_coords(&self, server_state: &ServerState, window: ResourceId) -> (i16, i16) {
+        let (ax, ay) = server_state.resources.window_absolute_position(window);
+        let ex = (self.core.cursor_x as i32) - ax;
+        let ey = (self.core.cursor_y as i32) - ay;
+        (
+            ex.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
+            ey.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
+        )
     }
 
-    /// SHAPE-input (preferred) / bounding (fallback) hit-test for a
-    /// single window. `local_x`/`local_y` are the pointer position
-    /// in the window's own coordinate space (origin = window's top-
-    /// left). Returns `true` when no SHAPE is set or the cursor lies
-    /// inside at least one rectangle; an empty rect list means the
-    /// window is unhittable.
-    fn cursor_inside_shape(&self, window_id: u32, local_x: f64, local_y: f64) -> bool {
-        let shape = self
-            .core
-            .shape_input
-            .get(&window_id)
-            .or_else(|| self.core.shape_bounding.get(&window_id));
-        let Some(rects) = shape else {
-            return true;
-        };
-        rects.iter().any(|r| {
-            let rx = f64::from(r.x);
-            let ry = f64::from(r.y);
-            local_x >= rx
-                && local_x < rx + f64::from(r.width)
-                && local_y >= ry
-                && local_y < ry + f64::from(r.height)
-        })
-    }
-
-    /// Event-window-relative coords for an event whose `host_xid`
-    /// is the topmost mapped top-level under the cursor. v2-shape
-    /// port — reads geometry off `windows_v2`. Falls back to root
-    /// coords when `host_xid` isn't tracked (the dispatcher
-    /// re-derives target coords from its own tree walk anyway).
-    fn event_relative_coords(&self, host_xid: u32) -> (i16, i16) {
-        if let Some(w) = self.windows_v2.get(&host_xid) {
-            let ex = (self.core.cursor_x as i32) - i32::from(w.x);
-            let ey = (self.core.cursor_y as i32) - i32::from(w.y);
-            (
-                ex.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
-                ey.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
-            )
-        } else {
-            (self.core.cursor_x as i16, self.core.cursor_y as i16)
+    /// Derive the wire `host_xid` for a core `ResourceId`, resolved only
+    /// at emit time. `ROOT_WINDOW` → the root container; a window whose
+    /// `host_xid` is momentarily absent also maps to the root container
+    /// — never silently substituting another (sibling/app) window, which
+    /// is what the deleted `unwrap_or(new_xid)` fallback did. Delivery is
+    /// driven by the core hit-test (`root_pointer_target_at`) in the
+    /// fanout, so this value only seeds the over-bare-root fallback.
+    fn emit_host_xid_for(&self, server_state: &ServerState, window: ResourceId) -> u32 {
+        if window == yserver_core::resources::ROOT_WINDOW {
+            return self.core.window_id;
         }
+        server_state
+            .resources
+            .window(window)
+            .and_then(|w| w.host_xid.map(|h| h.as_raw()))
+            .unwrap_or(self.core.window_id)
     }
 
     fn emit_pointer(&mut self, ev: HostPointerEvent) {
@@ -5044,14 +4961,16 @@ impl KmsBackendV2 {
 
     fn emit_crossing(
         &mut self,
-        host_xid: u32,
+        server_state: &ServerState,
+        window: ResourceId,
         kind: PointerEventKind,
         detail: u8,
         crossing_mode: u8,
         child: u32,
         state: u16,
     ) {
-        let (event_x, event_y) = self.event_relative_coords(host_xid);
+        let host_xid = self.emit_host_xid_for(server_state, window);
+        let (event_x, event_y) = self.event_relative_coords(server_state, window);
         let ev = HostPointerEvent {
             kind,
             host_xid,
@@ -5068,8 +4987,9 @@ impl KmsBackendV2 {
         self.emit_pointer(ev);
     }
 
-    fn emit_motion_only(&mut self, host_xid: u32, mask: u16) {
-        let (event_x, event_y) = self.event_relative_coords(host_xid);
+    fn emit_motion_only(&mut self, server_state: &ServerState, window: ResourceId, mask: u16) {
+        let host_xid = self.emit_host_xid_for(server_state, window);
+        let (event_x, event_y) = self.event_relative_coords(server_state, window);
         let ev = HostPointerEvent {
             kind: PointerEventKind::MotionNotify,
             host_xid,
@@ -5086,97 +5006,93 @@ impl KmsBackendV2 {
         self.emit_pointer(ev);
     }
 
-    /// Spec-correct Normal-mode crossing chain for a top-level
-    /// transition. Direct v1 port (kms/backend.rs:6630-6695) —
-    /// the body only touches KmsCore + nested-resource look-ups.
-    fn update_pointer_window(&mut self, server_state: &ServerState, new_xid: u32, mask: u16) {
-        if self.core.prev_pointer_window == Some(new_xid) {
+    /// Spec-correct Normal-mode crossing chain for a pointer-window
+    /// transition. Operates entirely in **`ResourceId`** space: `new_id`
+    /// is the core hit-test result (`root_pointer_target_at`), compared
+    /// against the `ResourceId` `prev_pointer_window`. `host_xid` is
+    /// derived only inside `emit_crossing`. No `xid_map` round-trip — a
+    /// window whose `host_xid` is momentarily stale can no longer
+    /// collapse the crossing chain to ancestor/root semantics.
+    fn update_pointer_window(&mut self, server_state: &ServerState, new_id: ResourceId, mask: u16) {
+        if self.core.prev_pointer_window == Some(new_id) {
             log::trace!(
                 target: "yserver::kms::v2::pointer",
-                "upw: SKIP-SAME prev=new=0x{new_xid:x}"
+                "upw: SKIP-SAME prev=new={}",
+                new_id.0
             );
             return;
         }
-        let prev_host = self.core.prev_pointer_window;
-        let root_container_host = self.core.window_id;
-        let resolve_host_to_nested = |host: u32, xid_map: &HostXidMap| -> Option<ResourceId> {
-            if host == root_container_host {
-                Some(yserver_core::resources::ROOT_WINDOW)
-            } else {
-                xid_map.get(&host).copied()
-            }
-        };
-        let prev_id = prev_host.and_then(|p| resolve_host_to_nested(p, &self.core.xid_map));
-        let new_id = resolve_host_to_nested(new_xid, &self.core.xid_map);
+        let prev_id = self.core.prev_pointer_window;
         log::trace!(
             target: "yserver::kms::v2::pointer",
-            "upw: prev_host={:?} new_host=0x{:x} prev_nested={:?} new_nested={:?}",
-            prev_host.map(|h| format!("0x{h:x}")),
-            new_xid,
+            "upw: prev_id={:?} new_id={}",
             prev_id.map(|r| r.0),
-            new_id.map(|r| r.0),
+            new_id.0,
         );
 
-        if let (Some(from), Some(to)) = (prev_id, new_id) {
-            let events = yserver_core::crossings::normal_mode_crossings(server_state, from, to);
+        if let Some(from) = prev_id {
+            let events = yserver_core::crossings::normal_mode_crossings(server_state, from, new_id);
             log::trace!(
                 target: "yserver::kms::v2::pointer",
                 "upw: normal_mode_crossings(from={}, to={}) → {} events",
-                from.0, to.0, events.len()
+                from.0, new_id.0, events.len()
             );
             for ev in events {
-                let win_host_xid = if ev.window == yserver_core::resources::ROOT_WINDOW {
-                    self.core.window_id
-                } else {
-                    server_state
-                        .resources
-                        .window(ev.window)
-                        .and_then(|w| w.host_xid.map(|h| h.as_raw()))
-                        .unwrap_or(new_xid)
-                };
                 let kind = match ev.kind {
                     yserver_core::crossings::CrossingKind::Enter => PointerEventKind::EnterNotify,
                     yserver_core::crossings::CrossingKind::Leave => PointerEventKind::LeaveNotify,
                 };
-                log::trace!(
-                    target: "yserver::kms::v2::pointer",
-                    "upw: emit_crossing host=0x{win_host_xid:x} kind={:?} detail={} child={:#x}",
-                    kind, ev.detail, ev.child.0
+                self.emit_crossing(
+                    server_state,
+                    ev.window,
+                    kind,
+                    ev.detail,
+                    0,
+                    ev.child.0,
+                    mask,
                 );
-                self.emit_crossing(win_host_xid, kind, ev.detail, 0, ev.child.0, mask);
             }
         } else {
-            log::trace!(
-                target: "yserver::kms::v2::pointer",
-                "upw: FALLBACK path (prev_id={:?}, new_id={:?})",
-                prev_id, new_id
+            // First-motion bootstrap (no prior pointer window) — a single
+            // Enter on the new window with detail=0, matching the v1 port.
+            self.emit_crossing(
+                server_state,
+                new_id,
+                PointerEventKind::EnterNotify,
+                0,
+                0,
+                0,
+                mask,
             );
-            // First-motion bootstrap or unmapped host_xid —
-            // fall back to a single Leave/Enter with detail=0.
-            if let Some(prev) = prev_host {
-                self.emit_crossing(prev, PointerEventKind::LeaveNotify, 0, 0, 0, mask);
-            }
-            self.emit_crossing(new_xid, PointerEventKind::EnterNotify, 0, 0, 0, mask);
         }
-        self.core.prev_pointer_window = Some(new_xid);
+        self.core.prev_pointer_window = Some(new_id);
         // Stage 5 Phase A: cross-in may change the effective cursor
         // (per-window DefineCursor walks up the parent chain).
-        self.refresh_effective_cursor();
+        self.refresh_effective_cursor(server_state);
+    }
+
+    /// The window currently under the cursor in **core-resource space**
+    /// — the single pointer authority (Xorg miSpriteTrace over the one
+    /// window tree). Falls back to `ROOT_WINDOW` so root-window
+    /// subscribers (e16's right-click-desktop menu, fvwm3's root
+    /// bindings) still see motion over the wallpaper.
+    fn pointer_target_resid(&self, server_state: &ServerState) -> ResourceId {
+        server_state
+            .root_pointer_target_at(self.core.cursor_x as i16, self.core.cursor_y as i16)
+            .map(|(id, _, _)| id)
+            .unwrap_or(yserver_core::resources::ROOT_WINDOW)
     }
 
     fn dispatch_motion_event(&mut self, server_state: &ServerState) {
-        // Fall back to the root container so root-window subscribers
-        // (e16's right-click-desktop menu, fvwm3's root bindings) can
-        // see motion when the cursor is over the wallpaper.
-        let host_xid = self.window_under_cursor().unwrap_or(self.core.window_id);
+        let target = self.pointer_target_resid(server_state);
         let mask = self.serialize_modifiers() | self.core.button_mask;
         log::trace!(
             target: "yserver::kms::v2::pointer",
-            "dispatch_motion: cursor=({},{}) → host_xid=0x{host_xid:x}",
-            self.core.cursor_x, self.core.cursor_y
+            "dispatch_motion: cursor=({},{}) → target={}",
+            self.core.cursor_x, self.core.cursor_y, target.0
         );
-        self.update_pointer_window(server_state, host_xid, mask);
-        self.emit_motion_only(host_xid, mask);
+        self.update_pointer_window(server_state, target, mask);
+        self.emit_motion_only(server_state, target, mask);
     }
 
     fn process_pointer_absolute(&mut self, server_state: &ServerState, x: f32, y: f32) {
@@ -5250,8 +5166,54 @@ impl KmsBackendV2 {
                 return;
             }
         };
-        let host_xid = self.window_under_cursor().unwrap_or(self.core.window_id);
-        let (event_x, event_y) = self.event_relative_coords(host_xid);
+        let target = self.pointer_target_resid(server_state);
+        // TEMP STACKDIAG (2026-06-16): dump root.children bottom→top with
+        // map-state / contains-cursor / shape, to find why the core
+        // hit-test resolves to nemo-desktop over app frames. Remove once
+        // the resources-vs-top_level_order stacking divergence is fixed.
+        {
+            let cx = self.core.cursor_x as i16;
+            let cy = self.core.cursor_y as i16;
+            if let Some(root) = server_state
+                .resources
+                .window(yserver_core::resources::ROOT_WINDOW)
+            {
+                let dump: Vec<String> = root
+                    .children
+                    .iter()
+                    .map(|c| match server_state.resources.window(*c) {
+                        Some(w) => {
+                            let contains = cx >= w.x
+                                && cy >= w.y
+                                && i32::from(cx) < i32::from(w.x) + i32::from(w.width)
+                                && i32::from(cy) < i32::from(w.y) + i32::from(w.height);
+                            let shape = server_state.shape_windows.get(c).map(|s| {
+                                (
+                                    s.bounding.as_ref().map(std::vec::Vec::len),
+                                    s.input.as_ref().map(std::vec::Vec::len),
+                                )
+                            });
+                            format!(
+                                "0x{:x}[{:?} ({},{} {}x{}) hit={contains} shape={shape:?}]",
+                                c.0, w.map_state, w.x, w.y, w.width, w.height
+                            )
+                        }
+                        None => format!("0x{:x}[MISSING]", c.0),
+                    })
+                    .collect();
+                log::warn!(
+                    "STACKDIAG click cursor=({cx},{cy}) target=0x{:x} root.children(bottom->top)={dump:?} top_level_order={:?}",
+                    target.0,
+                    self.core
+                        .top_level_order
+                        .iter()
+                        .map(|h| format!("0x{h:x}"))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+        let host_xid = self.emit_host_xid_for(server_state, target);
+        let (event_x, event_y) = self.event_relative_coords(server_state, target);
         let button_bit: u16 = match detail {
             1 => 0x0100,
             2 => 0x0200,
@@ -5294,29 +5256,22 @@ impl KmsBackendV2 {
             child: 0,
         };
         self.emit_pointer(ptr_event);
-        // Implicit-grab crossings (G3). Direct v1 port.
+        // Implicit-grab crossings (G3). Reuse the already-resolved core
+        // target as the grab window and the `ResourceId`
+        // `prev_pointer_window` as the focus — no `xid_map` round-trip.
         let post_state = self.serialize_modifiers() | self.core.button_mask;
         let press_mode: u8 = if pressed { 1 } else { 2 };
-        let grab_id = self.core.xid_map.get(&host_xid).copied();
-        let focus_id = self
-            .core
-            .prev_pointer_window
-            .and_then(|prev| self.core.xid_map.get(&prev).copied());
-        if let (Some(focus), Some(grab)) = (focus_id, grab_id) {
+        if let Some(focus) = self.core.prev_pointer_window {
             let events =
-                yserver_core::crossings::implicit_grab_crossings(server_state, focus, grab);
+                yserver_core::crossings::implicit_grab_crossings(server_state, focus, target);
             for ev in events {
-                let win_host_xid = server_state
-                    .resources
-                    .window(ev.window)
-                    .and_then(|w| w.host_xid.map(|h| h.as_raw()))
-                    .unwrap_or(host_xid);
                 let kind = match ev.kind {
                     yserver_core::crossings::CrossingKind::Enter => PointerEventKind::EnterNotify,
                     yserver_core::crossings::CrossingKind::Leave => PointerEventKind::LeaveNotify,
                 };
                 self.emit_crossing(
-                    win_host_xid,
+                    server_state,
+                    ev.window,
                     kind,
                     ev.detail,
                     press_mode,
@@ -6777,7 +6732,6 @@ impl KmsBackendV2 {
                 stack_rank,
                 bg_pixel,
                 bg_pixmap: None,
-                cursor: None,
             },
         );
         // Stage 3f.6 + 3f.14: clear newly-allocated storage to a
@@ -10509,7 +10463,6 @@ impl Backend for KmsBackendV2 {
             stack_rank: rank,
             bg_pixel: None,
             bg_pixmap: None,
-            cursor: None,
         };
         self.windows_v2.insert(cow_host_xid, geom);
         self.core.top_level_order.retain(|&x| x != cow_host_xid);
@@ -10959,31 +10912,22 @@ impl Backend for KmsBackendV2 {
     fn define_cursor(
         &mut self,
         _origin: Option<OriginContext>,
+        server_state: &ServerState,
         host_window_xid: u32,
         cursor_host_xid: u32,
     ) -> io::Result<()> {
-        // Stage 5 Phase A: store the cursor on the window's
-        // attribute slot. Per X11, the cursor visible on screen is
-        // the one belonging to the deepest window under the pointer
-        // that has a non-None cursor (walking up the parent chain);
-        // `cursor_host_xid == 0` is X11 `None` and means "inherit
-        // from parent".
-        //
-        // The sticky `active_cursor` fallback on `KmsCore` matches
-        // v1: a DefineCursor on the root container becomes the
-        // server-wide default for windows that don't override it.
-        let nested = if cursor_host_xid == 0 {
-            None
-        } else {
-            Some(cursor_host_xid)
-        };
-        if let Some(geom) = self.windows_v2.get_mut(&host_window_xid) {
-            geom.cursor = nested;
-        }
+        // The per-window cursor attribute lives in the core resource
+        // tree (`Window.cursor`, set by the protocol CWCursor path) and
+        // the effective-cursor walk reads it from there — the backend no
+        // longer keeps a parallel per-window store. We only maintain the
+        // sticky `active_cursor` fallback (a DefineCursor on the root
+        // container becomes the server-wide default) and re-resolve the
+        // effective cursor against the core chain. `cursor_host_xid == 0`
+        // is X11 `None`.
         if cursor_host_xid != 0 && host_window_xid == self.core.window_id {
             self.core.active_cursor = Some(cursor_host_xid);
         }
-        self.refresh_effective_cursor();
+        self.refresh_effective_cursor(server_state);
         Ok(())
     }
 
@@ -15031,12 +14975,14 @@ impl Backend for KmsBackendV2 {
         kind: u8,
         rects: &[xfixes::RegionRect],
     ) -> io::Result<()> {
-        // Bookkeeping mutation: SHAPE rects live in KmsCore; no
-        // paint side-effect needed in Stage 1b.
+        // Bookkeeping mutation: Bounding/Clip rects live in KmsCore and
+        // feed the renderer. The Input kind (2) is no longer mirrored
+        // here — pointer hit-testing is the single core authority
+        // (`ServerState::window_input_contains`); the backend keeps no
+        // parallel input-shape store.
         let dst = match kind {
             0 => &mut self.core.shape_bounding,
             1 => &mut self.core.shape_clip,
-            2 => &mut self.core.shape_input,
             _ => {
                 self.log_v2_gap("set_shape_rectangles_invalid_kind");
                 return Ok(());
@@ -17519,7 +17465,8 @@ mod tests {
             .render_create_cursor(None, pic, 0, 0)
             .expect("render_create_cursor");
 
-        b.define_cursor(None, 0xABCD_EF01, c1.as_raw())
+        let state = ServerState::new();
+        b.define_cursor(None, &state, 0xABCD_EF01, c1.as_raw())
             .expect("define_cursor");
         b.xfixes_change_cursor_by_name(None, c1.as_raw(), b"watch")
             .expect("xfixes_change_cursor_by_name");
@@ -17539,15 +17486,16 @@ mod tests {
         }
     }
 
-    /// Stage 5 Phase A: define_cursor stores the cursor on the
-    /// window's geometry slot and (when the window is the root
-    /// container) updates `KmsCore.active_cursor` so unbound child
-    /// windows inherit the new sprite via the parent-chain walk.
+    /// `define_cursor` on the root container updates the sticky
+    /// `KmsCore.active_cursor` fallback; a non-root `define_cursor` must
+    /// not. (The per-window cursor attribute itself lives in the core
+    /// resource tree now, not in the backend.)
     #[test]
-    fn define_cursor_records_per_window_and_root_sticky() {
+    fn define_cursor_root_sets_sticky_active_cursor() {
         use yserver_core::backend::{Backend, PixmapHandle};
 
         let mut b = KmsBackendV2::for_tests();
+        let state = ServerState::new();
         let pix = PixmapHandle::from_raw(0x1234_0010).unwrap();
         let c = b
             .create_cursor(None, pix, None, (0xFFFF, 0, 0), (0, 0xFFFF, 0), 0, 0)
@@ -17555,124 +17503,100 @@ mod tests {
 
         // DefineCursor on the root container — sticky fallback.
         let root_host = b.core.window_id;
-        b.define_cursor(None, root_host, c.as_raw())
+        b.define_cursor(None, &state, root_host, c.as_raw())
             .expect("define_cursor root");
         assert_eq!(b.core.active_cursor, Some(c.as_raw()));
 
-        // DefineCursor on a non-root window — stored on geom only,
-        // does NOT touch `active_cursor`.
-        let w: u32 = 0xABCD_0001;
-        let rank = b.alloc_window_stack_rank();
-        b.windows_v2.insert(
-            w,
-            super::WindowGeometryV2 {
-                x: 0,
-                y: 0,
-                width: 8,
-                height: 8,
-                depth: 24,
-                mapped: true,
-                parent: None,
-                stack_rank: rank,
-                bg_pixel: None,
-                bg_pixmap: None,
-                cursor: None,
-            },
-        );
+        // DefineCursor on a non-root window does NOT touch `active_cursor`.
         let c2 = b
             .create_cursor(None, pix, None, (0, 0xFFFF, 0), (0xFFFF, 0, 0), 0, 0)
             .expect("create_cursor 2");
-        b.define_cursor(None, w, c2.as_raw())
+        b.define_cursor(None, &state, 0xABCD_0001, c2.as_raw())
             .expect("define_cursor non-root");
         assert_eq!(
             b.core.active_cursor,
             Some(c.as_raw()),
             "non-root must not touch active_cursor"
         );
-        assert_eq!(
-            b.windows_v2.get(&w).and_then(|g| g.cursor),
-            Some(c2.as_raw())
-        );
-
-        // `define_cursor(_, 0)` (X11 None) clears the per-window slot.
-        b.define_cursor(None, w, 0).expect("define_cursor clear");
-        assert_eq!(b.windows_v2.get(&w).and_then(|g| g.cursor), None);
     }
 
-    /// Effective-cursor walk: a child without its own cursor inherits
-    /// from its parent; a fresh root cursor (DefineCursor on root)
-    /// becomes the fallback when no chain entry binds one.
+    /// Effective-cursor walk over the **core resource** parent chain: a
+    /// child without its own cursor inherits from its parent; when no
+    /// chain entry binds a cursor the walk falls back to
+    /// `active_cursor` / `default_cursor_xid`.
     #[test]
     fn effective_cursor_walks_parent_chain() {
-        use yserver_core::backend::{Backend, PixmapHandle};
+        use yserver_core::{
+            backend::CursorHandle,
+            resources::{ROOT_VISUAL, ROOT_WINDOW},
+        };
+        use yserver_protocol::x11::{ClientId, CreateWindowRequest, ResourceId};
 
         let mut b = KmsBackendV2::for_tests();
-        let pix = PixmapHandle::from_raw(0x1234_0011).unwrap();
-        let root_cur = b
-            .create_cursor(None, pix, None, (0xFFFF, 0, 0), (0, 0, 0), 0, 0)
-            .expect("create_cursor");
-        let parent_cur = b
-            .create_cursor(None, pix, None, (0, 0xFFFF, 0), (0, 0, 0), 0, 0)
-            .expect("create_cursor parent");
-        // Wire: root → parent → child. Parent has its own cursor;
-        // child inherits.
-        let root_host = b.core.window_id;
-        let parent: u32 = 0xDEAD_0001;
-        let child: u32 = 0xDEAD_0002;
-        let rank_p = b.alloc_window_stack_rank();
-        let rank_c = b.alloc_window_stack_rank();
-        b.windows_v2.insert(
-            parent,
-            super::WindowGeometryV2 {
+
+        // Core tree: root → parent → child. Parent binds its own cursor
+        // (host 0xAAAA); child has none and inherits it.
+        let mut state = ServerState::new();
+        let parent = ResourceId(0x0010_0001);
+        let child = ResourceId(0x0010_0002);
+        let parent_cur = ResourceId(0x0020_0001);
+        state.resources.create_cursor(ClientId(1), parent_cur);
+        state
+            .resources
+            .set_cursor_host_xid(parent_cur, CursorHandle::from_raw(0xAAAA).unwrap());
+
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: parent,
+                parent: ROOT_WINDOW,
                 x: 0,
                 y: 0,
                 width: 16,
                 height: 16,
-                depth: 24,
-                mapped: true,
-                parent: Some(root_host),
-                stack_rank: rank_p,
-                bg_pixel: None,
-                bg_pixmap: None,
-                cursor: None,
+                border_width: 0,
+                class: 1,
+                visual: ROOT_VISUAL,
+                ..Default::default()
             },
         );
-        b.windows_v2.insert(
-            child,
-            super::WindowGeometryV2 {
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: child,
+                parent,
                 x: 0,
                 y: 0,
                 width: 8,
                 height: 8,
-                depth: 24,
-                mapped: true,
-                parent: Some(parent),
-                stack_rank: rank_c,
-                bg_pixel: None,
-                bg_pixmap: None,
-                cursor: None,
+                border_width: 0,
+                class: 1,
+                visual: ROOT_VISUAL,
+                ..Default::default()
             },
         );
-        // DefineCursor on root + parent.
-        b.define_cursor(None, root_host, root_cur.as_raw())
-            .expect("root");
-        b.define_cursor(None, parent, parent_cur.as_raw())
-            .expect("parent");
+        // Bind parent's cursor attribute (no `cursor` field on
+        // CreateWindowRequest — set it directly).
+        state.resources.window_mut(parent).unwrap().cursor = Some(parent_cur);
+
         // Child inherits parent's cursor (parent has its own bound).
         assert_eq!(
-            b.effective_cursor_walking_chain(child),
-            Some(parent_cur.as_raw())
+            b.effective_cursor_walking_chain(&state, child),
+            Some(0xAAAA)
         );
         // Parent itself reports its own cursor.
         assert_eq!(
-            b.effective_cursor_walking_chain(parent),
-            Some(parent_cur.as_raw())
+            b.effective_cursor_walking_chain(&state, parent),
+            Some(0xAAAA)
         );
-        // Window unknown to windows_v2 → falls back to active_cursor
-        // (root's DefineCursor).
+        // A window with no cursor on its chain falls back to the sticky
+        // root `active_cursor`.
+        b.core.active_cursor = Some(0xBBBB);
         assert_eq!(
-            b.effective_cursor_walking_chain(0xFFFF_FFFF),
-            Some(root_cur.as_raw())
+            b.effective_cursor_walking_chain(&state, ROOT_WINDOW),
+            Some(0xBBBB)
         );
     }
 
@@ -17772,6 +17696,7 @@ mod tests {
         use yserver_core::backend::{Backend, PixmapHandle};
 
         let mut b = KmsBackendV2::for_tests();
+        let state = ServerState::new();
         let pix = PixmapHandle::from_raw(0x1234_0040).unwrap();
         let c1 = b
             .create_cursor(None, pix, None, (0xFFFF, 0, 0), (0, 0, 0), 0, 0)
@@ -17786,7 +17711,7 @@ mod tests {
 
         // Purely static cursor → anim state stays cleared.
         let root_host = b.core.window_id;
-        b.define_cursor(None, root_host, c1.as_raw())
+        b.define_cursor(None, &state, root_host, c1.as_raw())
             .expect("static before anim");
         assert!(
             b.active_cursor_anim.is_none(),
@@ -17794,7 +17719,7 @@ mod tests {
         );
 
         // Bind the anim cursor on root → it becomes effective and arms.
-        b.define_cursor(None, root_host, anim.as_raw())
+        b.define_cursor(None, &state, root_host, anim.as_raw())
             .expect("define anim");
         let st = b.active_cursor_anim.as_ref().expect("armed");
         assert_eq!(st.handle, anim.as_raw());
@@ -17810,16 +17735,16 @@ mod tests {
         // Pretend the animation advanced, then re-resolve to the SAME
         // cursor: frame index must be preserved (no restart).
         b.active_cursor_anim.as_mut().unwrap().frame = 1;
-        b.refresh_effective_cursor();
+        b.refresh_effective_cursor(&state);
         assert_eq!(b.active_cursor_anim.as_ref().unwrap().frame, 1);
 
         // Switch to a static cursor → animation cleared.
-        b.define_cursor(None, root_host, c1.as_raw())
+        b.define_cursor(None, &state, root_host, c1.as_raw())
             .expect("define static");
         assert!(b.active_cursor_anim.is_none());
 
         // Switch back → restarts at frame 0.
-        b.define_cursor(None, root_host, anim.as_raw())
+        b.define_cursor(None, &state, root_host, anim.as_raw())
             .expect("re-define anim");
         assert_eq!(b.active_cursor_anim.as_ref().unwrap().frame, 0);
     }
@@ -17862,7 +17787,6 @@ mod tests {
                 bg_pixel: None,
                 bg_pixmap: None,
                 stack_rank,
-                cursor: None,
             },
         );
         let w_storage = Storage::for_tests_null(
@@ -17969,7 +17893,6 @@ mod tests {
                 bg_pixel: None,
                 bg_pixmap: None,
                 stack_rank,
-                cursor: None,
             },
         );
         let w_storage = Storage::for_tests_null(
@@ -18153,7 +18076,6 @@ mod tests {
                 bg_pixel: None,
                 bg_pixmap: None,
                 stack_rank: parent_stack_rank,
-                cursor: None,
             },
         );
         b.store
@@ -18190,7 +18112,6 @@ mod tests {
                 bg_pixel: None,
                 bg_pixmap: None,
                 stack_rank: child_stack_rank,
-                cursor: None,
             },
         );
         let child_id = b
@@ -18301,7 +18222,6 @@ mod tests {
                 bg_pixel: None,
                 bg_pixmap: None,
                 stack_rank: parent_stack_rank,
-                cursor: None,
             },
         );
         b.store
@@ -18337,7 +18257,6 @@ mod tests {
                 bg_pixel: None,
                 bg_pixmap: None,
                 stack_rank: child_stack_rank,
-                cursor: None,
             },
         );
         b.store
@@ -18426,7 +18345,6 @@ mod tests {
                 stack_rank: 0,
                 bg_pixel: None,
                 bg_pixmap: None,
-                cursor: None,
             },
         );
 
@@ -18698,179 +18616,6 @@ mod tests {
         assert_eq!(b.core.cursor_y, 1439.0);
     }
 
-    /// `window_under_cursor` returns the topmost mapped top-level
-    /// containing the cursor. Walks `core.top_level_order` back-to-
-    /// front so the most-recently-stacked window wins. Unmapped
-    /// windows skipped.
-    #[test]
-    fn window_under_cursor_finds_topmost_mapped() {
-        let mut b = KmsBackendV2::for_tests();
-        b.windows_v2.insert(
-            0x1000,
-            super::WindowGeometryV2 {
-                x: 0,
-                y: 0,
-                width: 100,
-                height: 100,
-                depth: 32,
-                mapped: true,
-                parent: None,
-                stack_rank: 0,
-                bg_pixel: None,
-                bg_pixmap: None,
-                cursor: None,
-            },
-        );
-        b.windows_v2.insert(
-            0x2000,
-            super::WindowGeometryV2 {
-                x: 50,
-                y: 50,
-                width: 100,
-                height: 100,
-                depth: 32,
-                mapped: true,
-                parent: None,
-                stack_rank: 1,
-                bg_pixel: None,
-                bg_pixmap: None,
-                cursor: None,
-            },
-        );
-        b.core.top_level_order.push(0x1000);
-        b.core.top_level_order.push(0x2000);
-
-        // Cursor in overlap (50..100, 50..100): 0x2000 wins (topmost).
-        b.core.cursor_x = 75.0;
-        b.core.cursor_y = 75.0;
-        assert_eq!(b.window_under_cursor(), Some(0x2000));
-
-        // Cursor outside overlap, only in 0x1000.
-        b.core.cursor_x = 25.0;
-        b.core.cursor_y = 25.0;
-        assert_eq!(b.window_under_cursor(), Some(0x1000));
-
-        // Cursor outside both — root-fallback handled at caller.
-        b.core.cursor_x = 300.0;
-        b.core.cursor_y = 300.0;
-        assert_eq!(b.window_under_cursor(), None);
-
-        // Unmapping the topmost — next match wins.
-        b.windows_v2.get_mut(&0x2000).unwrap().mapped = false;
-        b.core.cursor_x = 75.0;
-        b.core.cursor_y = 75.0;
-        assert_eq!(b.window_under_cursor(), Some(0x1000));
-    }
-
-    /// `window_under_cursor` descends into mapped sub-windows so the
-    /// returned xid is the deepest match. xfwm4 attaches resize-edge
-    /// cursors to frame sub-windows; without descent the cursor walk
-    /// stops at the (cursor=None) frame top-level and the resize
-    /// sprites never become effective on hover. Pinned: top-edge
-    /// child wins when pointer is in the edge band; the frame
-    /// top-level wins in the interior; topmost sibling wins on
-    /// overlap; unmapped sub-windows are skipped (parent wins).
-    #[test]
-    fn window_under_cursor_descends_into_subwindow_tree() {
-        let mut b = KmsBackendV2::for_tests();
-        // Frame top-level at (100,100, 800x600), no cursor.
-        b.windows_v2.insert(
-            0x1000,
-            super::WindowGeometryV2 {
-                x: 100,
-                y: 100,
-                width: 800,
-                height: 600,
-                depth: 24,
-                mapped: true,
-                parent: None,
-                stack_rank: 0,
-                bg_pixel: None,
-                bg_pixmap: None,
-                cursor: None,
-            },
-        );
-        b.core.top_level_order.push(0x1000);
-        // Top-edge resize sub-window at parent-local (0,0, 800x10),
-        // i.e. screen (100,100, 800x10). Has its own resize cursor.
-        b.windows_v2.insert(
-            0x1001,
-            super::WindowGeometryV2 {
-                x: 0,
-                y: 0,
-                width: 800,
-                height: 10,
-                depth: 24,
-                mapped: true,
-                parent: Some(0x1000),
-                stack_rank: 0,
-                bg_pixel: None,
-                bg_pixmap: None,
-                cursor: Some(0xdead_0001),
-            },
-        );
-        // Bottom-edge resize sub-window at parent-local (0,590, 800x10),
-        // screen (100,690, 800x10). Different cursor.
-        b.windows_v2.insert(
-            0x1002,
-            super::WindowGeometryV2 {
-                x: 0,
-                y: 590,
-                width: 800,
-                height: 10,
-                depth: 24,
-                mapped: true,
-                parent: Some(0x1000),
-                stack_rank: 1,
-                bg_pixel: None,
-                bg_pixmap: None,
-                cursor: Some(0xdead_0002),
-            },
-        );
-
-        // Cursor in the top-edge band: deepest hit is the top sub-window.
-        b.core.cursor_x = 150.0;
-        b.core.cursor_y = 105.0;
-        assert_eq!(b.window_under_cursor(), Some(0x1001));
-
-        // Cursor in the bottom-edge band: bottom sub-window.
-        b.core.cursor_x = 150.0;
-        b.core.cursor_y = 695.0;
-        assert_eq!(b.window_under_cursor(), Some(0x1002));
-
-        // Cursor in the frame interior (not in any edge band): the
-        // frame top-level itself.
-        b.core.cursor_x = 400.0;
-        b.core.cursor_y = 300.0;
-        assert_eq!(b.window_under_cursor(), Some(0x1000));
-
-        // Overlap test — add a second top-edge child at the same
-        // location with higher stack_rank; topmost wins.
-        b.windows_v2.insert(
-            0x1003,
-            super::WindowGeometryV2 {
-                x: 0,
-                y: 0,
-                width: 800,
-                height: 10,
-                depth: 24,
-                mapped: true,
-                parent: Some(0x1000),
-                stack_rank: 99,
-                bg_pixel: None,
-                bg_pixmap: None,
-                cursor: Some(0xdead_0003),
-            },
-        );
-        b.core.cursor_x = 150.0;
-        b.core.cursor_y = 105.0;
-        assert_eq!(b.window_under_cursor(), Some(0x1003));
-
-        // Unmap the topmost overlap entry — sibling beneath wins.
-        b.windows_v2.get_mut(&0x1003).unwrap().mapped = false;
-        assert_eq!(b.window_under_cursor(), Some(0x1001));
-    }
-
     /// `on_host_input` no longer logs the `v2: on_host_input not
     /// yet implemented` gap that fired before 3f.7. Key events
     /// drain through xkb cooking; pointer events drain to the
@@ -18953,7 +18698,6 @@ mod tests {
                 stack_rank: 0,
                 bg_pixel: None,
                 bg_pixmap: None,
-                cursor: None,
             },
         );
         let child = b
@@ -19021,7 +18765,6 @@ mod tests {
                 stack_rank: 0,
                 bg_pixel: None,
                 bg_pixmap: None,
-                cursor: None,
             },
         );
         b.windows_v2.insert(
@@ -19037,7 +18780,6 @@ mod tests {
                 stack_rank: 1,
                 bg_pixel: None,
                 bg_pixmap: None,
-                cursor: None,
             },
         );
         b.core.top_level_order.push(0xC0FFEE);
@@ -19089,7 +18831,6 @@ mod tests {
                 stack_rank: 0,
                 bg_pixel: None,
                 bg_pixmap: None,
-                cursor: None,
             },
         );
         // Reparent to a host_parent that doesn't exist in windows_v2.
@@ -19127,7 +18868,6 @@ mod tests {
                 stack_rank: 0,
                 bg_pixel: None,
                 bg_pixmap: None,
-                cursor: None,
             },
         );
         // host_parent == root's real host xid (core.window_id), exactly
@@ -19258,7 +18998,6 @@ mod tests {
                 stack_rank: 0,
                 bg_pixel: None,
                 bg_pixmap: None,
-                cursor: None,
             },
         );
         b.windows_v2.insert(
@@ -19274,7 +19013,6 @@ mod tests {
                 stack_rank: 1,
                 bg_pixel: None,
                 bg_pixmap: None,
-                cursor: None,
             },
         );
         b.restack_subwindow(0xD00D, 1, Some(0xCAFE));
@@ -19302,7 +19040,6 @@ mod tests {
                 stack_rank: 0,
                 bg_pixel: None,
                 bg_pixmap: None,
-                cursor: None,
             },
         );
         b.windows_v2.insert(
@@ -19318,7 +19055,6 @@ mod tests {
                 stack_rank: 1,
                 bg_pixel: None,
                 bg_pixmap: None,
-                cursor: None,
             },
         );
         // Start: child not in top_level_order.
@@ -19365,7 +19101,6 @@ mod tests {
                 stack_rank: 0,
                 bg_pixel: None,
                 bg_pixmap: None,
-                cursor: None,
             },
         );
         b.store
@@ -21262,7 +20997,6 @@ mod tests {
                 stack_rank: 0,
                 bg_pixel: None,
                 bg_pixmap: None,
-                cursor: None,
             },
         );
         let _ = backend.store.allocate(
@@ -22469,7 +22203,8 @@ mod tests {
             .expect("anim")
             .expect("KMS animates");
         let root_host = b.core.window_id;
-        b.define_cursor(None, root_host, anim.as_raw())
+        let state = ServerState::new();
+        b.define_cursor(None, &state, root_host, anim.as_raw())
             .expect("define");
 
         let mut last_version = b.cursor_records.get(&anim.as_raw()).unwrap().version;
@@ -22519,7 +22254,8 @@ mod tests {
             .expect("anim")
             .expect("KMS animates");
         let root_host = b.core.window_id;
-        b.define_cursor(None, root_host, anim.as_raw())
+        let state = ServerState::new();
+        b.define_cursor(None, &state, root_host, anim.as_raw())
             .expect("define");
         let deadline = b.active_cursor_anim.as_ref().unwrap().next_frame;
 
@@ -22595,7 +22331,8 @@ mod tests {
             .expect("anim")
             .expect("KMS animates");
         let root_host = b.core.window_id;
-        b.define_cursor(None, root_host, anim.as_raw())
+        let state = ServerState::new();
+        b.define_cursor(None, &state, root_host, anim.as_raw())
             .expect("define");
 
         let mut last_serial = b.get_active_cursor_image().expect("image").serial;

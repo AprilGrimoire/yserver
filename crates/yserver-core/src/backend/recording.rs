@@ -640,6 +640,7 @@ impl Backend for RecordingBackend {
     fn define_cursor(
         &mut self,
         _origin: Option<OriginContext>,
+        _server_state: &crate::server::ServerState,
         host_window_xid: u32,
         cursor_host_xid: u32,
     ) -> io::Result<()> {

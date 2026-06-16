@@ -9,7 +9,6 @@ use std::{
     time::Instant,
 };
 
-use log::trace;
 use yserver_protocol::x11::{
     self, AtomId, ClientByteOrder, ClientId, ResourceId, SequenceNumber, shape, xfixes,
 };
@@ -1914,20 +1913,33 @@ impl ServerState {
     }
 
     fn window_input_contains(&self, window: ResourceId, x: i16, y: i16) -> bool {
-        let Some(rects) = self
-            .shape_windows
-            .get(&window)
-            .and_then(|state| state.input.as_ref())
-        else {
+        let Some(state) = self.shape_windows.get(&window) else {
             return true;
         };
+        // Xorg sprite-trace gate (mi/miwindow.c:767, dix/window.c): a point
+        // hits iff it is inside the bounding shape (when one is set) AND
+        // inside the input shape (when one is set), as two independent
+        // checks. `None` => that gate passes (no shape on that channel);
+        // `Some([])` (empty region) => not contained => click-through.
+        let in_bounding = match state.bounding.as_ref() {
+            Some(rects) => Self::rects_contain_point(rects, x, y),
+            None => true,
+        };
+        let in_input = match state.input.as_ref() {
+            Some(rects) => Self::rects_contain_point(rects, x, y),
+            None => true,
+        };
+        in_bounding && in_input
+    }
+
+    fn rects_contain_point(rects: &[xfixes::RegionRect], x: i16, y: i16) -> bool {
+        let px = i32::from(x);
+        let py = i32::from(y);
         rects.iter().any(|rect| {
             let rx = i32::from(rect.x);
             let ry = i32::from(rect.y);
             let rr = rx + i32::from(rect.width);
             let rb = ry + i32::from(rect.height);
-            let px = i32::from(x);
-            let py = i32::from(y);
             px >= rx && py >= ry && px < rr && py < rb
         })
     }
@@ -2182,575 +2194,6 @@ pub fn emit_window_event(
         Err(_) => return,
     };
     fanout_event(&targets, encode);
-}
-
-#[allow(clippy::too_many_lines)]
-pub fn pointer_event_fanout(
-    state: &Mutex<ServerState>,
-    xid_map: &crate::host_x11::HostXidMap,
-    event: crate::host_x11::HostPointerEvent,
-) {
-    pointer_event_fanout_inner(state, xid_map, event, true);
-}
-
-/// Re-routes a thawed ButtonPress as if no passive grab had matched.
-/// Called by AllowEvents ReplayPointer. This intentionally does not
-/// re-check passive grabs, otherwise the same event would immediately
-/// refreeze on the same grab.
-pub fn route_button_press_no_grab(
-    state: &Mutex<ServerState>,
-    xid_map: &crate::host_x11::HostXidMap,
-    event: crate::host_x11::HostPointerEvent,
-) {
-    pointer_event_fanout_inner(state, xid_map, event, false)
-}
-
-#[allow(clippy::too_many_lines)]
-fn pointer_event_fanout_inner(
-    state: &Mutex<ServerState>,
-    xid_map: &crate::host_x11::HostXidMap,
-    event: crate::host_x11::HostPointerEvent,
-    handle_grabs: bool,
-) {
-    use crate::host_x11::PointerEventKind;
-    trace!(
-        "pointer_event_fanout: kind={:?} detail={} host_xid=0x{:x} root=({},{}) event=({},{}) state=0x{:x}",
-        event.kind,
-        event.detail,
-        event.host_xid,
-        event.root_x,
-        event.root_y,
-        event.event_x,
-        event.event_y,
-        event.state
-    );
-
-    // Translate root_x/root_y from host-screen coordinates into ynest-root
-    // coordinates. The host pump reports root_x/y relative to the host server's
-    // root window, but our nested clients see the ynest container as their
-    // root, so values must be relative to that. For events on a registered
-    // top-level subwindow we have host event_x/y (relative to that subwindow)
-    // and the top-level's known position in nested-root, so the translation is
-    // straightforward. Without this translation, clients placing popups or
-    // tooltips at root_x/root_y end up off-screen by the container's host
-    // offset.
-    let event = if let Some(top_level_id) = xid_map.get(&event.host_xid).copied() {
-        let translated = state.lock().ok().and_then(|g| {
-            g.resources
-                .window(top_level_id)
-                .map(|w| (w.x + event.event_x, w.y + event.event_y))
-        });
-        if let Some((rx, ry)) = translated {
-            crate::host_x11::HostPointerEvent {
-                root_x: rx,
-                root_y: ry,
-                ..event
-            }
-        } else {
-            event
-        }
-    } else {
-        event
-    };
-
-    // Active pointer grab: redirect all button/motion events to grab owner.
-    // event_x/event_y must be relative to the grab_window (per X11 spec) so
-    // the grab owner can locate which child window (menu item, button…)
-    // was clicked. Without this translation a WM-popup grab sees clicks at
-    // root coordinates and can't match them against its menu-item children.
-    let grab_state = if handle_grabs {
-        match state.lock() {
-            Ok(g) => g.pointer_grab.and_then(|(client_id, grab_window)| {
-                let target = g.client_target(client_id)?;
-                let (gx, gy) = g.resources.window_absolute_position(grab_window);
-                let owner_events = if g.pointer_grab_is_passive {
-                    g.button_grabs
-                        .iter()
-                        .rev()
-                        .find(|grab| grab.owner == client_id && grab.grab_window == grab_window)
-                        .is_some_and(|grab| grab.owner_events)
-                } else {
-                    g.active_pointer_grab
-                        .filter(|grab| grab.owner == client_id)
-                        .is_some_and(|grab| grab.owner_events)
-                };
-                Some((grab_window, client_id, target, gx, gy, owner_events))
-            }),
-            Err(_) => return,
-        }
-    } else {
-        None
-    };
-    if let Some((grab_window, _grab_client, target, grab_x, grab_y, owner_events)) = grab_state {
-        let seq = SequenceNumber(target.last_sequence.load(Ordering::Relaxed));
-        let mut buf = Vec::with_capacity(32);
-        let event_x = i32::from(event.root_x)
-            .saturating_sub(grab_x)
-            .clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
-        let event_y = i32::from(event.root_y)
-            .saturating_sub(grab_y)
-            .clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
-        let target_within_grab_window = match state.lock() {
-            Ok(g) => {
-                let hit_window =
-                    g.root_pointer_target_at(event.root_x, event.root_y)
-                        .or_else(|| {
-                            xid_map.get(&event.host_xid).copied().and_then(|top| {
-                                g.pointer_target_at(top, event.event_x, event.event_y)
-                            })
-                        })
-                        .map(|(window, _, _)| window);
-                hit_window.is_some_and(|w| {
-                    w == grab_window || g.resources.is_descendant_of(w, grab_window)
-                })
-            }
-            Err(_) => false,
-        };
-        let redirect_to_grab = !owner_events || !target_within_grab_window;
-        match event.kind {
-            PointerEventKind::ButtonPress => x11::encode_button_press_event(
-                &mut buf,
-                target.byte_order,
-                x11::PointerEvent {
-                    sequence: seq,
-                    detail: event.detail,
-                    time: event.time,
-                    root: crate::resources::ROOT_WINDOW,
-                    event: grab_window,
-                    root_x: event.root_x,
-                    root_y: event.root_y,
-                    event_x,
-                    event_y,
-                    child: ResourceId(0),
-                    state: event.state,
-                },
-            ),
-            PointerEventKind::ButtonRelease => x11::encode_button_release_event(
-                &mut buf,
-                target.byte_order,
-                x11::PointerEvent {
-                    sequence: seq,
-                    detail: event.detail,
-                    time: event.time,
-                    root: crate::resources::ROOT_WINDOW,
-                    event: grab_window,
-                    root_x: event.root_x,
-                    root_y: event.root_y,
-                    event_x,
-                    event_y,
-                    child: ResourceId(0),
-                    state: event.state,
-                },
-            ),
-            PointerEventKind::MotionNotify => x11::encode_motion_notify_event(
-                &mut buf,
-                target.byte_order,
-                x11::PointerEvent {
-                    sequence: seq,
-                    detail: 0,
-                    time: event.time,
-                    root: crate::resources::ROOT_WINDOW,
-                    event: grab_window,
-                    root_x: event.root_x,
-                    root_y: event.root_y,
-                    event_x,
-                    event_y,
-                    child: ResourceId(0),
-                    state: event.state,
-                },
-            ),
-            PointerEventKind::EnterNotify | PointerEventKind::LeaveNotify => return,
-        }
-        if redirect_to_grab && let Ok(mut w) = target.writer.lock() {
-            let _ = w.write_all(&buf);
-        }
-    }
-
-    if event.kind == PointerEventKind::ButtonRelease
-        && let Ok(mut s) = state.lock()
-        && s.pointer_grab_is_passive
-    {
-        s.pointer_grab = None;
-        s.pointer_grab_is_passive = false;
-        s.frozen_pointer_event = None;
-        s.frozen_pointer_queue.clear();
-    }
-
-    // Passive button grab matching for ButtonPress events.
-    if handle_grabs && event.kind == PointerEventKind::ButtonPress {
-        let top_level_id_opt = xid_map.get(&event.host_xid).copied();
-        let matched = top_level_id_opt.and_then(|top| {
-            let s = state.lock().ok()?;
-            let (hit_window, _, _) = s
-                .root_pointer_target_at(event.root_x, event.root_y)
-                .or_else(|| s.pointer_target_at(top, event.event_x, event.event_y))
-                .unwrap_or((top, event.event_x, event.event_y));
-            s.find_passive_grab(hit_window, event.detail, event.state)
-                .map(|grab| (grab, hit_window))
-        });
-        if let Some(grab) = matched {
-            let (grab, hit_window) = grab;
-            let target_within_grab_window = match state.lock() {
-                Ok(s) => {
-                    hit_window == grab.grab_window
-                        || s.resources.is_descendant_of(hit_window, grab.grab_window)
-                }
-                Err(_) => false,
-            };
-            let redirect_to_grab = !grab.owner_events || !target_within_grab_window;
-            let target_opt = match state.lock() {
-                Ok(mut s) => {
-                    let target = s.client_target(grab.owner);
-                    if grab.pointer_mode == 0 {
-                        s.frozen_pointer_event = Some(event);
-                    }
-                    s.pointer_grab = Some((grab.owner, grab.grab_window));
-                    s.pointer_grab_is_passive = true;
-                    target
-                }
-                Err(_) => return,
-            };
-            if redirect_to_grab {
-                if let Some(target) = target_opt {
-                    let seq = SequenceNumber(target.last_sequence.load(Ordering::Relaxed));
-                    let mut buf = Vec::with_capacity(32);
-                    x11::encode_button_press_event(
-                        &mut buf,
-                        target.byte_order,
-                        x11::PointerEvent {
-                            sequence: seq,
-                            detail: event.detail,
-                            time: event.time,
-                            root: crate::resources::ROOT_WINDOW,
-                            event: grab.grab_window,
-                            root_x: event.root_x,
-                            root_y: event.root_y,
-                            event_x: event.event_x,
-                            event_y: event.event_y,
-                            child: ResourceId(0),
-                            state: event.state,
-                        },
-                    );
-                    if let Ok(mut w) = target.writer.lock() {
-                        let _ = w.write_all(&buf);
-                    }
-                }
-                return;
-            }
-        }
-    }
-
-    let top_level_id = match xid_map.get(&event.host_xid).copied() {
-        Some(id) => id,
-        None => return,
-    };
-    let mask_bit: u32 = match event.kind {
-        PointerEventKind::ButtonPress => 0x0000_0004,
-        PointerEventKind::ButtonRelease => 0x0000_0008,
-        PointerEventKind::MotionNotify => {
-            // PointerMotion (0x40), plus ButtonMotion (0x2000) and the
-            // matching ButtonNMotion bit for each currently held button.
-            // event.state bits 8..=12 are Button1..Button5.
-            let mut bits: u32 = 0x0000_0040;
-            let buttons_held = (event.state >> 8) & 0x1f;
-            if buttons_held != 0 {
-                bits |= 0x0000_2000;
-                for n in 0..5 {
-                    if buttons_held & (1 << n) != 0 {
-                        bits |= 0x0000_0100 << n;
-                    }
-                }
-            }
-            bits
-        }
-        PointerEventKind::EnterNotify => 0x0000_0010,
-        PointerEventKind::LeaveNotify => 0x0000_0020,
-    };
-    let xi2_evtype: u16 = match event.kind {
-        PointerEventKind::ButtonPress => 4,
-        PointerEventKind::ButtonRelease => 5,
-        PointerEventKind::MotionNotify => 6,
-        PointerEventKind::EnterNotify => 7,
-        PointerEventKind::LeaveNotify => 8,
-    };
-    // XI2 raw events fire alongside the device events when a client has
-    // selected XI_Raw* on the root window (xeyes uses RawMotion as a
-    // cursor-moved trigger, then calls XIQueryPointer for the position).
-    let xi2_raw_evtype: Option<u16> = match event.kind {
-        PointerEventKind::ButtonPress => Some(15), // XI_RawButtonPress
-        PointerEventKind::ButtonRelease => Some(16), // XI_RawButtonRelease
-        PointerEventKind::MotionNotify => Some(17), // XI_RawMotion
-        PointerEventKind::EnterNotify | PointerEventKind::LeaveNotify => None,
-    };
-
-    let (nested_id, event_x, event_y, core_targets, xi2_targets, xi2_raw_targets) = match state
-        .lock()
-    {
-        Ok(g) => {
-            let (target, target_x, target_y) = g
-                .root_pointer_target_at(event.root_x, event.root_y)
-                .or_else(|| g.pointer_target_at(top_level_id, event.event_x, event.event_y))
-                .unwrap_or((top_level_id, event.event_x, event.event_y));
-
-            // Walk up the parent chain to the first window any client is
-            // subscribed on. Without this, a click on a window that doesn't
-            // select pointer events (e.g. e16's full-screen "Root-bg" cover)
-            // never bubbles to root where the WM is listening.
-            let (nested_id, event_x, event_y, core_targets) = g
-                .pointer_propagation_target(target, target_x, target_y, mask_bit)
-                .unwrap_or((target, target_x, target_y, Vec::new()));
-
-            let mut xi2_targets = Vec::new();
-            let mut xi2_raw_targets = Vec::new();
-            if xi2_evtype != 0 {
-                for (cid, c) in g.clients.iter() {
-                    let mask = xi2_mask_for_client(c, target, top_level_id, &[4, 2, 1, 0]);
-                    trace!(
-                        "  xi2 lookup: client={} target=0x{:x} top_level=0x{:x} mask=0x{:x} want_bit={}",
-                        cid,
-                        target.0,
-                        top_level_id.0,
-                        mask,
-                        1u32 << xi2_evtype
-                    );
-                    if mask & (1 << xi2_evtype) != 0 {
-                        xi2_targets.push(ServerState::event_target_for_client(c));
-                    }
-                    // XI_Raw* events are typically selected on the root
-                    // window; xi2_mask_for_client falls back through
-                    // (target, fallback) so a root-window selection on
-                    // device 0/1/2 will be found when the cursor is over
-                    // any window.
-                    if let Some(raw_evtype) = xi2_raw_evtype
-                        && mask & (1 << raw_evtype) != 0
-                    {
-                        xi2_raw_targets.push(ServerState::event_target_for_client(c));
-                    }
-                    // Also probe the root window for raw events — clients
-                    // commonly select XI_Raw* on root with deviceid=1
-                    // (XIAllDevices). The lookup above already includes
-                    // (target, fallback=top_level); add an explicit root
-                    // fallback for raw events specifically.
-                    if let Some(raw_evtype) = xi2_raw_evtype {
-                        let root_mask = xi2_mask_for_client(
-                            c,
-                            crate::resources::ROOT_WINDOW,
-                            crate::resources::ROOT_WINDOW,
-                            &[1, 0, 4, 2],
-                        );
-                        if root_mask & (1 << raw_evtype) != 0
-                            // Avoid double-add if the per-target lookup
-                            // also found the same client via the same
-                            // selection.
-                            && !xi2_raw_targets
-                                .iter()
-                                .any(|t: &EventTarget| Arc::ptr_eq(&t.writer, &c.writer))
-                        {
-                            xi2_raw_targets.push(ServerState::event_target_for_client(c));
-                        }
-                    }
-                }
-            }
-
-            (
-                nested_id,
-                event_x,
-                event_y,
-                core_targets,
-                xi2_targets,
-                xi2_raw_targets,
-            )
-        }
-        Err(_) => return,
-    };
-
-    for target in core_targets {
-        let seq = SequenceNumber(target.last_sequence.load(Ordering::Relaxed));
-        let mut buf = Vec::with_capacity(32);
-        match event.kind {
-            PointerEventKind::ButtonPress => x11::encode_button_press_event(
-                &mut buf,
-                target.byte_order,
-                x11::PointerEvent {
-                    sequence: seq,
-                    detail: event.detail,
-                    time: event.time,
-                    root: crate::resources::ROOT_WINDOW,
-                    event: nested_id,
-                    root_x: event.root_x,
-                    root_y: event.root_y,
-                    event_x,
-                    event_y,
-                    child: ResourceId(0),
-                    state: event.state,
-                },
-            ),
-            PointerEventKind::ButtonRelease => x11::encode_button_release_event(
-                &mut buf,
-                target.byte_order,
-                x11::PointerEvent {
-                    sequence: seq,
-                    detail: event.detail,
-                    time: event.time,
-                    root: crate::resources::ROOT_WINDOW,
-                    event: nested_id,
-                    root_x: event.root_x,
-                    root_y: event.root_y,
-                    event_x,
-                    event_y,
-                    child: ResourceId(0),
-                    state: event.state,
-                },
-            ),
-            PointerEventKind::MotionNotify => x11::encode_motion_notify_event(
-                &mut buf,
-                target.byte_order,
-                x11::PointerEvent {
-                    sequence: seq,
-                    detail: 0,
-                    time: event.time,
-                    root: crate::resources::ROOT_WINDOW,
-                    event: nested_id,
-                    root_x: event.root_x,
-                    root_y: event.root_y,
-                    event_x,
-                    event_y,
-                    child: ResourceId(0),
-                    state: event.state,
-                },
-            ),
-            PointerEventKind::EnterNotify => x11::encode_enter_notify_event(
-                &mut buf,
-                target.byte_order,
-                x11::CrossingEvent {
-                    sequence: seq,
-                    time: event.time,
-                    root: crate::resources::ROOT_WINDOW,
-                    event: nested_id,
-                    child: ResourceId(event.child),
-                    root_x: event.root_x,
-                    root_y: event.root_y,
-                    event_x,
-                    event_y,
-                    state: event.state,
-                    detail: event.detail,
-                    mode: event.crossing_mode,
-                },
-            ),
-            PointerEventKind::LeaveNotify => x11::encode_leave_notify_event(
-                &mut buf,
-                target.byte_order,
-                x11::CrossingEvent {
-                    sequence: seq,
-                    time: event.time,
-                    root: crate::resources::ROOT_WINDOW,
-                    event: nested_id,
-                    child: ResourceId(event.child),
-                    root_x: event.root_x,
-                    root_y: event.root_y,
-                    event_x,
-                    event_y,
-                    state: event.state,
-                    detail: event.detail,
-                    mode: event.crossing_mode,
-                },
-            ),
-        }
-        if let Ok(mut w) = target.writer.lock() {
-            let _ = w.write_all(&buf);
-        }
-    }
-
-    for target in xi2_raw_targets {
-        let Some(raw_evtype) = xi2_raw_evtype else {
-            break;
-        };
-        let seq = SequenceNumber(target.last_sequence.load(Ordering::Relaxed));
-        let mut buf = Vec::with_capacity(68);
-        x11::encode_xi2_raw_event(
-            &mut buf,
-            target.byte_order,
-            seq,
-            137, // XI2 major opcode
-            raw_evtype,
-            2, // deviceid: Master Pointer
-            event.time,
-            u32::from(event.detail),
-            2, // sourceid: Master Pointer
-            i32::from(event.root_x),
-            i32::from(event.root_y),
-        );
-        if let Ok(mut w) = target.writer.lock() {
-            let _ = w.write_all(&buf);
-        }
-    }
-
-    for target in xi2_targets {
-        let seq = SequenceNumber(target.last_sequence.load(Ordering::Relaxed));
-        let mut buf = Vec::with_capacity(84);
-        if matches!(
-            event.kind,
-            PointerEventKind::EnterNotify | PointerEventKind::LeaveNotify
-        ) {
-            x11::encode_xi2_crossing_event(
-                &mut buf,
-                target.byte_order,
-                seq,
-                137,
-                xi2_evtype,
-                2,
-                event.time,
-                crate::resources::ROOT_WINDOW,
-                nested_id,
-                event.root_x,
-                event.root_y,
-                event_x,
-                event_y,
-                event.state,
-                0,
-                0,
-                2,
-            );
-        } else {
-            // Pre-D3 legacy emitter (state.fanout_pointer). Mirror the
-            // D3 fanout's XIPointerEmulated handling for scroll-wheel
-            // emulation; same rationale as in
-            // `core_loop::pointer_fanout`.
-            let xi2_flags: u32 = if matches!(
-                event.kind,
-                crate::host_x11::PointerEventKind::ButtonPress
-                    | crate::host_x11::PointerEventKind::ButtonRelease
-            ) && (4..=7).contains(&event.detail)
-            {
-                x11::XI_POINTER_EMULATED
-            } else {
-                0
-            };
-            x11::encode_xi2_device_event(
-                &mut buf,
-                target.byte_order,
-                seq,
-                137, // XI2 major opcode
-                xi2_evtype,
-                2, // deviceid: Master Pointer
-                event.time,
-                crate::resources::ROOT_WINDOW,
-                nested_id,
-                ResourceId(0), // XI2 doesn't propagate; child=None for hit-target events
-                event.root_x,
-                event.root_y,
-                event_x,
-                event_y,
-                event.state,
-                u32::from(event.detail),
-                2,
-                xi2_flags,
-            );
-        }
-        if let Ok(mut w) = target.writer.lock() {
-            let _ = w.write_all(&buf);
-        }
-    }
 }
 
 /// Highest-first evaluation of "given current level + idle time, what
@@ -3292,760 +2735,6 @@ mod tests {
     }
 
     #[test]
-    fn replay_pointer_delivers_to_button_press_window_not_grab_owner() {
-        use std::{
-            collections::HashMap as StdHashMap,
-            io::{ErrorKind, Read},
-            sync::Mutex as StdMutex,
-        };
-
-        use crate::host_x11::{HostPointerEvent, PointerEventKind};
-
-        let (grab_writer_local, mut grab_reader_remote) = UnixStream::pair().expect("socketpair");
-        let (target_writer_local, mut target_reader_remote) =
-            UnixStream::pair().expect("socketpair");
-        grab_reader_remote.set_nonblocking(true).unwrap();
-        target_reader_remote.set_nonblocking(true).unwrap();
-
-        let state = StdMutex::new(ServerState::new());
-        {
-            let mut s = state.lock().unwrap();
-            let grab_window = ResourceId(0x0010_0002);
-            let target_window = ResourceId(0x0020_0002);
-            s.resources.create_window(
-                ClientId(1),
-                yserver_protocol::x11::CreateWindowRequest {
-                    depth: 24,
-                    window: grab_window,
-                    parent: crate::resources::ROOT_WINDOW,
-                    x: 0,
-                    y: 0,
-                    width: 100,
-                    height: 100,
-                    border_width: 0,
-                    class: 1,
-                    visual: crate::resources::ROOT_VISUAL,
-                    ..Default::default()
-                },
-            );
-            s.resources.create_window(
-                ClientId(2),
-                yserver_protocol::x11::CreateWindowRequest {
-                    depth: 24,
-                    window: target_window,
-                    parent: crate::resources::ROOT_WINDOW,
-                    x: 0,
-                    y: 0,
-                    width: 100,
-                    height: 100,
-                    border_width: 0,
-                    class: 1,
-                    visual: crate::resources::ROOT_VISUAL,
-                    ..Default::default()
-                },
-            );
-            let _ = s.resources.map_window(grab_window);
-            let _ = s.resources.map_window(target_window);
-            s.clients.insert(
-                1,
-                ClientState {
-                    writer: Arc::new(Mutex::new(grab_writer_local)),
-                    byte_order: ClientByteOrder::LittleEndian,
-                    last_sequence: Arc::new(AtomicU16::new(0)),
-                    resource_id_base: 0x0010_0000,
-                    resource_id_mask: 0x000F_FFFF,
-                    event_masks: HashMap::from([(grab_window, 0x0000_0004)]),
-                    save_set: HashSet::new(),
-                    big_requests_enabled: false,
-                    xi2_masks: HashMap::new(),
-                    xi1_event_classes: HashSet::new(),
-                    xi1_window_event_classes: HashMap::new(),
-                    outbound: std::collections::VecDeque::new(),
-                    watching_writable: false,
-                    focused_window: crate::resources::ROOT_WINDOW,
-                    reader_control: None,
-                },
-            );
-            s.clients.insert(
-                2,
-                ClientState {
-                    writer: Arc::new(Mutex::new(target_writer_local)),
-                    byte_order: ClientByteOrder::LittleEndian,
-                    last_sequence: Arc::new(AtomicU16::new(0)),
-                    resource_id_base: 0x0020_0000,
-                    resource_id_mask: 0x000F_FFFF,
-                    event_masks: HashMap::from([(target_window, 0x0000_0004)]),
-                    save_set: HashSet::new(),
-                    big_requests_enabled: false,
-                    xi2_masks: HashMap::new(),
-                    xi1_event_classes: HashSet::new(),
-                    xi1_window_event_classes: HashMap::new(),
-                    outbound: std::collections::VecDeque::new(),
-                    watching_writable: false,
-                    focused_window: crate::resources::ROOT_WINDOW,
-                    reader_control: None,
-                },
-            );
-            s.pointer_grab = Some((ClientId(1), grab_window));
-            s.pointer_grab_is_passive = true;
-            assert_eq!(s.subscribers(grab_window, 0x0000_0004).len(), 1);
-            assert_eq!(s.subscribers(target_window, 0x0000_0004).len(), 1);
-            assert!(s.resources.window(target_window).is_some());
-            assert!(
-                s.resources
-                    .pointer_target_at(target_window, 10, 10)
-                    .is_some()
-            );
-            assert!(
-                s.pointer_propagation_target(target_window, 10, 10, 0x0000_0004)
-                    .is_some()
-            );
-        }
-
-        let mut map = StdHashMap::new();
-        map.insert(0xCAFE_u32, ResourceId(0x0020_0002));
-        let xid_map = map;
-
-        route_button_press_no_grab(
-            &state,
-            &xid_map,
-            HostPointerEvent {
-                kind: PointerEventKind::ButtonPress,
-                host_xid: 0xCAFE,
-                detail: 1,
-                time: 0,
-                root_x: 10,
-                root_y: 10,
-                event_x: 10,
-                event_y: 10,
-                state: 0,
-                crossing_mode: 0,
-                child: 0,
-            },
-        );
-
-        let mut buf = [0u8; 32];
-        let grab_read = grab_reader_remote.read(&mut buf);
-        assert!(
-            matches!(grab_read, Err(ref e) if e.kind() == ErrorKind::WouldBlock),
-            "grab owner must not receive replayed ButtonPress; got {grab_read:?}",
-        );
-        let target_read = target_reader_remote.read(&mut buf);
-        assert!(
-            matches!(target_read, Ok(32)),
-            "target window subscriber should receive replayed ButtonPress; got {target_read:?}",
-        );
-        assert_eq!(buf[0], 4, "event type should be ButtonPress");
-        assert_eq!(&buf[12..16], &0x0020_0002u32.to_le_bytes());
-    }
-
-    #[test]
-    fn passive_grab_owner_events_keeps_child_delivery_on_owned_windows() {
-        use std::{
-            collections::HashMap as StdHashMap,
-            io::{ErrorKind, Read},
-            sync::Mutex as StdMutex,
-        };
-
-        use crate::host_x11::{HostPointerEvent, PointerEventKind};
-
-        let (grab_writer_local, mut grab_reader_remote) = UnixStream::pair().expect("socketpair");
-        let (child_writer_local, mut child_reader_remote) = UnixStream::pair().expect("socketpair");
-        grab_reader_remote.set_nonblocking(true).unwrap();
-        child_reader_remote.set_nonblocking(true).unwrap();
-
-        let state = StdMutex::new(ServerState::new());
-        {
-            let mut s = state.lock().unwrap();
-            let grab_window = ResourceId(0x0010_0002);
-            let child_window = ResourceId(0x0010_0003);
-            s.resources.create_window(
-                ClientId(1),
-                yserver_protocol::x11::CreateWindowRequest {
-                    depth: 24,
-                    window: grab_window,
-                    parent: crate::resources::ROOT_WINDOW,
-                    x: 0,
-                    y: 0,
-                    width: 100,
-                    height: 100,
-                    border_width: 0,
-                    class: 1,
-                    visual: crate::resources::ROOT_VISUAL,
-                    ..Default::default()
-                },
-            );
-            s.resources.create_window(
-                ClientId(1),
-                yserver_protocol::x11::CreateWindowRequest {
-                    depth: 24,
-                    window: child_window,
-                    parent: grab_window,
-                    x: 10,
-                    y: 10,
-                    width: 40,
-                    height: 40,
-                    border_width: 0,
-                    class: 1,
-                    visual: crate::resources::ROOT_VISUAL,
-                    ..Default::default()
-                },
-            );
-            let _ = s.resources.map_window(grab_window);
-            let _ = s.resources.map_window(child_window);
-            s.clients.insert(
-                1,
-                ClientState {
-                    writer: Arc::new(Mutex::new(grab_writer_local)),
-                    byte_order: ClientByteOrder::LittleEndian,
-                    last_sequence: Arc::new(AtomicU16::new(0)),
-                    resource_id_base: 0x0010_0000,
-                    resource_id_mask: 0x000F_FFFF,
-                    event_masks: HashMap::from([(grab_window, 0x0000_0004)]),
-                    save_set: HashSet::new(),
-                    big_requests_enabled: false,
-                    xi2_masks: HashMap::new(),
-                    xi1_event_classes: HashSet::new(),
-                    xi1_window_event_classes: HashMap::new(),
-                    outbound: std::collections::VecDeque::new(),
-                    watching_writable: false,
-                    focused_window: crate::resources::ROOT_WINDOW,
-                    reader_control: None,
-                },
-            );
-            s.clients.insert(
-                2,
-                ClientState {
-                    writer: Arc::new(Mutex::new(child_writer_local)),
-                    byte_order: ClientByteOrder::LittleEndian,
-                    last_sequence: Arc::new(AtomicU16::new(0)),
-                    resource_id_base: 0x0020_0000,
-                    resource_id_mask: 0x000F_FFFF,
-                    event_masks: HashMap::from([(child_window, 0x0000_0004)]),
-                    save_set: HashSet::new(),
-                    big_requests_enabled: false,
-                    xi2_masks: HashMap::new(),
-                    xi1_event_classes: HashSet::new(),
-                    xi1_window_event_classes: HashMap::new(),
-                    outbound: std::collections::VecDeque::new(),
-                    watching_writable: false,
-                    focused_window: crate::resources::ROOT_WINDOW,
-                    reader_control: None,
-                },
-            );
-            s.pointer_grab = Some((ClientId(1), grab_window));
-            s.pointer_grab_is_passive = true;
-            s.button_grabs.push(PassiveButtonGrab {
-                owner: ClientId(1),
-                grab_window,
-                button: 1,
-                modifiers: 0,
-                owner_events: true,
-                event_mask: 0xFFFF_FFFF,
-                pointer_mode: 0,
-                keyboard_mode: 1,
-                confine_to: ResourceId(0),
-                via_xi2: true,
-            });
-        }
-
-        let mut map = StdHashMap::new();
-        map.insert(0xCAFE_u32, ResourceId(0x0010_0002));
-        let xid_map = map;
-
-        pointer_event_fanout(
-            &state,
-            &xid_map,
-            HostPointerEvent {
-                kind: PointerEventKind::ButtonPress,
-                host_xid: 0xCAFE,
-                detail: 1,
-                time: 0,
-                root_x: 20,
-                root_y: 20,
-                event_x: 20,
-                event_y: 20,
-                state: 0,
-                crossing_mode: 0,
-                child: 0,
-            },
-        );
-
-        let mut buf = [0u8; 32];
-        let child_read = child_reader_remote.read(&mut buf);
-        assert!(
-            matches!(child_read, Ok(32)),
-            "owner_events=true passive grab must still deliver to the owned child; got {child_read:?}",
-        );
-        assert_eq!(buf[0], 4, "event type should be ButtonPress");
-        assert_eq!(&buf[12..16], &0x0010_0003u32.to_le_bytes());
-
-        let grab_read = grab_reader_remote.read(&mut buf);
-        assert!(
-            matches!(grab_read, Err(ref e) if e.kind() == ErrorKind::WouldBlock),
-            "owner_events=true passive grab must not redirect owned-child clicks to the grab owner; got {grab_read:?}",
-        );
-    }
-
-    #[test]
-    fn passive_grab_owner_events_keeps_descendant_delivery_even_when_child_owned_elsewhere() {
-        use std::{
-            collections::HashMap as StdHashMap,
-            io::{ErrorKind, Read},
-            sync::Mutex as StdMutex,
-        };
-
-        use crate::host_x11::{HostPointerEvent, PointerEventKind};
-
-        let (grab_writer_local, mut grab_reader_remote) = UnixStream::pair().expect("socketpair");
-        let (child_writer_local, mut child_reader_remote) = UnixStream::pair().expect("socketpair");
-        grab_reader_remote.set_nonblocking(true).unwrap();
-        child_reader_remote.set_nonblocking(true).unwrap();
-
-        let state = StdMutex::new(ServerState::new());
-        {
-            let mut s = state.lock().unwrap();
-            let grab_window = ResourceId(0x0010_0010);
-            let child_window = ResourceId(0x0010_0011);
-            s.resources.create_window(
-                ClientId(1),
-                yserver_protocol::x11::CreateWindowRequest {
-                    depth: 24,
-                    window: grab_window,
-                    parent: crate::resources::ROOT_WINDOW,
-                    x: 0,
-                    y: 0,
-                    width: 100,
-                    height: 100,
-                    border_width: 0,
-                    class: 1,
-                    visual: crate::resources::ROOT_VISUAL,
-                    ..Default::default()
-                },
-            );
-            s.resources.create_window(
-                ClientId(2),
-                yserver_protocol::x11::CreateWindowRequest {
-                    depth: 24,
-                    window: child_window,
-                    parent: grab_window,
-                    x: 10,
-                    y: 10,
-                    width: 40,
-                    height: 40,
-                    border_width: 0,
-                    class: 1,
-                    visual: crate::resources::ROOT_VISUAL,
-                    ..Default::default()
-                },
-            );
-            let _ = s.resources.map_window(grab_window);
-            let _ = s.resources.map_window(child_window);
-            s.clients.insert(
-                1,
-                ClientState {
-                    writer: Arc::new(Mutex::new(grab_writer_local)),
-                    byte_order: ClientByteOrder::LittleEndian,
-                    last_sequence: Arc::new(AtomicU16::new(0)),
-                    resource_id_base: 0x0010_0000,
-                    resource_id_mask: 0x000F_FFFF,
-                    event_masks: HashMap::from([(grab_window, 0x0000_0004)]),
-                    save_set: HashSet::new(),
-                    big_requests_enabled: false,
-                    xi2_masks: HashMap::new(),
-                    xi1_event_classes: HashSet::new(),
-                    xi1_window_event_classes: HashMap::new(),
-                    outbound: std::collections::VecDeque::new(),
-                    watching_writable: false,
-                    focused_window: crate::resources::ROOT_WINDOW,
-                    reader_control: None,
-                },
-            );
-            s.clients.insert(
-                2,
-                ClientState {
-                    writer: Arc::new(Mutex::new(child_writer_local)),
-                    byte_order: ClientByteOrder::LittleEndian,
-                    last_sequence: Arc::new(AtomicU16::new(0)),
-                    resource_id_base: 0x0020_0000,
-                    resource_id_mask: 0x000F_FFFF,
-                    event_masks: HashMap::from([(child_window, 0x0000_0004)]),
-                    save_set: HashSet::new(),
-                    big_requests_enabled: false,
-                    xi2_masks: HashMap::new(),
-                    xi1_event_classes: HashSet::new(),
-                    xi1_window_event_classes: HashMap::new(),
-                    outbound: std::collections::VecDeque::new(),
-                    watching_writable: false,
-                    focused_window: crate::resources::ROOT_WINDOW,
-                    reader_control: None,
-                },
-            );
-            s.pointer_grab = Some((ClientId(1), grab_window));
-            s.pointer_grab_is_passive = true;
-            s.button_grabs.push(PassiveButtonGrab {
-                owner: ClientId(1),
-                grab_window,
-                button: 1,
-                modifiers: 0,
-                owner_events: true,
-                event_mask: 0xFFFF_FFFF,
-                pointer_mode: 0,
-                keyboard_mode: 1,
-                confine_to: ResourceId(0),
-                via_xi2: true,
-            });
-        }
-
-        let mut map = StdHashMap::new();
-        map.insert(0xCAFE_u32, ResourceId(0x0010_0010));
-        let xid_map = map;
-
-        pointer_event_fanout(
-            &state,
-            &xid_map,
-            HostPointerEvent {
-                kind: PointerEventKind::ButtonPress,
-                host_xid: 0xCAFE,
-                detail: 1,
-                time: 0,
-                root_x: 20,
-                root_y: 20,
-                event_x: 20,
-                event_y: 20,
-                state: 0,
-                crossing_mode: 0,
-                child: 0,
-            },
-        );
-
-        let mut buf = [0u8; 32];
-        let child_read = child_reader_remote.read(&mut buf);
-        assert!(
-            matches!(child_read, Ok(32)),
-            "owner_events=true passive grab must still deliver to the descendant child even when another client owns it; got {child_read:?}",
-        );
-        let grab_read = grab_reader_remote.read(&mut buf);
-        assert!(
-            matches!(grab_read, Err(ref e) if e.kind() == ErrorKind::WouldBlock),
-            "owner_events=true passive grab must not redirect descendant clicks to the grab owner; got {grab_read:?}",
-        );
-    }
-
-    #[test]
-    fn pointer_event_fanout_filters_by_mask() {
-        use std::{collections::HashMap as StdHashMap, sync::Mutex as StdMutex};
-
-        use crate::host_x11::{HostPointerEvent, PointerEventKind};
-
-        // Client A: ButtonPress on window 0x0010_0002.
-        let (a_writer_local, _a_reader_remote) = UnixStream::pair().expect("socketpair");
-        // Client B: MotionNotify on window 0x0010_0002.
-        let (b_writer_local, _b_reader_remote) = UnixStream::pair().expect("socketpair");
-        // Client C: no pointer events at all.
-        let (c_writer_local, _c_reader_remote) = UnixStream::pair().expect("socketpair");
-
-        let state = StdMutex::new(ServerState::new());
-        {
-            let mut s = state.lock().unwrap();
-            s.clients.insert(
-                1,
-                ClientState {
-                    writer: Arc::new(Mutex::new(a_writer_local)),
-                    byte_order: ClientByteOrder::LittleEndian,
-                    last_sequence: Arc::new(AtomicU16::new(0)),
-                    resource_id_base: 0x0010_0000,
-                    resource_id_mask: 0x000F_FFFF,
-                    event_masks: HashMap::from([(ResourceId(0x0010_0002), 0x0000_0004)]), // ButtonPress
-                    save_set: HashSet::new(),
-                    big_requests_enabled: false,
-                    xi2_masks: HashMap::new(),
-                    xi1_event_classes: HashSet::new(),
-                    xi1_window_event_classes: HashMap::new(),
-                    outbound: std::collections::VecDeque::new(),
-                    watching_writable: false,
-                    focused_window: crate::resources::ROOT_WINDOW,
-                    reader_control: None,
-                },
-            );
-            s.clients.insert(
-                2,
-                ClientState {
-                    writer: Arc::new(Mutex::new(b_writer_local)),
-                    byte_order: ClientByteOrder::LittleEndian,
-                    last_sequence: Arc::new(AtomicU16::new(0)),
-                    resource_id_base: 0x0020_0000,
-                    resource_id_mask: 0x000F_FFFF,
-                    event_masks: HashMap::from([(ResourceId(0x0010_0002), 0x0000_0040)]), // PointerMotion
-                    save_set: HashSet::new(),
-                    big_requests_enabled: false,
-                    xi2_masks: HashMap::new(),
-                    xi1_event_classes: HashSet::new(),
-                    xi1_window_event_classes: HashMap::new(),
-                    outbound: std::collections::VecDeque::new(),
-                    watching_writable: false,
-                    focused_window: crate::resources::ROOT_WINDOW,
-                    reader_control: None,
-                },
-            );
-            s.clients.insert(
-                3,
-                ClientState {
-                    writer: Arc::new(Mutex::new(c_writer_local)),
-                    byte_order: ClientByteOrder::LittleEndian,
-                    last_sequence: Arc::new(AtomicU16::new(0)),
-                    resource_id_base: 0x0030_0000,
-                    resource_id_mask: 0x000F_FFFF,
-                    event_masks: HashMap::new(),
-                    save_set: HashSet::new(),
-                    big_requests_enabled: false,
-                    xi2_masks: HashMap::new(),
-                    xi1_event_classes: HashSet::new(),
-                    xi1_window_event_classes: HashMap::new(),
-                    outbound: std::collections::VecDeque::new(),
-                    watching_writable: false,
-                    focused_window: crate::resources::ROOT_WINDOW,
-                    reader_control: None,
-                },
-            );
-        }
-
-        let mut map = StdHashMap::new();
-        map.insert(0xCAFE_u32, ResourceId(0x0010_0002));
-        let xid_map = map;
-
-        pointer_event_fanout(
-            &state,
-            &xid_map,
-            HostPointerEvent {
-                kind: PointerEventKind::ButtonPress,
-                host_xid: 0xCAFE,
-                detail: 1,
-                time: 0,
-                root_x: 1,
-                root_y: 2,
-                event_x: 3,
-                event_y: 4,
-                state: 0,
-                crossing_mode: 0,
-                child: 0,
-            },
-        );
-
-        let s = state.lock().unwrap();
-        assert_eq!(
-            s.subscribers(ResourceId(0x0010_0002), 0x0000_0004).len(),
-            1,
-            "only client A selected ButtonPress"
-        );
-        assert_eq!(
-            s.subscribers(ResourceId(0x0010_0002), 0x0000_0040).len(),
-            1,
-            "only client B selected MotionNotify"
-        );
-    }
-
-    #[test]
-    fn pointer_event_fanout_delivers_motion_under_button_motion_mask() {
-        use std::{
-            collections::HashMap as StdHashMap,
-            io::{ErrorKind, Read},
-            sync::Mutex as StdMutex,
-        };
-
-        use crate::host_x11::{HostPointerEvent, PointerEventKind};
-
-        // Client A: subscribes to ButtonMotion (0x2000) only. Mirrors
-        // wmaker's frame mask: it expects motion while a button is held.
-        let (a_writer_local, mut a_reader_remote) = UnixStream::pair().expect("socketpair");
-        // Client B: no motion mask at all — must not receive anything.
-        let (b_writer_local, mut b_reader_remote) = UnixStream::pair().expect("socketpair");
-
-        a_reader_remote.set_nonblocking(true).unwrap();
-        b_reader_remote.set_nonblocking(true).unwrap();
-
-        let state = StdMutex::new(ServerState::new());
-        {
-            let mut s = state.lock().unwrap();
-            // Top-level window so pointer_target_at returns the same id.
-            s.resources.create_window(
-                ClientId(1),
-                yserver_protocol::x11::CreateWindowRequest {
-                    depth: 24,
-                    window: ResourceId(0x0010_0002),
-                    parent: crate::resources::ROOT_WINDOW,
-                    x: 0,
-                    y: 0,
-                    width: 100,
-                    height: 100,
-                    border_width: 0,
-                    class: 1,
-                    visual: crate::resources::ROOT_VISUAL,
-                    ..Default::default()
-                },
-            );
-            let _ = s.resources.map_window(ResourceId(0x0010_0002));
-            s.clients.insert(
-                1,
-                ClientState {
-                    writer: Arc::new(Mutex::new(a_writer_local)),
-                    byte_order: ClientByteOrder::LittleEndian,
-                    last_sequence: Arc::new(AtomicU16::new(0)),
-                    resource_id_base: 0x0010_0000,
-                    resource_id_mask: 0x000F_FFFF,
-                    event_masks: HashMap::from([(ResourceId(0x0010_0002), 0x0000_2000)]),
-                    save_set: HashSet::new(),
-                    big_requests_enabled: false,
-                    xi2_masks: HashMap::new(),
-                    xi1_event_classes: HashSet::new(),
-                    xi1_window_event_classes: HashMap::new(),
-                    outbound: std::collections::VecDeque::new(),
-                    watching_writable: false,
-                    focused_window: crate::resources::ROOT_WINDOW,
-                    reader_control: None,
-                },
-            );
-            s.clients.insert(
-                2,
-                ClientState {
-                    writer: Arc::new(Mutex::new(b_writer_local)),
-                    byte_order: ClientByteOrder::LittleEndian,
-                    last_sequence: Arc::new(AtomicU16::new(0)),
-                    resource_id_base: 0x0020_0000,
-                    resource_id_mask: 0x000F_FFFF,
-                    event_masks: HashMap::new(),
-                    save_set: HashSet::new(),
-                    big_requests_enabled: false,
-                    xi2_masks: HashMap::new(),
-                    xi1_event_classes: HashSet::new(),
-                    xi1_window_event_classes: HashMap::new(),
-                    outbound: std::collections::VecDeque::new(),
-                    watching_writable: false,
-                    focused_window: crate::resources::ROOT_WINDOW,
-                    reader_control: None,
-                },
-            );
-        }
-
-        let mut map = StdHashMap::new();
-        map.insert(0xCAFE_u32, ResourceId(0x0010_0002));
-        let xid_map = map;
-
-        // Motion with button 1 held (state bit 8 == 0x100).
-        pointer_event_fanout(
-            &state,
-            &xid_map,
-            HostPointerEvent {
-                kind: PointerEventKind::MotionNotify,
-                host_xid: 0xCAFE,
-                detail: 0,
-                time: 0,
-                root_x: 5,
-                root_y: 5,
-                event_x: 5,
-                event_y: 5,
-                state: 0x0100,
-                crossing_mode: 0,
-                child: 0,
-            },
-        );
-
-        let mut buf = [0u8; 32];
-        let a_read = a_reader_remote.read(&mut buf);
-        assert!(
-            matches!(a_read, Ok(32)),
-            "client with ButtonMotion mask should receive 32-byte MotionNotify when a button is held; got {a_read:?}",
-        );
-        assert_eq!(buf[0], 6, "event type should be MotionNotify");
-
-        let b_read = b_reader_remote.read(&mut buf);
-        assert!(
-            matches!(b_read, Err(ref e) if e.kind() == ErrorKind::WouldBlock),
-            "client with no motion mask must not receive motion; got {b_read:?}",
-        );
-
-        // Motion without any button held: ButtonMotion subscriber must NOT receive.
-        pointer_event_fanout(
-            &state,
-            &xid_map,
-            HostPointerEvent {
-                kind: PointerEventKind::MotionNotify,
-                host_xid: 0xCAFE,
-                detail: 0,
-                time: 0,
-                root_x: 5,
-                root_y: 5,
-                event_x: 5,
-                event_y: 5,
-                state: 0,
-                crossing_mode: 0,
-                child: 0,
-            },
-        );
-        let a_read2 = a_reader_remote.read(&mut buf);
-        assert!(
-            matches!(a_read2, Err(ref e) if e.kind() == ErrorKind::WouldBlock),
-            "ButtonMotion-only subscriber must NOT receive motion when no button is held; got {a_read2:?}",
-        );
-    }
-
-    #[test]
-    fn pointer_event_fanout_drops_unknown_host_xid() {
-        use std::{collections::HashMap as StdHashMap, sync::Mutex as StdMutex};
-
-        use crate::host_x11::{HostPointerEvent, PointerEventKind};
-
-        let (a_writer_local, _a_reader_remote) = UnixStream::pair().expect("socketpair");
-
-        let state = StdMutex::new(ServerState::new());
-        {
-            let mut s = state.lock().unwrap();
-            s.clients.insert(
-                1,
-                ClientState {
-                    writer: Arc::new(Mutex::new(a_writer_local)),
-                    byte_order: ClientByteOrder::LittleEndian,
-                    last_sequence: Arc::new(AtomicU16::new(0)),
-                    resource_id_base: 0x0010_0000,
-                    resource_id_mask: 0x000F_FFFF,
-                    event_masks: HashMap::from([(ResourceId(0x0010_0002), 0x0000_0004)]),
-                    save_set: HashSet::new(),
-                    big_requests_enabled: false,
-                    xi2_masks: HashMap::new(),
-                    xi1_event_classes: HashSet::new(),
-                    xi1_window_event_classes: HashMap::new(),
-                    outbound: std::collections::VecDeque::new(),
-                    watching_writable: false,
-                    focused_window: crate::resources::ROOT_WINDOW,
-                    reader_control: None,
-                },
-            );
-        }
-
-        let xid_map: crate::host_x11::HostXidMap = StdHashMap::new(); // empty
-
-        pointer_event_fanout(
-            &state,
-            &xid_map,
-            HostPointerEvent {
-                kind: PointerEventKind::ButtonPress,
-                host_xid: 0xCAFE, // not in map
-                detail: 1,
-                time: 0,
-                root_x: 0,
-                root_y: 0,
-                event_x: 0,
-                event_y: 0,
-                state: 0,
-                crossing_mode: 0,
-                child: 0,
-            },
-        );
-
-        assert!(state.lock().unwrap().clients.contains_key(&1));
-    }
-
-    #[test]
     fn key_grab_lookup_exact_match() {
         let mut s = ServerState::new();
         let win = ResourceId(0x42);
@@ -4434,6 +3123,113 @@ mod tests {
             0,
             "COW's default input shape rects are empty (click-through)"
         );
+    }
+
+    /// Helper: a mapped 100x100 child of root at (0,0), client 1.
+    #[cfg(test)]
+    fn make_root_child_100(state: &mut ServerState, id: ResourceId) {
+        use crate::resources::{ROOT_VISUAL, ROOT_WINDOW};
+        use yserver_protocol::x11::CreateWindowRequest;
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: id,
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(id);
+    }
+
+    #[test]
+    fn hit_test_bounding_only_shape_excludes_outside_bounding() {
+        use crate::resources::ROOT_WINDOW;
+        use yserver_protocol::x11::xfixes;
+
+        let mut state = ServerState::new();
+        let win = ResourceId(0x0010_0080);
+        make_root_child_100(&mut state, win);
+        // Bounding-only shape: top-left quadrant. No input shape.
+        state.shape_windows.entry(win).or_default().bounding = Some(vec![xfixes::RegionRect {
+            x: 0,
+            y: 0,
+            width: 50,
+            height: 50,
+        }]);
+
+        // Inside bounding -> hits the window.
+        let (inside, _, _) = state.root_pointer_target_at(25, 25).expect("hit");
+        assert_eq!(inside, win, "point inside bounding shape hits the window");
+
+        // Inside geometry but outside bounding -> falls through to root.
+        let (outside, _, _) = state.root_pointer_target_at(75, 75).expect("hit");
+        assert_eq!(
+            outside, ROOT_WINDOW,
+            "point outside bounding shape is not hittable (Xorg bounding gate)"
+        );
+    }
+
+    #[test]
+    fn hit_test_both_shapes_set_requires_conjunction() {
+        use crate::resources::ROOT_WINDOW;
+        use yserver_protocol::x11::xfixes;
+
+        let mut state = ServerState::new();
+        let win = ResourceId(0x0010_0080);
+        make_root_child_100(&mut state, win);
+        // Bounding = left half (x<50). Input = top half (y<50). The input
+        // region extends partially outside the bounding region (x>=50).
+        let shape = state.shape_windows.entry(win).or_default();
+        shape.bounding = Some(vec![xfixes::RegionRect {
+            x: 0,
+            y: 0,
+            width: 50,
+            height: 100,
+        }]);
+        shape.input = Some(vec![xfixes::RegionRect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 50,
+        }]);
+
+        // In both (left AND top) -> hit. This distinguishes the Xorg
+        // conjunction from the old `input.or_else(bounding)`.
+        let (both, _, _) = state.root_pointer_target_at(25, 25).expect("hit");
+        assert_eq!(both, win, "point inside both shapes hits the window");
+
+        // In input but outside bounding (right-top) -> miss. `or_else` would
+        // have wrongly hit here because it tests only the input region.
+        let (input_only, _, _) = state.root_pointer_target_at(75, 25).expect("hit");
+        assert_eq!(
+            input_only, ROOT_WINDOW,
+            "in input but outside bounding must miss (conjunction, not or_else)"
+        );
+
+        // In bounding but outside input (left-bottom) -> miss.
+        let (bounding_only, _, _) = state.root_pointer_target_at(25, 75).expect("hit");
+        assert_eq!(
+            bounding_only, ROOT_WINDOW,
+            "in bounding but outside input must miss (conjunction)"
+        );
+    }
+
+    #[test]
+    fn hit_test_no_shape_is_full_rect_opaque() {
+        let mut state = ServerState::new();
+        let win = ResourceId(0x0010_0080);
+        make_root_child_100(&mut state, win);
+        // No shape_windows entry at all (both None) -> full-rect hittable.
+        let (target, _, _) = state.root_pointer_target_at(99, 99).expect("hit");
+        assert_eq!(target, win, "no shape => full window rect is opaque");
     }
 
     #[test]

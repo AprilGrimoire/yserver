@@ -1,6 +1,6 @@
 //! Core-side event fanout helpers — the state-borrowing replacements
-//! for `server::fanout_event` / `server::fanout_raw_event` /
-//! `server::pointer_event_fanout`.
+//! for `server::fanout_event` / `server::fanout_raw_event`. Pointer
+//! delivery lives in `pointer_fanout::pointer_event_fanout_to_state`.
 //!
 //! Each helper takes `&mut ServerState` so it can update each
 //! client's `last_sequence`, encode against the client's

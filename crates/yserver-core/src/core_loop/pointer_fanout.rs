@@ -1,4 +1,6 @@
-//! State-borrowing replacement for `server::pointer_event_fanout`.
+//! State-borrowing pointer-event fanout — `pointer_event_fanout_to_state`
+//! is the single live pointer delivery path (the former
+//! `server::pointer_event_fanout` it replaced has been removed).
 //!
 //! Mirrors the pre-lift logic from `server.rs`:
 //!   * translate root_x/root_y from host-screen coords to ynest-root,
@@ -2094,6 +2096,582 @@ mod tests {
             state.pointer_grab,
             Some((ClientId(1), grab_window)),
             "passive grab must be active for client 1",
+        );
+    }
+
+    /// Core-first resolution: an event whose `host_xid` is unknown to
+    /// `xid_map` is NOT dropped — the target is resolved from root
+    /// coordinates via the core hit-test and the core event still
+    /// delivers. Replaces the dead `pointer_event_fanout_drops_unknown_host_xid`
+    /// test, which asserted the opposite (the now-removed early drop).
+    #[test]
+    fn pointer_event_core_first_resolves_unknown_host_xid() {
+        use yserver_protocol::x11::{CreateWindowRequest, ResourceId};
+
+        let mut state = ServerState::new();
+        let window = ResourceId(0x0010_0002);
+        let mut peer = install_client(&mut state, 1);
+
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window,
+                parent: crate::resources::ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(window);
+        state
+            .clients
+            .get_mut(&1)
+            .unwrap()
+            .event_masks
+            .insert(window, 0x0000_0004);
+
+        // host_xid 0xDEAD is deliberately absent from xid_map.
+        let xid_map = HostXidMap::new();
+        let mut backend = crate::backend::recording::RecordingBackend::default();
+
+        let _ = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &xid_map,
+            HostPointerEvent {
+                kind: PointerEventKind::ButtonPress,
+                host_xid: 0xDEAD,
+                detail: 1,
+                time: 0,
+                root_x: 5,
+                root_y: 5,
+                event_x: 5,
+                event_y: 5,
+                state: 0,
+                crossing_mode: 0,
+                child: 0,
+            },
+            true,
+            false,
+        );
+
+        let bytes = read_all_available(&mut peer);
+        assert!(
+            bytes.len() >= 32 && bytes[0] == 4,
+            "core event with unknown host_xid must resolve via root coords and \
+             still deliver (core-first), not drop; got {} bytes",
+            bytes.len(),
+        );
+        assert_eq!(&bytes[12..16], &window.0.to_le_bytes());
+    }
+
+    /// Replay (AllowEvents ReplayPointer): a thawed ButtonPress routed
+    /// with `handle_grabs=false` must reach the natural window-under-
+    /// pointer's subscriber, NOT the grab owner — even while a passive
+    /// grab is recorded. Ported from server.rs's dead
+    /// `route_button_press_no_grab` test onto the live fanout.
+    #[test]
+    fn replay_pointer_delivers_to_button_press_window_not_grab_owner() {
+        use yserver_protocol::x11::{CreateWindowRequest, ResourceId};
+
+        let mut state = ServerState::new();
+        let grab_window = ResourceId(0x0010_0002);
+        let target_window = ResourceId(0x0020_0002);
+
+        let mut grab_peer = install_client(&mut state, 1);
+        let mut target_peer = install_client(&mut state, 2);
+
+        // Disjoint geometry so the core hit-test unambiguously resolves
+        // the click to the target window (no stacking dependence).
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: grab_window,
+                parent: crate::resources::ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        state.resources.create_window(
+            ClientId(2),
+            CreateWindowRequest {
+                depth: 24,
+                window: target_window,
+                parent: crate::resources::ROOT_WINDOW,
+                x: 200,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(grab_window);
+        let _ = state.resources.map_window(target_window);
+        state
+            .clients
+            .get_mut(&1)
+            .unwrap()
+            .event_masks
+            .insert(grab_window, 0x0000_0004);
+        state
+            .clients
+            .get_mut(&2)
+            .unwrap()
+            .event_masks
+            .insert(target_window, 0x0000_0004);
+        state.pointer_grab = Some((ClientId(1), grab_window));
+        state.pointer_grab_is_passive = true;
+
+        let mut xid_map = HostXidMap::new();
+        xid_map.insert(0xCAFE_u32, target_window);
+        let mut backend = crate::backend::recording::RecordingBackend::default();
+
+        let _ = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &xid_map,
+            HostPointerEvent {
+                kind: PointerEventKind::ButtonPress,
+                host_xid: 0xCAFE,
+                detail: 1,
+                time: 0,
+                root_x: 210,
+                root_y: 10,
+                event_x: 10,
+                event_y: 10,
+                state: 0,
+                crossing_mode: 0,
+                child: 0,
+            },
+            /* handle_grabs = */ false,
+            /* is_replay = */ false,
+        );
+
+        let target_bytes = read_all_available(&mut target_peer);
+        assert!(
+            target_bytes.len() >= 32 && target_bytes[0] == 4,
+            "target subscriber must receive the replayed ButtonPress; got {} bytes",
+            target_bytes.len(),
+        );
+        assert_eq!(&target_bytes[12..16], &target_window.0.to_le_bytes());
+        let grab_bytes = read_all_available(&mut grab_peer);
+        assert!(
+            grab_bytes.is_empty(),
+            "grab owner must NOT receive the replayed press (handle_grabs=false); got {} bytes",
+            grab_bytes.len(),
+        );
+    }
+
+    /// owner_events=true passive grab: a press on a window OWNED BY the
+    /// grab client is reported naturally to its subscriber, not
+    /// redirected to the grab window. Guards `pointer_fanout.rs`'s
+    /// owner_events natural-delivery branch (the live suite otherwise
+    /// only covers the foreign-window fallback).
+    #[test]
+    fn passive_grab_owner_events_keeps_child_delivery_on_owned_windows() {
+        use yserver_protocol::x11::{CreateWindowRequest, ResourceId};
+
+        let mut state = ServerState::new();
+        let grab_window = ResourceId(0x0010_0002);
+        let child_window = ResourceId(0x0010_0003);
+
+        let mut grab_peer = install_client(&mut state, 1);
+        let mut child_peer = install_client(&mut state, 2);
+
+        // Both windows owned by the grab client (client 1).
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: grab_window,
+                parent: crate::resources::ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: child_window,
+                parent: grab_window,
+                x: 10,
+                y: 10,
+                width: 40,
+                height: 40,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(grab_window);
+        let _ = state.resources.map_window(child_window);
+        // The app subscriber (client 2) selects ButtonPress on the child.
+        state
+            .clients
+            .get_mut(&2)
+            .unwrap()
+            .event_masks
+            .insert(child_window, 0x0000_0004);
+        state.pointer_grab = Some((ClientId(1), grab_window));
+        state.pointer_grab_is_passive = true;
+        state.button_grabs.push(crate::server::PassiveButtonGrab {
+            owner: ClientId(1),
+            grab_window,
+            button: 1,
+            modifiers: 0,
+            owner_events: true,
+            event_mask: 0xFFFF_FFFF,
+            pointer_mode: 0,
+            keyboard_mode: 1,
+            confine_to: ResourceId(0),
+            via_xi2: true,
+        });
+
+        let mut xid_map = HostXidMap::new();
+        xid_map.insert(0xCAFE_u32, grab_window);
+        let mut backend = crate::backend::recording::RecordingBackend::default();
+
+        let _ = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &xid_map,
+            HostPointerEvent {
+                kind: PointerEventKind::ButtonPress,
+                host_xid: 0xCAFE,
+                detail: 1,
+                time: 0,
+                root_x: 20,
+                root_y: 20,
+                event_x: 20,
+                event_y: 20,
+                state: 0,
+                crossing_mode: 0,
+                child: 0,
+            },
+            true,
+            false,
+        );
+
+        let child_bytes = read_all_available(&mut child_peer);
+        assert!(
+            child_bytes.len() >= 32 && child_bytes[0] == 4,
+            "owner_events=true grab must still deliver to the owned child; got {} bytes",
+            child_bytes.len(),
+        );
+        assert_eq!(&child_bytes[12..16], &child_window.0.to_le_bytes());
+        let grab_bytes = read_all_available(&mut grab_peer);
+        assert!(
+            grab_bytes.is_empty(),
+            "owner_events=true grab must not redirect owned-child clicks to the grab owner; got {} bytes",
+            grab_bytes.len(),
+        );
+    }
+
+    /// owner_events=true passive grab: a press on a descendant of the
+    /// grab window is reported naturally even when that descendant is
+    /// owned by a DIFFERENT client (topological within-subtree case,
+    /// not the ownership case).
+    #[test]
+    fn passive_grab_owner_events_keeps_descendant_delivery_even_when_child_owned_elsewhere() {
+        use yserver_protocol::x11::{CreateWindowRequest, ResourceId};
+
+        let mut state = ServerState::new();
+        let grab_window = ResourceId(0x0010_0010);
+        let child_window = ResourceId(0x0010_0011);
+
+        let mut grab_peer = install_client(&mut state, 1);
+        let mut child_peer = install_client(&mut state, 2);
+
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: grab_window,
+                parent: crate::resources::ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        // Child owned by client 2 (NOT the grab client).
+        state.resources.create_window(
+            ClientId(2),
+            CreateWindowRequest {
+                depth: 24,
+                window: child_window,
+                parent: grab_window,
+                x: 10,
+                y: 10,
+                width: 40,
+                height: 40,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(grab_window);
+        let _ = state.resources.map_window(child_window);
+        state
+            .clients
+            .get_mut(&2)
+            .unwrap()
+            .event_masks
+            .insert(child_window, 0x0000_0004);
+        state.pointer_grab = Some((ClientId(1), grab_window));
+        state.pointer_grab_is_passive = true;
+        state.button_grabs.push(crate::server::PassiveButtonGrab {
+            owner: ClientId(1),
+            grab_window,
+            button: 1,
+            modifiers: 0,
+            owner_events: true,
+            event_mask: 0xFFFF_FFFF,
+            pointer_mode: 0,
+            keyboard_mode: 1,
+            confine_to: ResourceId(0),
+            via_xi2: true,
+        });
+
+        let mut xid_map = HostXidMap::new();
+        xid_map.insert(0xCAFE_u32, grab_window);
+        let mut backend = crate::backend::recording::RecordingBackend::default();
+
+        let _ = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &xid_map,
+            HostPointerEvent {
+                kind: PointerEventKind::ButtonPress,
+                host_xid: 0xCAFE,
+                detail: 1,
+                time: 0,
+                root_x: 20,
+                root_y: 20,
+                event_x: 20,
+                event_y: 20,
+                state: 0,
+                crossing_mode: 0,
+                child: 0,
+            },
+            true,
+            false,
+        );
+
+        let child_bytes = read_all_available(&mut child_peer);
+        assert!(
+            child_bytes.len() >= 32 && child_bytes[0] == 4,
+            "owner_events=true grab must deliver to the in-subtree descendant even when owned elsewhere; got {} bytes",
+            child_bytes.len(),
+        );
+        let grab_bytes = read_all_available(&mut grab_peer);
+        assert!(
+            grab_bytes.is_empty(),
+            "owner_events=true grab must not redirect descendant clicks to the grab owner; got {} bytes",
+            grab_bytes.len(),
+        );
+    }
+
+    /// Mask filtering: only clients whose event mask matches the event
+    /// kind receive it (ButtonPress vs PointerMotion vs none).
+    #[test]
+    fn pointer_event_fanout_filters_by_mask() {
+        use yserver_protocol::x11::{CreateWindowRequest, ResourceId};
+
+        let mut state = ServerState::new();
+        let window = ResourceId(0x0010_0002);
+
+        let mut a_peer = install_client(&mut state, 1); // ButtonPress
+        let mut b_peer = install_client(&mut state, 2); // PointerMotion
+        let mut c_peer = install_client(&mut state, 3); // nothing
+
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window,
+                parent: crate::resources::ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(window);
+        state
+            .clients
+            .get_mut(&1)
+            .unwrap()
+            .event_masks
+            .insert(window, 0x0000_0004); // ButtonPress
+        state
+            .clients
+            .get_mut(&2)
+            .unwrap()
+            .event_masks
+            .insert(window, 0x0000_0040); // PointerMotion
+
+        let mut xid_map = HostXidMap::new();
+        xid_map.insert(0xCAFE_u32, window);
+        let mut backend = crate::backend::recording::RecordingBackend::default();
+
+        let _ = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &xid_map,
+            HostPointerEvent {
+                kind: PointerEventKind::ButtonPress,
+                host_xid: 0xCAFE,
+                detail: 1,
+                time: 0,
+                root_x: 5,
+                root_y: 5,
+                event_x: 5,
+                event_y: 5,
+                state: 0,
+                crossing_mode: 0,
+                child: 0,
+            },
+            true,
+            false,
+        );
+
+        let a_bytes = read_all_available(&mut a_peer);
+        assert!(
+            a_bytes.len() >= 32 && a_bytes[0] == 4,
+            "only the ButtonPress-masked client receives the press; got {} bytes",
+            a_bytes.len(),
+        );
+        assert!(
+            read_all_available(&mut b_peer).is_empty(),
+            "PointerMotion-masked client must not receive a ButtonPress",
+        );
+        assert!(
+            read_all_available(&mut c_peer).is_empty(),
+            "unmasked client must not receive a ButtonPress",
+        );
+    }
+
+    /// ButtonMotion mask (wmaker frame idiom): a motion with a button
+    /// held delivers to a ButtonMotion subscriber; a motion with no
+    /// button held does not.
+    #[test]
+    fn pointer_event_fanout_delivers_motion_under_button_motion_mask() {
+        use yserver_protocol::x11::{CreateWindowRequest, ResourceId};
+
+        let mut state = ServerState::new();
+        let window = ResourceId(0x0010_0002);
+
+        let mut a_peer = install_client(&mut state, 1); // ButtonMotion
+        let mut b_peer = install_client(&mut state, 2); // nothing
+
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window,
+                parent: crate::resources::ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(window);
+        state
+            .clients
+            .get_mut(&1)
+            .unwrap()
+            .event_masks
+            .insert(window, 0x0000_2000); // ButtonMotion
+
+        let mut xid_map = HostXidMap::new();
+        xid_map.insert(0xCAFE_u32, window);
+        let mut backend = crate::backend::recording::RecordingBackend::default();
+
+        let motion = |held: u16| HostPointerEvent {
+            kind: PointerEventKind::MotionNotify,
+            host_xid: 0xCAFE,
+            detail: 0,
+            time: 0,
+            root_x: 5,
+            root_y: 5,
+            event_x: 5,
+            event_y: 5,
+            state: held,
+            crossing_mode: 0,
+            child: 0,
+        };
+
+        // Motion with button 1 held (state bit 0x100) → delivered.
+        let _ = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &xid_map,
+            motion(0x0100),
+            true,
+            false,
+        );
+        let a_bytes = read_all_available(&mut a_peer);
+        assert!(
+            a_bytes.len() >= 32 && a_bytes[0] == 6,
+            "ButtonMotion subscriber should receive MotionNotify while a button is held; got {} bytes",
+            a_bytes.len(),
+        );
+        assert!(
+            read_all_available(&mut b_peer).is_empty(),
+            "client with no motion mask must not receive motion",
+        );
+
+        // Motion with no button held → ButtonMotion subscriber gets nothing.
+        let _ = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &xid_map,
+            motion(0),
+            true,
+            false,
+        );
+        assert!(
+            read_all_available(&mut a_peer).is_empty(),
+            "ButtonMotion-only subscriber must not receive motion when no button is held",
         );
     }
 
