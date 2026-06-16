@@ -58,44 +58,68 @@ a stationary pointer (Xorg's `WindowsRestructured` path; see
 The core hit-test (`ServerState::root_pointer_target_at` → the
 `hit_test_children` / `window_input_contains` walk over `resources` +
 `shape_windows`) becomes the **single** pointer authority. `target` (clicks)
-already uses it on this branch; we route the crossing/motion path through it
-too and delete the backend's competing authority.
+already uses it on this branch; we route the crossing/motion/cursor path
+through it too and delete the backend's competing authority.
 
-### 1. Route crossings + motion through the core hit-test (KMS v2 backend)
+Two prerequisites surfaced in review must land *before* the backend authority
+is removed, or they become regressions.
 
-Add a helper on the v2 backend:
+### 0. Teach the core hit-test the bounding-shape fallback (prerequisite)
 
-```
-fn core_pointer_target_host_xid(&self, state: &ServerState) -> Option<u32>
-```
+Today the backend's `cursor_inside_shape` uses `shape_input.or_else(shape_bounding)`
+— the input region defaults to the bounding region when no input shape is set,
+matching Xorg (`XYToWindow` gates input on both `PointInBorderSize`, i.e. the
+bounding shape, *and* the input shape). The core `window_input_contains`
+(`server.rs:1916`) checks **only** the input shape and treats "no input shape"
+as the full window rect, ignoring the bounding shape entirely. A window that
+sets a bounding-only shape is therefore hittable in its clipped-away corners
+under the core walk. This is already wrong for clicks today; removing the
+backend walk would extend it to crossings, motion, `QueryPointer`, and
+`XIQueryPointer` (all of which route through `direct_child_at`).
 
-It calls `state.root_pointer_target_at(cursor_x, cursor_y)` (cursor in
-root/fb coords, same space the existing backend hit-test uses), takes the
-resolved deepest `ResourceId`, and maps it to its `host_xid` via
-`state.resources.window(id).host_xid`. Both top-levels and sub-windows are
-registered in `xid_map` (`register_top_level` @10012, `register_subwindow`
-@10035), so the `ResourceId → host_xid` round-trip is total for mapped
-windows.
+Fix `window_input_contains` to compute the effective input region as
+`input.or_else(bounding)` (both live in `ShapeWindowState`, `server.rs:1465`):
+test against the input rects if set, else the bounding rects if set, else the
+full rect. This makes the core walk Xorg-faithful and behavior-identical to the
+backend walk it replaces.
 
-`dispatch_motion_event` (`backend.rs:5171`) and `process_pointer_button`
-(`backend.rs:5253`) replace:
+### 1. Route crossings + motion + cursor through the core hit-test in ResourceId space
 
-```
-let host_xid = self.window_under_cursor().unwrap_or(self.core.window_id);
-```
+The pointer window is resolved once per motion as a **`ResourceId`** via
+`state.root_pointer_target_at(cursor_x, cursor_y)` and threaded through the
+crossing/cursor path in `ResourceId` space, deriving `host_xid` only at wire
+emit. This avoids a lossy `ResourceId → host_xid → ResourceId` round-trip: a
+mapped child whose `host_xid` is momentarily missing/stale
+(`register_subwindow` can register a window before parent/geometry catch up,
+and `update_pointer_window` has an "unmapped host_xid" fallback) would
+otherwise silently collapse to ancestor/root semantics and corrupt crossings,
+motion coords, and cursor selection.
 
-with the core-derived resolution (same `unwrap_or` root-container fallback).
-Everything downstream is unchanged: `update_pointer_window` already converts
-host→`ResourceId` (`resolve_host_to_nested`, @5102), computes crossings in
-`ResourceId` space (`normal_mode_crossings`), and re-derives host xids at
-`emit_crossing`. We are only feeding it the *correct* window.
+Concretely:
+
+- Change `KmsCore.prev_pointer_window` from `Option<u32>` (host) to
+  `Option<ResourceId>` (5 call sites: `core.rs:1538`, `backend.rs:1243`,
+  `5093/5100/5161`, `5303`).
+- `dispatch_motion_event` (`backend.rs:5167`) and `process_pointer_button`
+  (`backend.rs:5237`) resolve the target `ResourceId` from
+  `root_pointer_target_at` (cursor in root/fb coords, same space the deleted
+  backend hit-test used), replacing `window_under_cursor()`.
+- `update_pointer_window` takes a `ResourceId`, compares against the
+  `ResourceId` `prev_pointer_window`, calls `normal_mode_crossings`
+  (already `ResourceId`-based), and derives `host_xid` only inside the
+  `emit_crossing` loop (the existing `w.host_xid` lookup at
+  `backend.rs:5128`). `emit_motion_only` likewise derives `host_xid` at emit.
+- `refresh_effective_cursor` (`backend.rs:1243`) walks the cursor chain from
+  the `ResourceId` pointer window (via core resources / its `host_xid`) rather
+  than the host-side `prev_pointer_window`.
 
 ### 2. Delete the backend input authority
 
 Once nothing reads it:
 
 - Remove `window_under_cursor` (`backend.rs:4910`) and `cursor_inside_shape`
-  (`backend.rs:5004`) plus their unit tests.
+  (`backend.rs:5004`) plus their unit tests (port their intent — empty input
+  region, bounding-only fallback, deepest-child descent — onto the core walk).
 - Remove `KmsCore.shape_input` (`core.rs:1574`), its initializers, and the
   `kind == 2` arm of `set_shape_rectangles` (`backend.rs:15039`).
 - Drop `KIND_INPUT` from `mirror_shape_to_host_state` (the mirror existed only
@@ -113,25 +137,44 @@ Once nothing reads it:
 
 ## Risks
 
-- **Sub-window `host_xid` gaps.** If a mapped sub-window lacked a `host_xid`,
-  the mapping would fall back to an ancestor and crossings would target too
-  shallow. Mitigation: `register_subwindow` populates `xid_map`, so this should
-  not occur for mapped windows; HW verification covers it.
+- **Bounding-fallback behavior change.** Step 0 changes hit-testing for
+  bounding-only shaped windows (they stop being hittable outside the bounding
+  region). This is the Xorg-correct behavior and matches the deleted backend
+  walk, but it is a behavior change for clicks too — cover with a test and
+  watch shaped clients (oclock/xeyes-style, decorations) on HW.
+- **Lingering host-side pointer state.** `prev_pointer_window` and the cursor
+  chain are the residual host-space state that could re-create the prior
+  "cursor/focus says ancestor, click says child" failure if left stale —
+  especially for override-redirect sub-windows and unmap/teardown races. Step 1
+  threads `ResourceId` end-to-end specifically to close this; verify the
+  cursor and crossings on OR popups and on destroy/unmap of the prev pointer
+  window.
 - **Non-obvious consumers of the input path.** Two prior fixes built green but
-  failed on HW with no clicks. This change is the *inverse* direction (core-
-  first, matching Xorg), but the lesson holds: **HW observation gates the
-  commit** — no merge before silence confirms.
-- **Coordinate space.** `cursor_x/cursor_y` (backend, fb/root space) must match
-  `root_pointer_target_at`'s expected root coords. Verify equality with a unit
-  test and the existing trace.
+  failed on HW (#34: focus≠click; unified-pointer-sprite: no clicks). Both
+  pushed an authority toward the *backend*; this change is the *inverse*
+  (core-first, matching Xorg). The lesson holds regardless: **HW observation
+  gates the commit** — no merge before silence confirms.
+- **Coordinate space.** `cursor_x/cursor_y` (backend, fb/root `f32`) must match
+  `root_pointer_target_at`'s expected `i16` root coords. Verify with an edge
+  test at non-zero window and child offsets, plus the existing trace.
 
 ## Testing
 
-- **Unit:** a hit-test test proving an empty input region on a parent makes it
-  click-through (pointer descends to the sibling beneath), mirroring the
-  cinnamon COW/stage case, asserted through the core walk now used by both
-  paths. Port the intent of the deleted `window_under_cursor_*` tests onto the
-  core hit-test where coverage is lost.
+- **Core hit-test unit tests** (`window_input_contains` / `hit_test_children`):
+  - empty input region on a parent → click-through (pointer descends to the
+    sibling beneath), mirroring the cinnamon COW/stage case.
+  - bounding-only shape (no input shape) → hittable inside, excluded outside
+    the bounding region (the Step 0 fallback).
+  - `None` input + `None` bounding → full-rect opaque.
+  - deepest-child descent and non-zero window/child offset coordinate cases
+    (port the intent of the deleted `window_under_cursor_*` tests).
+- **Protocol path tests:** `QueryPointer` / `XIQueryPointer` `child`
+  resolution under empty input region and bounding-only shape; active-grab
+  press/release where the focus/natural target differs from the grab window
+  (implicit-grab crossings still correct).
+- **Mapping edge cases:** core hit resolves a window whose `host_xid` is
+  `None`; COW lifecycle (materialize/release) transitions; root-window hit;
+  destroy/unmap of the previous pointer window mid-stream.
 - **Build/clippy/test:** `cargo +nightly fmt`, `cargo clippy`, `cargo test`
   (core + yserver) all green.
 - **HW (gating):** on silence, cinnamon + wezterm and gkrellm. Confirm sloppy
