@@ -158,17 +158,35 @@ Once nothing reads it:
 `server.rs::pointer_event_fanout` / `pointer_event_fanout_inner`
 (`server.rs:2188`/`2209`) is the pre-lift fanout superseded by
 `core_loop::pointer_fanout::pointer_event_fanout_to_state`. It has **zero live
-callers** — every call site is inside `mod tests` (`server.rs:2774+`), so four
+callers** — every call site is inside `mod tests` (`server.rs:2774+`), so five
 unit tests keep dead production code alive while asserting nothing about the
 live path. This stale parallel path is the same anti-pattern as the dual
 hit-test we are removing, and during review it caused a reviewer to analyze the
 wrong function and report non-applicable findings.
 
-Delete `pointer_event_fanout`, `pointer_event_fanout_inner`, and their tests;
-migrate any behavior they cover that the live path's tests
-(`pointer_fanout.rs:2042+`) don't (mask filtering, button-motion delivery,
-unknown-host_xid drop) onto `pointer_event_fanout_to_state`. This can land as
-its own commit within the PR.
+Delete `pointer_event_fanout`, `pointer_event_fanout_inner`, and their tests.
+Handle the five tests deliberately:
+
+- **Port to `pointer_event_fanout_to_state` (live behavior, not yet covered
+  by the live suite at `pointer_fanout.rs:2042+`):**
+  - `pointer_event_fanout_filters_by_mask` (`server.rs:3736`)
+  - `pointer_event_fanout_delivers_motion_under_button_motion_mask`
+    (`server.rs:3849`)
+  - `passive_grab_owner_events_keeps_child_delivery_on_owned_windows`
+    (`server.rs:3443`) and
+    `passive_grab_owner_events_keeps_descendant_delivery_even_when_child_owned_elsewhere`
+    (`server.rs:3591`) — these guard the live `owner_events=true`
+    natural-delivery logic (`pointer_fanout.rs:296-299`); the live suite only
+    covers the opposite foreign-window fallback (`pointer_fanout.rs:1953`).
+- **Do NOT port** `pointer_event_fanout_drops_unknown_host_xid`
+  (`server.rs:3993`): it asserts the unknown-`host_xid` early-drop
+  (`server.rs:2443`) that Step 1 deliberately removes. The correct live
+  behavior is core-first resolution — resolve `root_hit` from root coords, and
+  skip *only XI2* when no top-level is derivable (`pointer_fanout.rs:637`),
+  never dropping the core event on an unknown `host_xid`. Replace it (if
+  anything) with a test asserting that core-first behavior.
+
+This can land as its own commit within the PR.
 
 ### Scope boundary
 
