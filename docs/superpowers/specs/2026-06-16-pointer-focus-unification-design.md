@@ -153,6 +153,23 @@ Once nothing reads it:
 
 `ServerState.shape_windows` is then the only input-shape store.
 
+### 3. Delete the dead legacy fanout (cleanup)
+
+`server.rs::pointer_event_fanout` / `pointer_event_fanout_inner`
+(`server.rs:2188`/`2209`) is the pre-lift fanout superseded by
+`core_loop::pointer_fanout::pointer_event_fanout_to_state`. It has **zero live
+callers** — every call site is inside `mod tests` (`server.rs:2774+`), so four
+unit tests keep dead production code alive while asserting nothing about the
+live path. This stale parallel path is the same anti-pattern as the dual
+hit-test we are removing, and during review it caused a reviewer to analyze the
+wrong function and report non-applicable findings.
+
+Delete `pointer_event_fanout`, `pointer_event_fanout_inner`, and their tests;
+migrate any behavior they cover that the live path's tests
+(`pointer_fanout.rs:2042+`) don't (mask filtering, button-motion delivery,
+unknown-host_xid drop) onto `pointer_event_fanout_to_state`. This can land as
+its own commit within the PR.
+
 ### Scope boundary
 
 - **KMS v2 backend only.** The `host_x11`/ynest backend gets `host_xid` from
@@ -166,7 +183,11 @@ Once nothing reads it:
   bounding-only shaped windows (they stop being hittable outside the bounding
   region). This is the Xorg-correct behavior and matches the deleted backend
   walk, but it is a behavior change for clicks too — cover with a test and
-  watch shaped clients (oclock/xeyes-style, decorations) on HW.
+  watch shaped clients (oclock/xeyes-style, decorations) on HW. Land Step 0
+  and Step 1 together (or in immediate succession) so there is no intermediate
+  state where clicks use the Xorg conjunction while crossings still use the
+  backend `or_else` — that would briefly diverge focus from clicks for the
+  both-shapes-set case.
 - **Lingering host-side pointer state.** `prev_pointer_window` and the cursor
   chain are the residual host-space state that could re-create the prior
   "cursor/focus says ancestor, click says child" failure if left stale —
