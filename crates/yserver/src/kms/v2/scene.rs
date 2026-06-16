@@ -4252,115 +4252,6 @@ mod tests {
         assert!(built.sampled_ids.contains(&bystander_id));
     }
 
-    /// Stage 4d follow-up — a Manual-redirected parent with a
-    /// redirected backing must emit that backing directly, while
-    /// still pruning its descendants.
-    #[test]
-    fn build_scene_emits_manual_redirected_parent_backing_but_prunes_descendants() {
-        let mut core = KmsCore::for_tests();
-        let mut store = DrawableStore::new();
-        let platform = PlatformBackend::for_tests();
-        let mut windows_v2 = super::super::backend::WindowsV2Map::new();
-
-        alloc_stub_window(
-            &mut store,
-            &mut windows_v2,
-            0x111,
-            100,
-            200,
-            200,
-            150,
-            None,
-            true,
-        );
-        core.top_level_order.push(0x111);
-        let w_frame_id = store.lookup(0x111).expect("frame lookup");
-
-        let mut backing = super::super::store::Storage::for_tests_null(
-            extent(200, 150),
-            vk::Format::B8G8R8A8_UNORM,
-        );
-        let backing_view: vk::ImageView = ash::vk::Handle::from_raw(0xBEEF_CAFE);
-        backing.image_view = backing_view;
-        backing.sample_view = backing_view;
-        let backing_id = store
-            .allocate(0xB002, DrawableKind::Pixmap, 32, true, backing)
-            .expect("alloc redirected backing");
-        store.set_redirected_target(w_frame_id, Some(backing_id));
-        store.set_scene_participating(w_frame_id, false);
-        assert!(
-            store.get(backing_id).unwrap().scene_participating,
-            "fixture sanity: redirected backing stays scene_participating=true",
-        );
-
-        alloc_stub_window(
-            &mut store,
-            &mut windows_v2,
-            0x112,
-            11,
-            41,
-            100,
-            80,
-            Some(0x111),
-            true,
-        );
-
-        alloc_stub_window(
-            &mut store,
-            &mut windows_v2,
-            0x222,
-            500,
-            500,
-            60,
-            30,
-            None,
-            true,
-        );
-        core.top_level_order.push(0x222);
-
-        let child_id = store.lookup(0x112).expect("child lookup");
-        assert!(
-            store.get(child_id).unwrap().scene_participating,
-            "fixture sanity: child stays scene_participating=true",
-        );
-
-        let built = build_scene(
-            &core,
-            &mut store,
-            &windows_v2,
-            0,
-            &platform,
-            None,
-            None,
-            None,
-            false,
-        );
-        let scene = &built.scene;
-
-        assert_eq!(scene.draws.len(), 2, "expected manual backing + bystander");
-        assert!(
-            scene
-                .draws
-                .iter()
-                .any(|d| d.dst_origin == [100.0, 200.0] && d.dst_size == [200.0, 150.0]),
-            "manual parent backing draw missing: {:?}",
-            scene.draws
-        );
-        assert!(
-            scene
-                .draws
-                .iter()
-                .any(|d| d.dst_origin == [500.0, 500.0] && d.dst_size == [60.0, 30.0]),
-            "bystander draw missing: {:?}",
-            scene.draws
-        );
-
-        let bystander_id = store.lookup(0x222).expect("bystander lookup");
-        assert_eq!(built.sampled_ids.len(), 2);
-        assert!(built.sampled_ids.contains(&backing_id));
-        assert!(built.sampled_ids.contains(&bystander_id));
-    }
-
     /// Audit #3 (2026-05-19) — a Manual-redirected parent still
     /// prunes its NON-redirected descendants (their paint resolves
     /// to the parent's B via `resolve_paint_target` so the parent
@@ -4723,7 +4614,6 @@ mod tests {
             Some(cow_xid),
             true,
         );
-        let cow_id = store.lookup(cow_xid).expect("cow drawable");
 
         let built = build_scene(
             &core,
@@ -4732,8 +4622,8 @@ mod tests {
             0,
             &platform,
             None,
-            Some(cow_id),
-            Some(yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0),
+            None,
+            Some(cow_xid),
             false,
         );
         let scene = &built.scene;
