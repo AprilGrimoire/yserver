@@ -300,6 +300,12 @@ impl BufferAgeRing {
         found >= want_count
     }
 
+    /// Ring depth (scanout BO count + 1). Used to size the
+    /// post-structure-change full-repaint flush window.
+    fn depth(&self) -> usize {
+        self.depth
+    }
+
     /// Union all damage regions in `(last_gen+1, frame_gen)` into
     /// `dst`.
     fn union_history_into(&self, last_gen: u64, frame_gen: u64, dst: &mut RegionSet) {
@@ -341,6 +347,18 @@ struct OutputSceneState {
     /// successful flip (transactional commit per codex round 2
     /// point 2).
     current_generation: u64,
+    /// Buffer-age re-enable guard (off unless `YSERVER_BUFFER_AGE`
+    /// is set). When scene-structure damage (window move / map /
+    /// restack) is seen at generation `G`, this is bumped to
+    /// `G + ring_depth` so the next `ring_depth` ticks force
+    /// `Repaint::Full` — flushing *every* BO in the ring of the
+    /// stale geometry before clipped repaint resumes. This is what
+    /// the 2026-05-30 always-Full stopgap (dbf093f) lacked: it left
+    /// the ring poisoned after a drag, so old window positions
+    /// lingered ("drag-shake"). Steady-state in-place content damage
+    /// (e.g. menu hover — the #48 workload) never sets this, so it
+    /// gets clipped repaint.
+    buffer_age_full_until_gen: u64,
     /// Scene-structure damage in output coords. Accumulated by
     /// `mark_scene_structure_damage(region)`; subtracted on
     /// retirement using the snapshot captured at submit time.
@@ -449,6 +467,24 @@ fn hw_cursor_strategy_enabled() -> bool {
         std::env::var("YSERVER_V2_HW_CURSOR").ok().as_deref(),
         Some("0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF")
     )
+}
+
+/// Buffer-age clipped-repaint re-enable switch. OFF by default —
+/// the 2026-05-30 drag-shake stopgap (dbf093f) forces
+/// `Repaint::Full` every frame, which is correct but burns full-
+/// framebuffer bandwidth + (on tilers) a render pass per op every
+/// tick. Setting `YSERVER_BUFFER_AGE` to a truthy value re-enables
+/// the clipped path, guarded by the post-structure-change full
+/// flush (see `buffer_age_full_until_gen`). Read once and cached so
+/// it has zero per-tick cost.
+fn buffer_age_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("YSERVER_BUFFER_AGE").ok().as_deref(),
+            Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+        )
+    })
 }
 
 /// Stage 5 Phase D — deferred upload slot held while at least one
@@ -602,6 +638,7 @@ impl SceneCompositor {
             failed_submit_bos: VecDeque::with_capacity(4),
             damage_history: BufferAgeRing::new(bo_depth + 1),
             current_generation: 0,
+            buffer_age_full_until_gen: 0,
             scene_structure_damage: RegionSet::new(),
             pending_repaint_after_failed_submit: RegionSet::new(),
             output_extent: vk::Extent2D {
@@ -1484,9 +1521,16 @@ fn tick_one_output(
     ));
     // Always-Full repaint makes stationary SW cursors safe even when
     // cursor_damage is empty and some unrelated damage triggers a
-    // frame. If `Repaint::Clipped` is ever re-enabled, the current SW
-    // cursor rect must also be folded into the repaint region even
-    // when it did not itself trigger the compose.
+    // frame. Under re-enabled `Repaint::Clipped` that safety is gone,
+    // so fold the *current* SW cursor rect into the repaint region
+    // unconditionally — otherwise a frame triggered by unrelated
+    // damage would clip away the cursor's location and a BO that
+    // never painted the cursor there would scan out without it.
+    if buffer_age_enabled()
+        && let Some(cur) = built.new_cursor_rect
+    {
+        output_damage.add(cur);
+    }
     output_damage.union_with(&scene_structure_snap);
     output_damage.union_with(&failed_repaint_snap);
     telemetry.record_scene_entries(
@@ -1517,6 +1561,25 @@ fn tick_one_output(
     };
 
     // 5. Pick repaint region via buffer-age algorithm.
+    //
+    // Buffer-age clipped repaint is gated behind `YSERVER_BUFFER_AGE`
+    // (default off → always-Full, the dbf093f stopgap). When on, any
+    // scene-structure damage (window move / map / restack) arms a
+    // `ring_depth`-tick full-repaint flush so every BO is refreshed
+    // of the stale geometry before clipped repaint resumes — this is
+    // the drag-shake guard the original stopgap lacked.
+    let allow_clipped = {
+        let depth = inner.outputs[output_idx].damage_history.depth() as u64;
+        let state = inner.outputs.get_mut(output_idx).expect("range");
+        if buffer_age_enabled() {
+            if !scene_structure_snap.is_empty() || !failed_repaint_snap.is_empty() {
+                state.buffer_age_full_until_gen = frame_gen + depth;
+            }
+            frame_gen >= state.buffer_age_full_until_gen
+        } else {
+            false
+        }
+    };
     let extent = inner.outputs[output_idx].output_extent;
     let repaint = if built.scene.draws.is_empty() {
         // Scene is just the bg_color clear (no top-levels, no
@@ -1532,6 +1595,7 @@ fn tick_one_output(
         Repaint::Full(extent)
     } else {
         pick_repaint_region(
+            allow_clipped,
             token.last_present_generation,
             token.content_invalidated,
             frame_gen,
@@ -1694,22 +1758,25 @@ fn tick_one_output(
     }
 }
 
-/// Pick the repaint region for the upcoming compose. Currently always
-/// returns `Repaint::Full` — the `Repaint::Clipped` + `loadOp=LOAD`
-/// buffer-age optimisation below is correct in isolation but produces
-/// visible multi-pixel "drag-shake" on non-composited MATE: stale
-/// drag-phase window content remains in BOs the catch-up scissor
-/// doesn't cover. Compositing-ON masks it because COW-authoritative
-/// mode re-presents the compositor image fully each frame, which is
-/// equivalent to what we now do for every output. Two attempted root-
-/// cause fixes (input-coord hysteresis; invalidate-all-BOs on
-/// scene-structure change) made things worse rather than better; until
-/// the actual failure mode in the buffer-age propagation is
-/// identified, Always-Full is the correctness hammer. Measurable GPU
-/// cost was not observable in interactive testing.
+/// Pick the repaint region for the upcoming compose.
 ///
-/// Re-enable the optimisation by removing the early return below.
+/// `allow_clipped == false` is the dbf093f stopgap: always
+/// `Repaint::Full`. The `Repaint::Clipped` + `loadOp=LOAD`
+/// buffer-age path is correct *only* if every frame's recorded
+/// damage fully covers everything that changed that frame — each BO
+/// is a patchwork of generations (clipped frames LOAD the
+/// un-repainted area from that BO's even-older content), so an
+/// under-reported frame leaves stale pixels. A window drag exposed
+/// exactly this on non-composited MATE ("drag-shake": old window
+/// positions linger across the BO ring). The caller therefore only
+/// passes `allow_clipped == true` once `ring_depth` ticks have
+/// elapsed with no scene-structure damage, so the shake-prone
+/// geometry-move case always falls back to Full and the ring is
+/// flushed before clipped repaint resumes. The remaining steady-
+/// state case (in-place content damage, e.g. menu hover) is the
+/// inductively-safe one the optimisation targets.
 fn pick_repaint_region(
+    allow_clipped: bool,
     bo_last_gen: Option<u64>,
     bo_invalidated: bool,
     frame_gen: u64,
@@ -1717,32 +1784,21 @@ fn pick_repaint_region(
     history: &BufferAgeRing,
     extent: vk::Extent2D,
 ) -> Repaint {
-    let _ = (
-        bo_last_gen,
-        bo_invalidated,
-        frame_gen,
-        current_damage,
-        history,
-    );
-    Repaint::Full(extent)
-
-    // Disabled buffer-age logic (see doc comment above):
-    //
-    // if bo_invalidated {
-    //     return Repaint::Full(extent);
-    // }
-    // let Some(last) = bo_last_gen else {
-    //     return Repaint::Full(extent);
-    // };
-    // if !history.contains_all(last, frame_gen) {
-    //     return Repaint::Full(extent);
-    // }
-    // let mut repaint = current_damage.clone();
-    // history.union_history_into(last, frame_gen, &mut repaint);
-    // match repaint.bounding_rect() {
-    //     Some(r) if r.extent.width > 0 && r.extent.height > 0 => Repaint::Clipped(r),
-    //     _ => Repaint::Full(extent),
-    // }
+    if !allow_clipped || bo_invalidated {
+        return Repaint::Full(extent);
+    }
+    let Some(last) = bo_last_gen else {
+        return Repaint::Full(extent);
+    };
+    if !history.contains_all(last, frame_gen) {
+        return Repaint::Full(extent);
+    }
+    let mut repaint = current_damage.clone();
+    history.union_history_into(last, frame_gen, &mut repaint);
+    match repaint.bounding_rect() {
+        Some(r) if r.extent.width > 0 && r.extent.height > 0 => Repaint::Clipped(r),
+        _ => Repaint::Full(extent),
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3445,7 +3501,7 @@ mod tests {
         let history = BufferAgeRing::new(4);
         let mut damage = RegionSet::new();
         damage.add(rect(0, 0, 10, 10));
-        let p = pick_repaint_region(Some(5), true, 6, &damage, &history, extent(800, 600));
+        let p = pick_repaint_region(true, Some(5), true, 6, &damage, &history, extent(800, 600));
         assert!(matches!(p, Repaint::Full(_)));
     }
 
@@ -3454,7 +3510,7 @@ mod tests {
         let history = BufferAgeRing::new(4);
         let mut damage = RegionSet::new();
         damage.add(rect(0, 0, 10, 10));
-        let p = pick_repaint_region(None, false, 1, &damage, &history, extent(800, 600));
+        let p = pick_repaint_region(true, None, false, 1, &damage, &history, extent(800, 600));
         assert!(matches!(p, Repaint::Full(_)));
     }
 
@@ -3467,20 +3523,17 @@ mod tests {
         history.push(3, r);
         let mut damage = RegionSet::new();
         damage.add(rect(0, 0, 10, 10));
-        let p = pick_repaint_region(Some(2), false, 6, &damage, &history, extent(800, 600));
+        let p = pick_repaint_region(true, Some(2), false, 6, &damage, &history, extent(800, 600));
         // Need 3, 4, 5 — only have 3.
         assert!(matches!(p, Repaint::Full(_)));
     }
 
-    /// Buffer-age partial-repaint is currently disabled (see the
-    /// `pick_repaint_region` doc-comment on the drag-shake stopgap).
-    /// While disabled, every steady-state call returns `Repaint::Full`
-    /// regardless of input — this test pins that contract so an
-    /// accidental re-enable is caught by CI. When the real fix lands,
-    /// flip the expectation back to `Repaint::Clipped(58, 58)` and
-    /// remove this comment.
+    /// When `allow_clipped == false` (the default dbf093f stopgap,
+    /// and every tick within the post-structure-change flush window),
+    /// the picker returns `Repaint::Full` regardless of how complete
+    /// the buffer-age history is.
     #[test]
-    fn pick_repaint_returns_full_while_optimisation_disabled() {
+    fn pick_repaint_full_when_clipped_disallowed() {
         let mut history = BufferAgeRing::new(4);
         let mut h3 = RegionSet::new();
         h3.add(rect(10, 10, 5, 5));
@@ -3490,11 +3543,55 @@ mod tests {
         history.push(4, h4);
         let mut current = RegionSet::new();
         current.add(rect(0, 0, 3, 3));
-        let p = pick_repaint_region(Some(2), false, 5, &current, &history, extent(800, 600));
+        let p = pick_repaint_region(
+            false,
+            Some(2),
+            false,
+            5,
+            &current,
+            &history,
+            extent(800, 600),
+        );
         assert!(
             matches!(p, Repaint::Full(_)),
-            "always-Full stopgap returns Full unconditionally; got {p:?}",
+            "allow_clipped=false must force Full; got {p:?}",
         );
+    }
+
+    /// With `allow_clipped == true`, a complete history, and a valid
+    /// BO generation, the picker returns `Repaint::Clipped` whose rect
+    /// is the bounding box of `current_damage ∪ history(last+1..frame)`.
+    /// Here: current (0,0,3,3) ∪ gen3 (10,10,5,5) ∪ gen4 (50,50,8,8)
+    /// → bounding box (0,0)..(58,58).
+    #[test]
+    fn pick_repaint_clipped_when_history_complete() {
+        let mut history = BufferAgeRing::new(4);
+        let mut h3 = RegionSet::new();
+        h3.add(rect(10, 10, 5, 5));
+        history.push(3, h3);
+        let mut h4 = RegionSet::new();
+        h4.add(rect(50, 50, 8, 8));
+        history.push(4, h4);
+        let mut current = RegionSet::new();
+        current.add(rect(0, 0, 3, 3));
+        let p = pick_repaint_region(
+            true,
+            Some(2),
+            false,
+            5,
+            &current,
+            &history,
+            extent(800, 600),
+        );
+        match p {
+            Repaint::Clipped(r) => {
+                assert_eq!(r.offset.x, 0);
+                assert_eq!(r.offset.y, 0);
+                assert_eq!(r.extent.width, 58);
+                assert_eq!(r.extent.height, 58);
+            }
+            Repaint::Full(_) => panic!("expected Clipped, got Full"),
+        }
     }
 
     #[test]
@@ -3504,31 +3601,27 @@ mod tests {
         // redraw fallback.
         let history = BufferAgeRing::new(4);
         let empty = RegionSet::new();
-        let p = pick_repaint_region(Some(2), false, 3, &empty, &history, extent(800, 600));
+        let p = pick_repaint_region(true, Some(2), false, 3, &empty, &history, extent(800, 600));
         assert!(matches!(p, Repaint::Full(_)));
     }
 
-    /// Tripwire for the idle-compose cursor-damage gating
-    /// (project_idle_compose_cursor_damage): gating the cursor out of
-    /// `output_damage` is only safe because `pick_repaint_region` returns
-    /// `Repaint::Full` unconditionally today, so every compose repaints the
-    /// whole BO (cursor included). If `Repaint::Clipped` is re-enabled, the
-    /// current SW cursor rect must be folded into the repaint region even when
-    /// the cursor did not itself trigger the frame — else a fresh/older-age BO
-    /// shows a stale/missing cursor (see the gating-site comment in
-    /// `tick_one_output`). Passes today; fails the day Full stops being
-    /// unconditional, forcing that revisit. (Not `#[ignore]` + `panic!`: that
-    /// pattern breaks `cargo test --include-ignored`.)
+    /// Idle-compose cursor-damage gating
+    /// (project_idle_compose_cursor_damage): when `Repaint::Clipped` is
+    /// re-enabled the current SW cursor rect must be folded into the
+    /// repaint region even when the cursor did not itself trigger the
+    /// frame — else a fresh/older-age BO shows a stale/missing cursor.
+    /// `pick_repaint_region` has no cursor knowledge, so the fold lives
+    /// at the call site in `tick_one_output` (guarded by
+    /// `buffer_age_enabled()`); this test pins the picker half of the
+    /// contract: with no damage at all, even an otherwise-clippable BO
+    /// falls back to Full, so a cursor-only frame can never clip the
+    /// cursor away before the caller's fold runs.
     #[test]
-    fn clipped_reenable_must_fold_in_stationary_sw_cursor_rect() {
+    fn pick_repaint_empty_damage_full_even_when_clippable() {
         let history = BufferAgeRing::new(4);
         let damage = RegionSet::new();
-        let p = pick_repaint_region(Some(2), false, 5, &damage, &history, extent(800, 600));
-        assert!(
-            matches!(p, Repaint::Full(_)),
-            "Repaint::Clipped re-enabled — fold the stationary SW cursor rect \
-             into the repaint region (project_idle_compose_cursor_damage)",
-        );
+        let p = pick_repaint_region(true, Some(2), false, 5, &damage, &history, extent(800, 600));
+        assert!(matches!(p, Repaint::Full(_)));
     }
 
     // ── Stage 3f.6: subwindow scene traversal ─────────────────────
