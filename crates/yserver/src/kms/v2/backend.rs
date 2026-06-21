@@ -8483,51 +8483,74 @@ fn scanout_selection_phases(
     }
 }
 
-fn select_scanout_bo_for_rect(
-    backend: &KmsBackendV2,
+/// One output's contribution to a (possibly multi-output) scanout
+/// readback: copy the BO-local source sub-rect (`src_*`, `w`×`h`) into the
+/// stitched output buffer at (`dst_x`, `dst_y`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScanoutReadPlan {
+    pool_idx: usize,
+    bo_idx: usize,
+    src_x: u32,
+    src_y: u32,
+    w: u32,
+    h: u32,
+    dst_x: u32,
+    dst_y: u32,
+}
+
+/// Highest-priority readable BO in `pool` for `phases` (priority = phase
+/// order).
+fn select_bo_in_pool(
+    pool: &crate::kms::vk::scanout::ScanoutBoPool,
+    phases: &[crate::kms::vk::scanout::BoPhase],
+) -> Option<usize> {
+    phases
+        .iter()
+        .find_map(|phase| pool.bos.iter().position(|bo| bo.state.phase == *phase))
+}
+
+/// Plan the per-output copies to satisfy a readback of `rect` (root /
+/// virtual-screen coords) across `outputs` (each `(x, y, w, h, bo_idx)`;
+/// `bo_idx == None` → that output has no readable BO and is skipped).
+///
+/// The virtual root is the union of per-output scanout BOs — no single BO
+/// covers a cross-output rect — so a root GetImage spanning two monitors
+/// must be stitched from each, not rejected (issue #48: dual-head RX 9070
+/// XT, where the old single-BO selector failed every root read and the
+/// desktop layer never drew). Each output contributes the intersection of
+/// its layout with `rect`; pixels covered by no output are left for the
+/// caller to zero-fill.
+fn plan_multi_output_read(
+    outputs: &[(i64, i64, i64, i64, Option<usize>)],
     rect: vk::Rect2D,
-    selection: ScanoutReadSelection,
-) -> io::Result<(usize, usize, vk::Rect2D)> {
+) -> Vec<ScanoutReadPlan> {
     let rx0 = i64::from(rect.offset.x);
     let ry0 = i64::from(rect.offset.y);
     let rx1 = rx0 + i64::from(rect.extent.width);
     let ry1 = ry0 + i64::from(rect.extent.height);
-    let phases = scanout_selection_phases(selection);
-
-    for (pool_idx, layout) in backend.platform.outputs.iter().enumerate() {
-        let lx0 = i64::from(layout.x);
-        let ly0 = i64::from(layout.y);
-        let lx1 = lx0 + i64::from(layout.width);
-        let ly1 = ly0 + i64::from(layout.height);
-        if rx0 < lx0 || ry0 < ly0 || rx1 > lx1 || ry1 > ly1 {
+    let to_u32 = |v: i64| u32::try_from(v).unwrap_or(0);
+    let mut plans = Vec::new();
+    for (pool_idx, &(ox, oy, ow, oh, bo)) in outputs.iter().enumerate() {
+        let Some(bo_idx) = bo else { continue };
+        let ix0 = rx0.max(ox);
+        let iy0 = ry0.max(oy);
+        let ix1 = rx1.min(ox + ow);
+        let iy1 = ry1.min(oy + oh);
+        if ix0 >= ix1 || iy0 >= iy1 {
             continue;
         }
-        let Some(pool) = backend
-            .platform
-            .scanout_pools
-            .get(pool_idx)
-            .and_then(|p| p.as_ref())
-        else {
-            continue;
-        };
-        for phase in phases {
-            if let Some(bo_idx) = pool.bos.iter().position(|bo| bo.state.phase == *phase) {
-                let local = vk::Rect2D {
-                    offset: vk::Offset2D {
-                        x: i32::try_from(rx0 - lx0).unwrap_or(i32::MAX),
-                        y: i32::try_from(ry0 - ly0).unwrap_or(i32::MAX),
-                    },
-                    extent: rect.extent,
-                };
-                return Ok((pool_idx, bo_idx, local));
-            }
-        }
+        plans.push(ScanoutReadPlan {
+            pool_idx,
+            bo_idx,
+            src_x: to_u32(ix0 - ox),
+            src_y: to_u32(iy0 - oy),
+            w: to_u32(ix1 - ix0),
+            h: to_u32(iy1 - iy0),
+            dst_x: to_u32(ix0 - rx0),
+            dst_y: to_u32(iy0 - ry0),
+        });
     }
-
-    Err(io::Error::other(match selection {
-        ScanoutReadSelection::OnScreenOnly => "root screenshot rect has no on-screen scanout bo",
-        ScanoutReadSelection::PermissiveDump => "scanout rect is not covered by any pool",
-    }))
+    plans
 }
 
 fn read_scanout_region(
@@ -8548,112 +8571,172 @@ fn read_scanout_region(
         return Err(io::Error::other("no ops command pool"));
     };
 
-    let (pool_idx, bo_idx, local_rect) = select_scanout_bo_for_rect(backend, rect, selection)?;
-    let Some(pool) = backend
+    let phases = scanout_selection_phases(selection);
+    // Per-output geometry + the highest-priority readable BO in each (None
+    // if that output has no BO matching the requested phases).
+    let outputs: Vec<(i64, i64, i64, i64, Option<usize>)> = backend
         .platform
-        .scanout_pools
-        .get(pool_idx)
-        .and_then(|p| p.as_ref())
-    else {
-        return Err(io::Error::other("scanout pool vanished"));
-    };
-    let Some(bo) = pool.bos.get(bo_idx) else {
-        return Err(io::Error::other("scanout bo vanished"));
-    };
-    let image = bo.vk_image;
-    let staging_buffer = bo.vk_transfer.staging_buffer;
-    let staging_mapped = bo.vk_transfer.staging_mapped;
-    let staging_size = bo.vk_transfer.staging_size;
-    let copy_width = local_rect.extent.width;
-    let copy_height = local_rect.extent.height;
-    let needed_bytes = usize::try_from(copy_width)
-        .ok()
-        .and_then(|w| {
-            usize::try_from(copy_height)
-                .ok()
-                .and_then(move |h| w.checked_mul(h))
+        .outputs
+        .iter()
+        .enumerate()
+        .map(|(idx, layout)| {
+            let bo = backend
+                .platform
+                .scanout_pools
+                .get(idx)
+                .and_then(|p| p.as_ref())
+                .and_then(|pool| select_bo_in_pool(pool, phases));
+            (
+                i64::from(layout.x),
+                i64::from(layout.y),
+                i64::from(layout.width),
+                i64::from(layout.height),
+                bo,
+            )
         })
+        .collect();
+
+    let plans = plan_multi_output_read(&outputs, rect);
+    if plans.is_empty() {
+        return Err(io::Error::other(match selection {
+            ScanoutReadSelection::OnScreenOnly => {
+                "root screenshot rect has no on-screen scanout bo"
+            }
+            ScanoutReadSelection::PermissiveDump => "scanout rect is not covered by any pool",
+        }));
+    }
+
+    // Stitch each output's contribution into a single row-major BGRA
+    // buffer sized to `rect`. Pixels covered by no output stay zero (the
+    // virtual root's inter-monitor gaps / a monitor shorter than the root).
+    let out_w = rect.extent.width as usize;
+    let out_h = rect.extent.height as usize;
+    let out_bytes = out_w
+        .checked_mul(out_h)
         .and_then(|px| px.checked_mul(4))
         .ok_or_else(|| io::Error::other("scanout copy size overflow"))?;
-    if needed_bytes > staging_size as usize {
-        return Err(io::Error::other("scanout staging buffer too small"));
-    }
+    let mut out = vec![0u8; out_bytes];
+    let out_stride = out_w * 4;
 
-    let run_result = run_one_shot_op(&vk, pool_handle, |vk, cb| {
-        let pre = [ash::vk::ImageMemoryBarrier2::default()
-            .src_stage_mask(ash::vk::PipelineStageFlags2::ALL_COMMANDS)
-            .src_access_mask(ash::vk::AccessFlags2::MEMORY_WRITE)
-            .dst_stage_mask(ash::vk::PipelineStageFlags2::COPY)
-            .dst_access_mask(ash::vk::AccessFlags2::TRANSFER_READ)
-            .old_layout(ash::vk::ImageLayout::GENERAL)
-            .new_layout(ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-            .image(image)
-            .subresource_range(
-                ash::vk::ImageSubresourceRange::default()
-                    .aspect_mask(ash::vk::ImageAspectFlags::COLOR)
-                    .level_count(1)
-                    .layer_count(1),
-            )];
-        let pre_dep = ash::vk::DependencyInfo::default().image_memory_barriers(&pre);
-        crate::vk_count!(cmd_pipeline_barrier2);
-        unsafe { vk.device.cmd_pipeline_barrier2(cb, &pre_dep) };
-
-        let region = [ash::vk::BufferImageCopy::default()
-            .buffer_offset(0)
-            .buffer_row_length(0)
-            .buffer_image_height(0)
-            .image_subresource(
-                ash::vk::ImageSubresourceLayers::default()
-                    .aspect_mask(ash::vk::ImageAspectFlags::COLOR)
-                    .layer_count(1),
-            )
-            .image_offset(ash::vk::Offset3D {
-                x: local_rect.offset.x,
-                y: local_rect.offset.y,
-                z: 0,
+    for plan in plans {
+        let Some(pool) = backend
+            .platform
+            .scanout_pools
+            .get(plan.pool_idx)
+            .and_then(|p| p.as_ref())
+        else {
+            return Err(io::Error::other("scanout pool vanished"));
+        };
+        let Some(bo) = pool.bos.get(plan.bo_idx) else {
+            return Err(io::Error::other("scanout bo vanished"));
+        };
+        let image = bo.vk_image;
+        let staging_buffer = bo.vk_transfer.staging_buffer;
+        let staging_mapped = bo.vk_transfer.staging_mapped;
+        let staging_size = bo.vk_transfer.staging_size;
+        let copy_width = plan.w;
+        let copy_height = plan.h;
+        let needed_bytes = usize::try_from(copy_width)
+            .ok()
+            .and_then(|w| {
+                usize::try_from(copy_height)
+                    .ok()
+                    .and_then(move |h| w.checked_mul(h))
             })
-            .image_extent(ash::vk::Extent3D {
-                width: copy_width,
-                height: copy_height,
-                depth: 1,
-            })];
-        unsafe {
-            crate::vk_count!(cmd_copy_image_to_buffer);
-            vk.device.cmd_copy_image_to_buffer(
-                cb,
-                image,
-                ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                staging_buffer,
-                &region,
-            );
+            .and_then(|px| px.checked_mul(4))
+            .ok_or_else(|| io::Error::other("scanout copy size overflow"))?;
+        if needed_bytes > staging_size as usize {
+            return Err(io::Error::other("scanout staging buffer too small"));
+        }
+        let src_off_x = i32::try_from(plan.src_x).unwrap_or(i32::MAX);
+        let src_off_y = i32::try_from(plan.src_y).unwrap_or(i32::MAX);
+
+        let run_result = run_one_shot_op(&vk, pool_handle, |vk, cb| {
+            let pre = [ash::vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(ash::vk::PipelineStageFlags2::ALL_COMMANDS)
+                .src_access_mask(ash::vk::AccessFlags2::MEMORY_WRITE)
+                .dst_stage_mask(ash::vk::PipelineStageFlags2::COPY)
+                .dst_access_mask(ash::vk::AccessFlags2::TRANSFER_READ)
+                .old_layout(ash::vk::ImageLayout::GENERAL)
+                .new_layout(ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .image(image)
+                .subresource_range(
+                    ash::vk::ImageSubresourceRange::default()
+                        .aspect_mask(ash::vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1),
+                )];
+            let pre_dep = ash::vk::DependencyInfo::default().image_memory_barriers(&pre);
+            crate::vk_count!(cmd_pipeline_barrier2);
+            unsafe { vk.device.cmd_pipeline_barrier2(cb, &pre_dep) };
+
+            let region = [ash::vk::BufferImageCopy::default()
+                .buffer_offset(0)
+                .buffer_row_length(0)
+                .buffer_image_height(0)
+                .image_subresource(
+                    ash::vk::ImageSubresourceLayers::default()
+                        .aspect_mask(ash::vk::ImageAspectFlags::COLOR)
+                        .layer_count(1),
+                )
+                .image_offset(ash::vk::Offset3D {
+                    x: src_off_x,
+                    y: src_off_y,
+                    z: 0,
+                })
+                .image_extent(ash::vk::Extent3D {
+                    width: copy_width,
+                    height: copy_height,
+                    depth: 1,
+                })];
+            unsafe {
+                crate::vk_count!(cmd_copy_image_to_buffer);
+                vk.device.cmd_copy_image_to_buffer(
+                    cb,
+                    image,
+                    ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    staging_buffer,
+                    &region,
+                );
+            }
+
+            let post = [ash::vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(ash::vk::PipelineStageFlags2::COPY)
+                .src_access_mask(ash::vk::AccessFlags2::TRANSFER_READ)
+                .dst_stage_mask(ash::vk::PipelineStageFlags2::ALL_COMMANDS)
+                .dst_access_mask(ash::vk::AccessFlags2::MEMORY_WRITE)
+                .old_layout(ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .new_layout(ash::vk::ImageLayout::GENERAL)
+                .image(image)
+                .subresource_range(
+                    ash::vk::ImageSubresourceRange::default()
+                        .aspect_mask(ash::vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1),
+                )];
+            let post_dep = ash::vk::DependencyInfo::default().image_memory_barriers(&post);
+            crate::vk_count!(cmd_pipeline_barrier2);
+            unsafe { vk.device.cmd_pipeline_barrier2(cb, &post_dep) };
+            Ok(())
+        });
+
+        if let Err(e) = run_result {
+            return Err(io::Error::other(format!("scanout copy submit: {e:?}")));
         }
 
-        let post = [ash::vk::ImageMemoryBarrier2::default()
-            .src_stage_mask(ash::vk::PipelineStageFlags2::COPY)
-            .src_access_mask(ash::vk::AccessFlags2::TRANSFER_READ)
-            .dst_stage_mask(ash::vk::PipelineStageFlags2::ALL_COMMANDS)
-            .dst_access_mask(ash::vk::AccessFlags2::MEMORY_WRITE)
-            .old_layout(ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-            .new_layout(ash::vk::ImageLayout::GENERAL)
-            .image(image)
-            .subresource_range(
-                ash::vk::ImageSubresourceRange::default()
-                    .aspect_mask(ash::vk::ImageAspectFlags::COLOR)
-                    .level_count(1)
-                    .layer_count(1),
-            )];
-        let post_dep = ash::vk::DependencyInfo::default().image_memory_barriers(&post);
-        crate::vk_count!(cmd_pipeline_barrier2);
-        unsafe { vk.device.cmd_pipeline_barrier2(cb, &post_dep) };
-        Ok(())
-    });
-
-    if let Err(e) = run_result {
-        return Err(io::Error::other(format!("scanout copy submit: {e:?}")));
+        let raw = unsafe { std::slice::from_raw_parts(staging_mapped.as_ptr(), needed_bytes) };
+        // Blit this output's tightly-packed sub-rect into `out` at
+        // (dst_x, dst_y).
+        let sub_stride = copy_width as usize * 4;
+        let dst_x_bytes = plan.dst_x as usize * 4;
+        for row in 0..copy_height as usize {
+            let src_off = row * sub_stride;
+            let dst_off = (plan.dst_y as usize + row) * out_stride + dst_x_bytes;
+            out[dst_off..dst_off + sub_stride].copy_from_slice(&raw[src_off..src_off + sub_stride]);
+        }
     }
 
-    let raw = unsafe { std::slice::from_raw_parts(staging_mapped.as_ptr(), needed_bytes) };
-    Ok(raw.to_vec())
+    Ok(out)
 }
 
 fn do_dump_scanout_v2(backend: &mut KmsBackendV2) -> io::Result<()> {
@@ -24355,6 +24438,100 @@ mod tests {
             .expect("root-path get_image")
             .expect("root-path bytes");
         assert_eq!(root_out, expected);
+    }
+
+    // Issue #48 (RX 9070 XT, dual-head): a root GetImage spanning more
+    // than one output must be stitched from each output's scanout BO, not
+    // rejected. `select_scanout_bo_for_rect` required the whole rect to fit
+    // in ONE output, so any cross-output / full-virtual-root read failed
+    // ("root screenshot rect has no on-screen scanout bo") and the desktop
+    // layer (reading the root) never drew. The planner is pure so it's
+    // tested without a GPU.
+    #[test]
+    fn plan_multi_output_read_stitches_across_outputs() {
+        use super::{ScanoutReadPlan, plan_multi_output_read};
+        use ash::vk;
+        // DP-1 3440x1440 @ (0,0) + HDMI-A-1 1920x1080 @ (3440,0); both have
+        // an on-screen BO (Some(0)). Virtual root = 5360x1440.
+        let outs = [
+            (0i64, 0i64, 3440i64, 1440i64, Some(0usize)),
+            (3440, 0, 1920, 1080, Some(0usize)),
+        ];
+        let full = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: vk::Extent2D {
+                width: 5360,
+                height: 1440,
+            },
+        };
+        let plans = plan_multi_output_read(&outs, full);
+        assert_eq!(
+            plans,
+            vec![
+                ScanoutReadPlan {
+                    pool_idx: 0,
+                    bo_idx: 0,
+                    src_x: 0,
+                    src_y: 0,
+                    w: 3440,
+                    h: 1440,
+                    dst_x: 0,
+                    dst_y: 0,
+                },
+                // HDMI is shorter (1080) — only its real height contributes;
+                // the rows below stay zero-filled by the caller.
+                ScanoutReadPlan {
+                    pool_idx: 1,
+                    bo_idx: 0,
+                    src_x: 0,
+                    src_y: 0,
+                    w: 1920,
+                    h: 1080,
+                    dst_x: 3440,
+                    dst_y: 0,
+                },
+            ],
+        );
+
+        // A rect straddling the seam splits between both outputs.
+        let seam = vk::Rect2D {
+            offset: vk::Offset2D { x: 3400, y: 0 },
+            extent: vk::Extent2D {
+                width: 80,
+                height: 100,
+            },
+        };
+        let plans = plan_multi_output_read(&outs, seam);
+        assert_eq!(plans.len(), 2);
+        assert_eq!((plans[0].src_x, plans[0].w, plans[0].dst_x), (3400, 40, 0));
+        assert_eq!((plans[1].src_x, plans[1].w, plans[1].dst_x), (0, 40, 40));
+
+        // A rect inside one output yields a single dst-(0,0) plan
+        // (preserves the old single-BO behavior).
+        let inside = vk::Rect2D {
+            offset: vk::Offset2D { x: 32, y: 24 },
+            extent: vk::Extent2D {
+                width: 16,
+                height: 16,
+            },
+        };
+        let plans = plan_multi_output_read(&outs, inside);
+        assert_eq!(plans.len(), 1);
+        assert_eq!(
+            (
+                plans[0].pool_idx,
+                plans[0].src_x,
+                plans[0].src_y,
+                plans[0].dst_x,
+                plans[0].dst_y
+            ),
+            (0, 32, 24, 0, 0)
+        );
+
+        // An output with no readable BO (None) is skipped → a read that
+        // only covers it produces no plans (caller errors).
+        let no_bo = [(0i64, 0i64, 3440i64, 1440i64, None)];
+        assert!(plan_multi_output_read(&no_bo, inside).is_empty());
     }
 
     #[test]
