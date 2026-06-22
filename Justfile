@@ -546,7 +546,7 @@ yserver-xfce-hw-strace log="info,yserver_core::core_loop::process_request=debug"
                   sleep 1;\
               done ) &\
               wchan_pid=$!;\
-              strace -f -tt -T -y -p "$pid" 2> desktop-client.strace;\
+              strace -f -tt -T -y -s 512 -p "$pid" 2> desktop-client.strace;\
               kill $wchan_pid 2>/dev/null;\
           fi ) &\
         watcher_pid=$!;\
