@@ -499,63 +499,57 @@ yserver-xfce-hw-telemetry log="info":
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;'
 
-# DIAGNOSTIC (#48): find WHY the desktop layer (xfdesktop / nemo-desktop)
-# is slow-or-black under yserver. Launches yserver with request-level debug
-# logging + xfce, and the moment the desktop client appears, attaches
-# `strace` to it so we can see what it BLOCKS on:
-#   recvmsg on the yserver socket -> waiting on an X reply (yserver's fault)
-#   poll/recvmsg on a dbus socket -> dbus activation/timeout
-#   ioctl on /dev/dri or futex    -> client-side Mesa/GL (e.g. RDNA4)
-# Let the session sit at the black/slow desktop for ~15s, then log out.
-# Attach ALL THREE files to the issue:
-#   yserver-hw-xfce.log    (yserver, incl. per-request debug)
-#   desktop-client.strace  (what the desktop client did / blocked on)
-#   desktop-client.wchan   (per-thread kernel wait-channel snapshots)
-# Needs `strace` (Debian/PikaOS: sudo apt install strace; Arch: pacman -S
-# strace). The watcher attaches strace to the desktop client, which is a
-# SIBLING process — that requires kernel.yama.ptrace_scope=0 (scope=1 only
-# allows an ANCESTOR to trace). The recipe checks this and tells you the
-# one-time fix if needed.
+# DIAGNOSTIC (#48 sluggishness): find WHERE yserver's wall-time goes when the
+# desktop is sluggish but the GPU is idle (low cpu_fence_wait) — i.e. is
+# yserver BLOCKED in a slow syscall (a DRM/atomic-commit or queue-submit ioctl
+# that's slow only on a given RADV/gfx12 + Mesa path), or just idle-waiting?
+# Attaches `strace -c` (per-syscall wall-time SUMMARY) to YSERVER itself, plus
+# per-thread kernel wait-channel (wchan) snapshots. Read the strace summary's
+# `% time` / `seconds` column:
+#   ioctl dominating           -> blocked in the DRM/driver path (the suspect)
+#   poll/ppoll/epoll_wait top  -> idle-waiting; yserver is NOT the bottleneck
+#   futex dominating           -> lock / thread contention
+# For per-call detail (args + duration of the blocking call, thunar-style),
+# swap `-f -c` below for `-f -tt -T -y -s 256` (bigger file, higher overhead).
+# NOTE: tracing adds syscall overhead, so the session itself feels slower while
+# traced — judge by WHERE time concentrates / what threads block on, not by
+# overall smoothness. Use the desktop ~30s to reach the sluggish state, log out.
+# Attach to the issue:
+#   yserver-hw-xfce.log  (yserver, incl. per-request debug)
+#   yserver.strace       (per-syscall wall-time summary for yserver)
+#   yserver.wchan        (per-thread kernel wait-channel snapshots)
+# strace on a SIBLING process needs kernel.yama.ptrace_scope=0 (scope=1 only
+# lets an ANCESTOR trace); the recipe checks and prints the one-time fix.
 yserver-xfce-hw-strace log="info,yserver_core::core_loop::process_request=debug":
     cargo build --release --bin yserver
     @command -v strace >/dev/null 2>&1 || { echo "ERROR: strace not installed (Debian/PikaOS: sudo apt install strace; Arch: sudo pacman -S strace)"; exit 1; }
-    @[ "$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo 0)" = "0" ] || { echo "ERROR: kernel.yama.ptrace_scope != 0 — strace can't attach to the (sibling) desktop client. Fix for this boot: sudo sysctl kernel.yama.ptrace_scope=0  (resets on reboot), then re-run."; exit 1; }
-    rm -f yserver-hw-xfce.log desktop-client.strace desktop-client.wchan
+    @[ "$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo 0)" = "0" ] || { echo "ERROR: kernel.yama.ptrace_scope != 0 — strace can't attach to the (sibling) yserver process. Fix for this boot: sudo sysctl kernel.yama.ptrace_scope=0  (resets on reboot), then re-run."; exit 1; }
+    rm -f yserver-hw-xfce.log yserver.strace yserver.wchan
     bash -c '\
         RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
             target/release/yserver > yserver-hw-xfce.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
-        ( pid="";\
-          for i in $(seq 1 120); do \
-              pid=$(pgrep -x xfdesktop | head -1);\
-              [ -z "$pid" ] && pid=$(pgrep -x nemo-desktop | head -1);\
-              [ -n "$pid" ] && break;\
-              sleep 0.25;\
-          done;\
-          if [ -z "$pid" ]; then \
-              echo "desktop client (xfdesktop/nemo-desktop) never appeared within 30s" > desktop-client.strace;\
-          else \
-              echo "attached to desktop client pid=$pid ($(cat /proc/$pid/comm 2>/dev/null))";\
-              ( for s in $(seq 1 20); do \
-                  echo "=== t+${s}s ===" >> desktop-client.wchan;\
-                  for w in /proc/$pid/task/*/wchan; do \
-                      echo "  tid $(basename $(dirname $w)): $(cat $w 2>/dev/null)" >> desktop-client.wchan;\
-                  done;\
-                  sleep 1;\
-              done ) &\
-              wchan_pid=$!;\
-              strace -f -tt -T -y -s 512 -p "$pid" 2> desktop-client.strace;\
-              kill $wchan_pid 2>/dev/null;\
-          fi ) &\
-        watcher_pid=$!;\
+        echo "tracing yserver pid=$yserver_pid";\
+        ( for s in $(seq 1 40); do \
+              echo "=== t+${s}s ===" >> yserver.wchan;\
+              for w in /proc/$yserver_pid/task/*/wchan; do \
+                  tid=$(basename $(dirname $w));\
+                  echo "  tid $tid ($(cat /proc/$yserver_pid/task/$tid/comm 2>/dev/null)): $(cat $w 2>/dev/null)" >> yserver.wchan;\
+              done;\
+              sleep 1;\
+          done ) &\
+        wchan_pid=$!;\
+        strace -f -c -p "$yserver_pid" 2> yserver.strace &\
+        strace_pid=$!;\
         env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 \
             XDG_SESSION_TYPE=x11 \
             dbus-run-session xfce4-session --display :7 > xfce.log 2>&1;\
+        kill -INT $strace_pid 2>/dev/null;\
+        kill $wchan_pid 2>/dev/null;\
         kill -TERM $yserver_pid 2>/dev/null;\
-        pkill -P $watcher_pid 2>/dev/null; kill $watcher_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;\
-        echo "DONE — attach to issue #48: yserver-hw-xfce.log desktop-client.strace desktop-client.wchan";'
+        echo "DONE — attach to issue #48: yserver-hw-xfce.log yserver.strace yserver.wchan";'
 
 # xfce on yserver with x11trace recording the full X11 wire
 # protocol between clients and yserver. xfce-session connects to
