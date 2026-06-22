@@ -552,7 +552,7 @@ yserver-xfce-hw-strace log="info,yserver_core::core_loop::process_request=debug"
         watcher_pid=$!;\
         env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 \
             XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
-            dbus-run-session xfce4-session --display :7 > xfce.log 2>&1;\
+            dbus-run-session sh tools/xfce-session-prewarm.sh xfce4-session --display :7 > xfce.log 2>&1;\
         kill -TERM $yserver_pid 2>/dev/null;\
         pkill -P $watcher_pid 2>/dev/null; kill $watcher_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;\
