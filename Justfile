@@ -522,7 +522,6 @@ yserver-xfce-hw-strace log="info,yserver_core::core_loop::process_request=debug"
     @[ "$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo 0)" = "0" ] || { echo "ERROR: kernel.yama.ptrace_scope != 0 — strace can't attach to the (sibling) desktop client. Fix for this boot: sudo sysctl kernel.yama.ptrace_scope=0  (resets on reboot), then re-run."; exit 1; }
     rm -f yserver-hw-xfce.log desktop-client.strace desktop-client.wchan
     bash -c '\
-        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
         RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
             target/release/yserver > yserver-hw-xfce.log 2>&1 &\
         yserver_pid=$!;\
@@ -551,12 +550,11 @@ yserver-xfce-hw-strace log="info,yserver_core::core_loop::process_request=debug"
           fi ) &\
         watcher_pid=$!;\
         env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 \
-            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
+            XDG_SESSION_TYPE=x11 \
             dbus-run-session sh tools/xfce-session-prewarm.sh xfce4-session --display :7 > xfce.log 2>&1;\
         kill -TERM $yserver_pid 2>/dev/null;\
         pkill -P $watcher_pid 2>/dev/null; kill $watcher_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;\
-        rm -rf "$xdg_rd" 2>/dev/null;\
         echo "DONE — attach to issue #48: yserver-hw-xfce.log desktop-client.strace desktop-client.wchan";'
 
 # xfce on yserver with x11trace recording the full X11 wire
