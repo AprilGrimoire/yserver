@@ -499,6 +499,63 @@ yserver-xfce-hw-telemetry log="info":
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;'
 
+# DIAGNOSTIC (#48): find WHY the desktop layer (xfdesktop / nemo-desktop)
+# is slow-or-black under yserver. Launches yserver with request-level debug
+# logging + xfce, and the moment the desktop client appears, attaches
+# `strace` to it so we can see what it BLOCKS on:
+#   recvmsg on the yserver socket -> waiting on an X reply (yserver's fault)
+#   poll/recvmsg on a dbus socket -> dbus activation/timeout
+#   ioctl on /dev/dri or futex    -> client-side Mesa/GL (e.g. RDNA4)
+# Let the session sit at the black/slow desktop for ~15s, then log out.
+# Attach ALL THREE files to the issue:
+#   yserver-hw-xfce.log    (yserver, incl. per-request debug)
+#   desktop-client.strace  (what the desktop client did / blocked on)
+#   desktop-client.wchan   (per-thread kernel wait-channel snapshots)
+# Needs `strace` (Debian/PikaOS: sudo apt install strace; Arch: pacman -S
+# strace). If strace says "Operation not permitted", set
+# `sudo sysctl kernel.yama.ptrace_scope=1` for the run.
+yserver-xfce-hw-strace log="info,yserver_core::core_loop::process_request=debug":
+    cargo build --release --bin yserver
+    @command -v strace >/dev/null 2>&1 || { echo "ERROR: strace not installed (Debian/PikaOS: sudo apt install strace; Arch: sudo pacman -S strace)"; exit 1; }
+    rm -f yserver-hw-xfce.log desktop-client.strace desktop-client.wchan
+    bash -c '\
+        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
+            target/release/yserver > yserver-hw-xfce.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        ( pid="";\
+          for i in $(seq 1 120); do \
+              pid=$(pgrep -x xfdesktop | head -1);\
+              [ -z "$pid" ] && pid=$(pgrep -x nemo-desktop | head -1);\
+              [ -n "$pid" ] && break;\
+              sleep 0.25;\
+          done;\
+          if [ -z "$pid" ]; then \
+              echo "desktop client (xfdesktop/nemo-desktop) never appeared within 30s" > desktop-client.strace;\
+          else \
+              echo "attached to desktop client pid=$pid ($(cat /proc/$pid/comm 2>/dev/null))";\
+              ( for s in $(seq 1 20); do \
+                  echo "=== t+${s}s ===" >> desktop-client.wchan;\
+                  for w in /proc/$pid/task/*/wchan; do \
+                      echo "  tid $(basename $(dirname $w)): $(cat $w 2>/dev/null)" >> desktop-client.wchan;\
+                  done;\
+                  sleep 1;\
+              done ) &\
+              wchan_pid=$!;\
+              strace -f -tt -T -y -p "$pid" 2> desktop-client.strace;\
+              kill $wchan_pid 2>/dev/null;\
+          fi ) &\
+        watcher_pid=$!;\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 \
+            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
+            dbus-run-session xfce4-session --display :7 > xfce.log 2>&1;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        pkill -P $watcher_pid 2>/dev/null; kill $watcher_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;\
+        rm -rf "$xdg_rd" 2>/dev/null;\
+        echo "DONE — attach to issue #48: yserver-hw-xfce.log desktop-client.strace desktop-client.wchan";'
+
 # xfce on yserver with x11trace recording the full X11 wire
 # protocol between clients and yserver. xfce-session connects to
 # the fake display `:8`; x11trace tunnels everything to yserver
