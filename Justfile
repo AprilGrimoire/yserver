@@ -512,11 +512,14 @@ yserver-xfce-hw-telemetry log="info":
 #   desktop-client.strace  (what the desktop client did / blocked on)
 #   desktop-client.wchan   (per-thread kernel wait-channel snapshots)
 # Needs `strace` (Debian/PikaOS: sudo apt install strace; Arch: pacman -S
-# strace). If strace says "Operation not permitted", set
-# `sudo sysctl kernel.yama.ptrace_scope=1` for the run.
+# strace). The watcher attaches strace to the desktop client, which is a
+# SIBLING process — that requires kernel.yama.ptrace_scope=0 (scope=1 only
+# allows an ANCESTOR to trace). The recipe checks this and tells you the
+# one-time fix if needed.
 yserver-xfce-hw-strace log="info,yserver_core::core_loop::process_request=debug":
     cargo build --release --bin yserver
     @command -v strace >/dev/null 2>&1 || { echo "ERROR: strace not installed (Debian/PikaOS: sudo apt install strace; Arch: sudo pacman -S strace)"; exit 1; }
+    @[ "$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo 0)" = "0" ] || { echo "ERROR: kernel.yama.ptrace_scope != 0 — strace can't attach to the (sibling) desktop client. Fix for this boot: sudo sysctl kernel.yama.ptrace_scope=0  (resets on reboot), then re-run."; exit 1; }
     rm -f yserver-hw-xfce.log desktop-client.strace desktop-client.wchan
     bash -c '\
         xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
