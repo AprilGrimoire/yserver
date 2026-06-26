@@ -846,6 +846,35 @@ fn drain_present_completions(state: &mut ServerState, backend: &mut dyn Backend)
         state.present_kernel_ust = ust;
         crate::core_loop::process_request::fire_due_present_notify_msc(state, msc, ust);
     }
+
+    // Idle vblank arming: if NotifyMSC requests remain parked, ask the
+    // backend to schedule a kernel vblank so the clock keeps advancing even
+    // when nothing is flipping. A full-screen compositor redirects every
+    // window → the scene is a static overlay → no pageflips → MSC never
+    // advances → the compositor's `present` clock deadlocks. The backend
+    // dedups against its per-CRTC armed-target map, so calling every
+    // iteration is safe (no refire storm).
+    if !state.present_pending_msc.is_empty() {
+        let targets: Vec<u64> = state
+            .present_pending_msc
+            .iter()
+            .map(|p| p.target_msc)
+            .collect();
+        match backend.arm_idle_vblanks(&targets) {
+            Ok(armed) => {
+                if armed > 0 {
+                    log::debug!(
+                        "PRESENT-DBG: arm_idle_vblanks pending={} -> armed={armed}",
+                        targets.len()
+                    );
+                }
+            }
+            Err(e) => log::warn!(
+                "PRESENT-DBG: arm_idle_vblanks pending={} -> ERR {e}",
+                targets.len()
+            ),
+        }
+    }
 }
 
 /// F2: pop every pending host event off the backend and fan it out

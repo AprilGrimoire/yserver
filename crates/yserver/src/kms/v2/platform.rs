@@ -499,6 +499,16 @@ fn cursor_err_disables_hw(e: &io::Error) -> bool {
     )
 }
 
+/// Returned by `drain_page_flip_events` per `DRM_CRTC_SEQUENCE` event.
+/// Fields are raw kernel values; validation (time_ns sign, crtc_id
+/// resolution) happens in `KmsBackendV2::on_crtc_sequence_event`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SequenceCompletion {
+    pub(crate) crtc_id_raw: u32,
+    pub(crate) time_ns: i64,
+    pub(crate) sequence: u64,
+}
+
 /// v2's real DRM/Vk/libinput owner. Replaces the flat field set
 /// that Stage 1b's `KmsBackendV2` carried.
 pub(crate) struct PlatformBackend {
@@ -1392,15 +1402,30 @@ impl PlatformBackend {
         fds
     }
 
-    pub(crate) fn drain_page_flip_events(&mut self) -> io::Result<Vec<usize>> {
+    pub(crate) fn drain_page_flip_events(
+        &mut self,
+    ) -> io::Result<(Vec<usize>, Vec<SequenceCompletion>)> {
         use ::drm::control::crtc;
 
         // Capture the kernel vblank (msc=frame, ust=duration) alongside the
         // CRTC so Present pacing can complete NotifyMSC with real values.
         let mut flipped: Vec<(crtc::Handle, u32, std::time::Duration)> = Vec::new();
-        crate::drm::page_flip::drain_events(&self.device, |c, frame, dur| {
-            flipped.push((c, frame, dur));
-        })?;
+        let mut sequenced: Vec<SequenceCompletion> = Vec::new();
+        crate::drm::page_flip::drain_events(
+            &self.device,
+            |c, frame, dur| {
+                flipped.push((c, frame, dur));
+            },
+            |crtc_id_raw, time_ns, sequence| {
+                // Raw kernel values; validation (time_ns sign, crtc_id
+                // resolution) happens in `on_crtc_sequence_event`.
+                sequenced.push(SequenceCompletion {
+                    crtc_id_raw,
+                    time_ns,
+                    sequence,
+                });
+            },
+        )?;
 
         let mut output_indices = Vec::with_capacity(flipped.len());
         for (crtc, frame, dur) in flipped {
@@ -1414,7 +1439,7 @@ impl PlatformBackend {
             self.ust_msc.insert(output_idx, (u64::from(frame), ust));
             output_indices.push(output_idx);
         }
-        Ok(output_indices)
+        Ok((output_indices, sequenced))
     }
 
     /// Latest kernel `(msc, ust_micros)` for the primary output (index 0),

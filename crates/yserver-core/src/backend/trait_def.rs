@@ -1911,6 +1911,27 @@ pub trait Backend: Send {
         (0, 0)
     }
 
+    /// Arm a one-shot kernel vblank event so the run loop's Present clock
+    /// keeps advancing while `PresentNotifyMSC` requests are parked but
+    /// nothing is flipping (a full-screen compositor produces no pageflips
+    /// when idle → MSC never advances → its frame clock deadlocks). Mirrors
+    /// Xorg `ms_present_queue_vblank`.
+    ///
+    /// `target_mscs` are the parked requests' target MSC values (from
+    /// `present_pending_msc`). KMS backends dedup against an internal
+    /// per-CRTC armed-target map so calling this every run-loop iteration is
+    /// safe (no refire storm), pre-gate on scanout permission, and clear the
+    /// armed map when scanout is disallowed (master loss drops queued
+    /// sequences). Returns the count of CRTCs newly armed; `0` covers the
+    /// "nothing pending" / "scanout disallowed" / "already armed" /
+    /// "unsupported kernel" cases — callers must not treat zero as an error.
+    ///
+    /// Default `Ok(0)` keeps backends without real vblanks (`HostX11`,
+    /// `Recording`) opted out — they flush parked notifies synchronously.
+    fn arm_idle_vblanks(&mut self, _target_mscs: &[u64]) -> std::io::Result<usize> {
+        Ok(0)
+    }
+
     // ──────────────────────────────────────────────────────────────
     // GLX_EXT_texture_from_pixmap export-lifetime management
     // ──────────────────────────────────────────────────────────────

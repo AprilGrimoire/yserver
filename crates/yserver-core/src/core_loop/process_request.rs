@@ -30006,7 +30006,7 @@ mod tests {
     }
 
     #[test]
-    fn present_notify_msc_immediate_sends_complete_notify() {
+    fn present_notify_msc_parks_then_fires_on_vblank_advance() {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
@@ -30056,6 +30056,26 @@ mod tests {
         )
         .expect("Present NotifyMSC");
 
+        // Vblank-paced clock: with no pageflip yet (present_kernel_msc == 0)
+        // the request is PARKED rather than completed immediately — emitting
+        // ust=0 would be rejected by a `present`-scheduler compositor (picom).
+        assert_eq!(
+            state.present_pending_msc.len(),
+            1,
+            "NotifyMSC parks until a real (msc, ust) is available"
+        );
+
+        // Simulate a pageflip / armed-vblank advancing the kernel clock. This
+        // is what `drain_present_completions` does after the backend reports a
+        // retirement; it drains every parked request whose target is satisfied.
+        const FIRED_MSC: u64 = 100;
+        const FIRED_UST: u64 = 0x1234_5678;
+        fire_due_present_notify_msc(&mut state, FIRED_MSC, FIRED_UST);
+        assert!(
+            state.present_pending_msc.is_empty(),
+            "satisfied parked request is removed after firing"
+        );
+
         let mut event = [0u8; 40];
         peer.read_exact(&mut event).expect("CompleteNotify event");
         assert_eq!(event[0], 35, "GenericEvent");
@@ -30079,6 +30099,23 @@ mod tests {
         assert_eq!(
             u32::from_le_bytes([event[20], event[21], event[22], event[23]]),
             SERIAL
+        );
+        // UST (offset 24) and MSC (offset 32) carry the real kernel values.
+        assert_eq!(
+            u64::from_le_bytes([
+                event[24], event[25], event[26], event[27], event[28], event[29], event[30],
+                event[31],
+            ]),
+            FIRED_UST,
+            "CompleteNotify reports the real UST from the vblank advance"
+        );
+        assert_eq!(
+            u64::from_le_bytes([
+                event[32], event[33], event[34], event[35], event[36], event[37], event[38],
+                event[39],
+            ]),
+            FIRED_MSC,
+            "CompleteNotify reports the real MSC from the vblank advance"
         );
     }
 

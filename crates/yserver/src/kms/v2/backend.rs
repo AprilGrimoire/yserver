@@ -356,6 +356,28 @@ pub struct KmsBackendV2 {
     /// §"`KmsCore` scope — narrowly drawn" split.
     pub(crate) cow_id: Option<crate::kms::v2::store::DrawableId>,
 
+    /// Per-CRTC armed absolute MSC for idle vblank pacing. Keyed by the
+    /// stable `crtc::Handle`; presence means "a `DRM_CRTC_SEQUENCE` is
+    /// queued on this CRTC and we are waiting for it" (value `0` is the
+    /// relative-next-vblank sentinel this spike uses). A per-CRTC map
+    /// rather than a single bool so arming CRTC A can't suppress arming
+    /// CRTC B (the dual-monitor permanent-stall class).
+    ///
+    /// **Invariant (load-bearing):** every code path that drops or
+    /// completes an armed sequence MUST clear the matching entry —
+    /// `on_crtc_sequence_event` (unconditional clear-arm before
+    /// validating), `!scanout_allowed()` in `arm_idle_vblanks_with`,
+    /// `run_suspend` / DPMS-off (master loss drops queued sequences), and
+    /// output removal (`prune_armed_targets_to_live_outputs`). A stuck
+    /// entry = a permanent ~0 fps stall on that CRTC.
+    pub(crate) armed_vblank_targets: std::collections::HashMap<::drm::control::crtc::Handle, u64>,
+
+    /// Latches true the first time `DRM_IOCTL_CRTC_QUEUE_SEQUENCE` returns
+    /// EOPNOTSUPP/ENOTTY (pre-4.14 kernels lack the ioctl). Once set we stop
+    /// attempting idle arming and degrade to flip-driven MSC only. Logged
+    /// once on transition; never resets within a process lifetime.
+    pub(crate) crtc_queue_sequence_unsupported: bool,
+
     /// CPU-side clip-mask cache for the current GC clip pixmap
     /// (depth-1 or depth-8). Install keeps identity/origin metadata
     /// current and eagerly refreshes the GPU snapshot, but defers the
@@ -1022,6 +1044,8 @@ impl KmsBackendV2 {
             last_observed_pool_creates: 0,
             last_observed_pool_resets: 0,
             cow_id: None,
+            armed_vblank_targets: std::collections::HashMap::new(),
+            crtc_queue_sequence_unsupported: false,
             clip_mask_cache: None,
             clip_mask_snapshot: None,
             fill_pattern_cache: None,
@@ -1174,6 +1198,8 @@ impl KmsBackendV2 {
             last_observed_pool_creates: 0,
             last_observed_pool_resets: 0,
             cow_id: None,
+            armed_vblank_targets: std::collections::HashMap::new(),
+            crtc_queue_sequence_unsupported: false,
             clip_mask_cache: None,
             clip_mask_snapshot: None,
             fill_pattern_cache: None,
@@ -1999,6 +2025,8 @@ impl KmsBackendV2 {
             last_observed_pool_creates: 0,
             last_observed_pool_resets: 0,
             cow_id: None,
+            armed_vblank_targets: std::collections::HashMap::new(),
+            crtc_queue_sequence_unsupported: false,
             clip_mask_cache: None,
             clip_mask_snapshot: None,
             fill_pattern_cache: None,
@@ -5394,6 +5422,124 @@ impl KmsBackendV2 {
         self.seat_state.allows_scanout()
     }
 
+    /// Clear the entire armed-target map.
+    ///
+    /// Called at lifecycle edges where the kernel has already dropped all
+    /// queued CRTC sequences: VT suspend (`run_suspend`) and DPMS-off
+    /// (`set_dpms_power` sleep side). An in-flight `DRM_CRTC_SEQUENCE` will
+    /// never arrive once DRM master is released or the CRTC is disabled, so
+    /// any surviving entry would permanently stall the per-CRTC arm cycle.
+    pub(crate) fn clear_all_armed_vblank_targets(&mut self) {
+        if !self.armed_vblank_targets.is_empty() {
+            self.armed_vblank_targets.clear();
+        }
+    }
+
+    /// Drop armed-target entries for CRTCs no longer owned by any live
+    /// output. Called after `requery_outputs_and_modeset` retires a
+    /// disconnected connector. (A new sequence event for a stale CRTC is
+    /// already dropped by `on_crtc_sequence_event`, but the map must not
+    /// retain dead entries — they would mis-dedup a CRTC id reused by a
+    /// later hotplug.)
+    pub(crate) fn prune_armed_targets_to_live_outputs(&mut self) {
+        if self.armed_vblank_targets.is_empty() {
+            return;
+        }
+        let live: std::collections::HashSet<::drm::control::crtc::Handle> = self
+            .platform
+            .outputs
+            .iter()
+            .map(|o| o.output.crtc)
+            .collect();
+        self.armed_vblank_targets.retain(|h, _| live.contains(h));
+    }
+
+    /// Side-effect-free `DRM_CRTC_SEQUENCE` event handler.
+    ///
+    /// **Invariant** (clear-arm before any drop):
+    /// 1. If `crtc_id_raw` is a valid handle, immediately remove its
+    ///    armed-target entry — ANY received sequence event proves the
+    ///    kernel's clock advanced on that pipe, so the arm is spent
+    ///    (whether or not the output is still live).
+    /// 2. Resolve `crtc_id_raw` to a live output index; drop if stale.
+    /// 3. Validate `time_ns >= 0`; negative/malformed → log + drop.
+    /// 4. Record `(sequence /*msc*/, ust_micros)` into the per-output
+    ///    `ust_msc` map so `present_get_ust_msc` reflects the advance.
+    ///
+    /// NEVER mutates scanout BO state, scene state, or triggers a flip
+    /// (black-scanout-regression guard).
+    pub(crate) fn on_crtc_sequence_event(&mut self, crtc_id_raw: u32, time_ns: i64, sequence: u64) {
+        // (1) Clear-arm by Handle, BEFORE any validity check.
+        let crtc_handle = ::drm::control::from_u32(crtc_id_raw);
+        if let Some(h) = crtc_handle {
+            self.armed_vblank_targets.remove(&h);
+        }
+        let Some(handle) = crtc_handle else {
+            log::warn!("PRESENT-DBG: CrtcSequence bogus crtc_id={crtc_id_raw} — dropped");
+            return;
+        };
+        // (2) Stale CRTC → drop (arm already cleared above).
+        let Some(output_idx) = self
+            .platform
+            .outputs
+            .iter()
+            .position(|o| o.output.crtc == handle)
+        else {
+            log::warn!(
+                "PRESENT-DBG: CrtcSequence for unknown crtc_id={crtc_id_raw} \
+                 (output removed?) — dropped"
+            );
+            return;
+        };
+        // (3) time_ns validity → microseconds (ust_msc stores micros).
+        let Ok(ns) = u64::try_from(time_ns) else {
+            log::warn!(
+                "PRESENT-DBG: CrtcSequence negative time_ns={time_ns} \
+                 crtc_id={crtc_id_raw} — dropped"
+            );
+            return;
+        };
+        // (4) Advance the per-output Present clock.
+        self.platform
+            .ust_msc
+            .insert(output_idx, (sequence, ns / 1000));
+    }
+
+    /// Testable seam for `arm_idle_vblanks`: `armer` performs the actual
+    /// ioctl (or a stub in tests). Arms a single one-shot vblank on the
+    /// **primary output** (index 0) — this spike has no per-window CRTC
+    /// routing, so all parked `NotifyMSC` waiters pace off the primary
+    /// pipe's clock. One in-flight sequence per CRTC: if already armed, the
+    /// parked notifies fire when it retires and the next iteration re-arms.
+    pub(crate) fn arm_idle_vblanks_with<F>(
+        &mut self,
+        target_mscs: &[u64],
+        mut armer: F,
+    ) -> std::io::Result<usize>
+    where
+        F: FnMut(u32 /*crtc_id*/) -> std::io::Result<()>,
+    {
+        if target_mscs.is_empty() {
+            return Ok(0);
+        }
+        // Master loss / DPMS off / VT suspend: the kernel discarded any
+        // queued sequences; drop our bookkeeping and skip arming.
+        if !self.scanout_allowed() {
+            self.clear_all_armed_vblank_targets();
+            return Ok(0);
+        }
+        let Some(handle) = self.platform.outputs.first().map(|o| o.output.crtc) else {
+            return Ok(0);
+        };
+        if self.armed_vblank_targets.contains_key(&handle) {
+            return Ok(0);
+        }
+        let crtc_id = u32::from(handle);
+        armer(crtc_id)?;
+        self.armed_vblank_targets.insert(handle, 0);
+        Ok(1)
+    }
+
     /// Suspend sequence — called by Task 12's `on_seat_ready` driver when
     /// the state machine decides `BeginSuspend`. `seat_state` is already
     /// `Suspending` at entry; the scanout gate is already closed.
@@ -5529,6 +5675,15 @@ impl KmsBackendV2 {
         //     re-renders (content marked invalidated).
         self.platform.reset_scanout_bos_for_suspend();
 
+        // 4d. Clear the per-CRTC armed-vblank-target map. The kernel drops
+        //     all queued `DRM_CRTC_SEQUENCE` events when DRM master is
+        //     revoked (step 6). A surviving entry would permanently block
+        //     the next re-arm on resume (the dedup gate would see the stale
+        //     arm and skip) → permanent ~0 fps stall. Clear unconditionally
+        //     here (GPU idle, scene drained) so resume re-arms on the first
+        //     idle tick.
+        self.clear_all_armed_vblank_targets();
+
         // 5. Suspend libinput — closes input device fds via close_restricted
         //    → seat.close_device for each input device. MUST NOT hold a
         //    LibseatInner borrow across this call (re-entrancy contract:
@@ -5596,6 +5751,11 @@ impl KmsBackendV2 {
                 if rescan.added_count != 0 || !rescan.dropped_names.is_empty() {
                     self.fire_randr_changes(state, rescan);
                 }
+                // Drop armed-target entries for CRTCs retired while suspended
+                // (disconnected connectors). The kernel already dropped their
+                // queued sequences; a stale entry would block re-arm on that
+                // handle or mis-dedup a reused CRTC id from a later hotplug.
+                self.prune_armed_targets_to_live_outputs();
             }
             Err(e) => {
                 log::error!("kms: resume: modeset failed (card gone?): {e}; exiting");
@@ -5794,6 +5954,9 @@ impl KmsBackendV2 {
                     return;
                 }
                 self.fire_randr_changes(state, rescan);
+                // A retired connector's CRTC is gone; drop any stale armed
+                // entry so it can't block re-arm or mis-dedup a reused id.
+                self.prune_armed_targets_to_live_outputs();
             }
             Err(e) => log::error!("kms: display rescan failed: {e}"),
         }
@@ -10139,13 +10302,20 @@ impl Backend for KmsBackendV2 {
         // or flush_submit_group runs. In Direct mode this is always false
         // → no behaviour change.
         if !self.scanout_allowed() {
-            // Drain to clear the DRM fd's readiness; discard results.
-            let _ = self.platform.drain_page_flip_events();
+            // Discard page-flip retires (no DRM master → don't touch scanout
+            // state) but STILL run the sequence handler so the armed-target
+            // map clears — leaving a stuck entry across suspend is exactly
+            // the permanent-stall failure mode this guards against.
+            if let Ok((_flips, sequences)) = self.platform.drain_page_flip_events() {
+                for seq in sequences {
+                    self.on_crtc_sequence_event(seq.crtc_id_raw, seq.time_ns, seq.sequence);
+                }
+            }
             log::debug!("v2 on_page_flip_ready: skipped (seat not Active)");
             return;
         }
-        let flipped = match self.platform.drain_page_flip_events() {
-            Ok(flipped) => flipped,
+        let (flipped, sequences) = match self.platform.drain_page_flip_events() {
+            Ok(pair) => pair,
             Err(e) => {
                 log::warn!("v2: drain_page_flip_events failed: {e}");
                 return;
@@ -10158,6 +10328,13 @@ impl Backend for KmsBackendV2 {
             {
                 self.telemetry.record_frame_present();
             }
+        }
+        // Idle vblank arming: clear the arm + advance the Present clock for
+        // each CRTC sequence the kernel delivered. The run loop reads the
+        // updated `(msc, ust)` via `present_get_ust_msc` and fires parked
+        // NotifyMSC, then re-arms if any remain.
+        for seq in sequences {
+            self.on_crtc_sequence_event(seq.crtc_id_raw, seq.time_ns, seq.sequence);
         }
         // The just-retired flip(s) freed up the primary atomic-commit
         // queue on at least one CRTC; retry any cursor move that lost
@@ -16746,6 +16923,52 @@ impl Backend for KmsBackendV2 {
         self.platform.present_get_ust_msc()
     }
 
+    fn arm_idle_vblanks(&mut self, target_mscs: &[u64]) -> std::io::Result<usize> {
+        // Pre-4.14 kernels lack DRM_IOCTL_CRTC_QUEUE_SEQUENCE; once we've
+        // latched that, stay flip-driven (no idle arming) for the rest of
+        // this process — the ioctl won't reappear within one master grab.
+        if self.crtc_queue_sequence_unsupported {
+            return Ok(0);
+        }
+        // Arc<Device> clone sidesteps the simultaneous &self.platform /
+        // &mut self.armed_vblank_targets borrow inside arm_idle_vblanks_with.
+        let device = self.platform.device.clone();
+        let mut newly_unsupported = false;
+        // Always arm relative=1 (next vblank). For picom's target=current+1
+        // pacing this IS the requested target; for skip-ahead targets the
+        // clock keeps ticking each vblank until `notify_msc_satisfied` passes.
+        let result = self.arm_idle_vblanks_with(target_mscs, |crtc_id| {
+            match crate::drm::page_flip::queue_crtc_sequence(
+                &device,
+                crtc_id,
+                /* relative */ true,
+                /* sequence */ 1,
+                /* user_data */ u64::from(crtc_id),
+            ) {
+                Ok(_) => Ok(()),
+                Err(e)
+                    if e.raw_os_error() == Some(libc::EOPNOTSUPP)
+                        || e.raw_os_error() == Some(libc::ENOTTY) =>
+                {
+                    newly_unsupported = true;
+                    Err(e)
+                }
+                Err(e) => Err(e),
+            }
+        });
+        if newly_unsupported {
+            log::warn!(
+                "DRM_IOCTL_CRTC_QUEUE_SEQUENCE returned EOPNOTSUPP — disabling \
+                 idle vblank arming (flip-driven MSC only) for the rest of this \
+                 DRM master grab"
+            );
+            self.crtc_queue_sequence_unsupported = true;
+            // Not a hard error for the run loop — degrade gracefully.
+            return Ok(0);
+        }
+        result
+    }
+
     fn present_capabilities(&self, _window: u32) -> PresentCaps {
         // Mirror v1's conservative "Copy-path only" caps. syncobj
         // tracks Dri3Caps::syncobj. flip_path / async_may_tear stay
@@ -17419,6 +17642,12 @@ impl Backend for KmsBackendV2 {
             self.scene.drain_all(&mut self.platform);
             log::info!("kms: dpms sleep — reset_scanout_bos_for_suspend");
             self.platform.reset_scanout_bos_for_suspend();
+            // Clear the per-CRTC armed-vblank-target map. The kernel stops
+            // generating vblank events for disabled CRTCs, so any queued
+            // `DRM_CRTC_SEQUENCE` will never fire; a stale entry would block
+            // re-arm on DPMS wake. Global off transition → clear-all.
+            log::info!("kms: dpms sleep — clear_all_armed_vblank_targets");
+            self.clear_all_armed_vblank_targets();
             log::info!("kms: dpms sleep — disable_output per output");
             let res = self.platform.dpms_set_outputs_active(false);
             // Only flip the cache on success. On Err, leave it where it was
@@ -26175,6 +26404,147 @@ mod tests {
         assert!(
             notify2.is_none(),
             "unchanged reload must not broadcast NewKeyboardNotify"
+        );
+    }
+
+    // ── Idle vblank arming (DRM_CRTC_QUEUE_SEQUENCE) ───────────────────────
+
+    #[test]
+    fn armed_vblank_targets_starts_empty() {
+        let b = super::KmsBackendV2::for_tests();
+        assert!(b.armed_vblank_targets.is_empty());
+        assert!(!b.crtc_queue_sequence_unsupported);
+    }
+
+    #[test]
+    fn clear_all_armed_vblank_targets_empties_map() {
+        let mut b = super::KmsBackendV2::for_tests();
+        let h = ::drm::control::from_u32(7).unwrap();
+        b.armed_vblank_targets.insert(h, 0);
+        b.clear_all_armed_vblank_targets();
+        assert!(b.armed_vblank_targets.is_empty());
+    }
+
+    #[test]
+    fn prune_armed_targets_drops_stale_keeps_live() {
+        let mut b = super::KmsBackendV2::for_tests();
+        let live = b.platform.outputs[0].output.crtc;
+        let stale = ::drm::control::from_u32(999).unwrap();
+        b.armed_vblank_targets.insert(live, 0);
+        b.armed_vblank_targets.insert(stale, 0);
+        b.prune_armed_targets_to_live_outputs();
+        assert!(b.armed_vblank_targets.contains_key(&live));
+        assert!(!b.armed_vblank_targets.contains_key(&stale));
+    }
+
+    #[test]
+    fn on_crtc_sequence_event_happy_path_records_msc_and_clears_arm() {
+        let mut b = super::KmsBackendV2::for_tests();
+        let crtc = b.platform.outputs[0].output.crtc;
+        b.armed_vblank_targets.insert(crtc, 0);
+
+        b.on_crtc_sequence_event(u32::from(crtc), 1_500_000 /* 1.5ms */, 7);
+
+        assert!(b.armed_vblank_targets.is_empty(), "arm must be cleared");
+        // ust_msc stores microseconds; primary output is index 0.
+        assert_eq!(b.platform.present_get_ust_msc(), (7, 1_500));
+    }
+
+    #[test]
+    fn on_crtc_sequence_event_negative_time_clears_arm_and_drops() {
+        let mut b = super::KmsBackendV2::for_tests();
+        let crtc = b.platform.outputs[0].output.crtc;
+        b.armed_vblank_targets.insert(crtc, 0);
+
+        b.on_crtc_sequence_event(u32::from(crtc), -1, 7);
+
+        assert!(
+            b.armed_vblank_targets.is_empty(),
+            "arm cleared even on drop"
+        );
+        assert_eq!(
+            b.platform.present_get_ust_msc(),
+            (0, 0),
+            "negative time_ns must not advance the clock"
+        );
+    }
+
+    #[test]
+    fn on_crtc_sequence_event_stale_crtc_clears_arm_and_drops() {
+        let mut b = super::KmsBackendV2::for_tests();
+        let stale = ::drm::control::from_u32(999).unwrap();
+        b.armed_vblank_targets.insert(stale, 0);
+
+        b.on_crtc_sequence_event(999, 1_000_000, 5);
+
+        assert!(
+            b.armed_vblank_targets.is_empty(),
+            "stale arm cleared so the CRTC can't strand"
+        );
+        assert_eq!(b.platform.present_get_ust_msc(), (0, 0));
+    }
+
+    #[test]
+    fn arm_idle_vblanks_with_empty_targets_is_noop() {
+        let mut b = super::KmsBackendV2::for_tests();
+        let mut calls = 0u32;
+        let armed = b
+            .arm_idle_vblanks_with(&[], |_| {
+                calls += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(armed, 0);
+        assert_eq!(calls, 0);
+        assert!(b.armed_vblank_targets.is_empty());
+    }
+
+    #[test]
+    fn arm_idle_vblanks_with_arms_primary_once_then_dedups() {
+        let mut b = super::KmsBackendV2::for_tests();
+        let primary = b.platform.outputs[0].output.crtc;
+        let mut calls = 0u32;
+
+        let armed = b
+            .arm_idle_vblanks_with(&[100], |_| {
+                calls += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(armed, 1);
+        assert_eq!(calls, 1);
+        assert!(b.armed_vblank_targets.contains_key(&primary));
+
+        // Already armed → no second ioctl while the sequence is in flight.
+        let armed2 = b
+            .arm_idle_vblanks_with(&[200], |_| {
+                calls += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(armed2, 0);
+        assert_eq!(calls, 1, "no re-arm while a sequence is queued");
+    }
+
+    #[test]
+    fn arm_idle_vblanks_with_scanout_disallowed_clears_and_returns_zero() {
+        let mut b = super::KmsBackendV2::for_tests();
+        let primary = b.platform.outputs[0].output.crtc;
+        b.armed_vblank_targets.insert(primary, 0);
+        b.seat_state = crate::seat::state::SeatState::Suspended;
+
+        let mut calls = 0u32;
+        let armed = b
+            .arm_idle_vblanks_with(&[100], |_| {
+                calls += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(armed, 0);
+        assert_eq!(calls, 0, "no arming without DRM master");
+        assert!(
+            b.armed_vblank_targets.is_empty(),
+            "master loss drops queued sequences → clear bookkeeping"
         );
     }
 }
