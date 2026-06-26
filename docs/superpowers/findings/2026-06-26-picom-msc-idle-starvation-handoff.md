@@ -209,5 +209,44 @@ stalled clock.
 4. Also try `--backend xrender` on fuji: it bypasses GL/DRI3 entirely. If xrender
    composites fine, that isolates the bug to the GLX/DRI3 buffer-fence path.
 
+## UPDATE 2026-06-27 — port BREAKS THE DEADLOCK on fuji; new bug: stale composite
+
+Captured picom's full request stream server-side via the new `reqtrace` target
+(`RUST_LOG=reqtrace=trace`; xtrace is unusable — it can't proxy DRI3/SHM
+SCM_RIGHTS FDs). Extension major opcodes (`nested.rs`): 140 XFIXES, 141 SHAPE,
+142 SYNC, 143 DAMAGE, 144 COMPOSITE, 145 PRESENT, 147 DRI3, 148 GLX.
+
+**fuji run WITH the port — picom's compositor loop is alive** (client 4):
+- DAMAGE `143/0x1` Create ×9, **`143/0x3` Subtract ×54** (re-arming damage)
+- PRESENT `145/0x1` Pixmap ×146, `145/0x2` NotifyMSC ×248 (presenting + pacing)
+- 248 NotifyMSCs means picom got ~248 CompleteNotifys → **the MSC clock is
+  advancing**. Every earlier fuji run had **0** Present traffic (total deadlock).
+  → The idle-vblank port does what it's for on a GPU whose kernel has
+  `DRM_IOCTL_CRTC_QUEUE_SEQUENCE` (i915, amdgpu). (Confirm arming engaged with
+  `yserver::kms::v2::backend=debug`: expect `armed=1`, no EOPNOTSUPP.)
+
+**NEW, SEPARATE bug — stale/partial composite.** With the loop running, the
+screen still doesn't update: had to click once to get the xterm to appear
+(fish prompt captured), then btop only renders as fragments *in the old
+fish-prompt colors* — the xterm never refreshes. So picom presents fine, but the
+content it composites (or what reaches scanout) is **stale**. This is NOT MSC and
+NOT the GLX/DRI3 bootstrap — it's Composite-redirect content-sync and/or
+damage-region accuracy: either yserver's redirected pixmap that picom samples
+isn't kept in sync with the window's live backing, or the damage rects picom
+re-composites are wrong/partial.
+
+### Next (compositing-correctness, separate investigation)
+1. In a presenting run, capture `reqtrace=trace` + `damage_fanout=trace`
+   together while btop animates: does fresh content-damage on the xterm reach
+   picom (match_ids>0, fresh fires) and does picom Subtract+re-present per frame?
+2. USR2 PPM dump (the popup-scanout-debug workflow) mid-stall: compare the
+   window **backing** (live content) vs its **redirected_target** pixmap (what
+   picom samples) vs **scanout**. Whichever is stale localizes the bug:
+   backing-fresh + redirect-stale → redirect sync; both-fresh + scanout-stale →
+   present→scanout.
+3. The "wrong colors" detail hints at a format/coverage issue (glyph mask
+   applied over a stale source) — worth checking the redirect pixmap's depth/
+   format vs the window.
+
 ## Memory
 `~/.claude/.../memory/project_picom_compositor_diagnosis.md` has the condensed version.
