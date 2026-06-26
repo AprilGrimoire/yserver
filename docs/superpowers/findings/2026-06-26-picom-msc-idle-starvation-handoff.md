@@ -137,5 +137,77 @@ then grep `yserver-hw-startx.log` for `damage_fanout … match_ids/fired_count`.
 - Then HARDEN: tests (deferred NotifyMSC fires on simulated vblank advance;
   armed-map clear on suspend/output-removal), run past codex, decide merge.
 
+## UPDATE 2026-06-26 (later) — port landed; fuji/air show a DIFFERENT blocker
+
+**GOAL reminder:** the objective is *picom working*, not "land the branch". The
+idle-vblank port is one means to one blocker (bee's NotifyMSC starvation). It is
+NOT the whole story.
+
+### Port status
+Idle-vblank arming ported + committed as `c18f5931` on
+`feat/present-vblank-msc-spike` (DRM_CRTC_QUEUE_SEQUENCE plumbing, per-CRTC
+armed-target map, `arm_idle_vblanks` relative=1 on the primary CRTC, lifecycle
+reconcile, EOPNOTSUPP latch). Unit suites green (core 858, yserver 633).
+**Unvalidated on bee** (the only machine where picom drives NotifyMSC) — bee was
+inaccessible. Validate there: success = btop animates with no clicking.
+
+### apple_drm (air): ioctl unsupported
+`DRM_IOCTL_CRTC_QUEUE_SEQUENCE` returns **EOPNOTSUPP** on apple_drm → arming
+latches off, stays flip-driven. So the port is inert on air; air would need the
+software-pace fallback (CLOCK_MONOTONIC ust + monotonic msc, rate-limited to
+refresh) to advance the clock without the ioctl. NOT yet built.
+
+### fuji (Intel i915): the blocker is UPSTREAM of MSC — picom never presents
+Full `core_loop=debug` + backend=debug run, picom `--backend glx`
+`--log-level=debug`, logs are **same run** (yserver UTC = picom local − 2h):
+
+- picom log: `redirect_start: Using vblank scheduler: present.` (so it commits
+  to the X Present extension), then **repeatedly**:
+  `check_render_finish: Last render did not complete during vblank, msc: 0`.
+  Its frame-clock msc is stuck at **0** the entire session.
+- yserver log: picom binds window content (DRI3 `FenceFromFD`, `seed_backing`),
+  then **ZERO** `PRESENT::NotifyMSC` and **ZERO** `PRESENT::Pixmap` reach the
+  server. (Both are logged at debug in `handle_present_request`; neither fires.)
+
+**Interpretation:** picom's present loop bootstraps by rendering frame 0, waiting
+for that render to *complete*, and only then issuing the first
+`PresentNotifyMSC`. On fuji that first render never reports completion (`msc:0`
+forever), so picom never sends a present request at all. The idle-arming has
+nothing to service — there is no parked NotifyMSC because picom never sends one.
+This is a **GLX/DRI3 render-completion / fence-signal** problem, DISTINCT from
+bee's NotifyMSC starvation (bee: 781 NotifyMSCs; fuji: 0). "Renders on click"
+because input-driven damage forces a repaint path that doesn't depend on the
+stalled clock.
+
+### Sharper localization (fuji, same run)
+- yserver already logs EVERY present request at dispatch entry
+  (`process_request.rs:7335` `PRESENT dispatch minor=…`). In the fuji run that
+  count is **0** — picom issues **no Present request of any kind** (not even
+  QueryVersion; it picks the present scheduler off the QueryExtension list).
+- DRI3 traffic: **11 `FenceFromFD`** (xshmfence imports) and nothing else logged.
+  So picom bound window content + sync fences, then stalled **before** its first
+  present/schedule. Its present scheduler won't schedule the next paint until the
+  current render "completes," that completion never arrives → `msc` stuck at 0,
+  repaint only on input-driven damage.
+- **DRI3 means yserver does NOT run picom's GL** — Mesa renders on the i915 GPU
+  inside picom's own process; yserver only hands out buffers + sync fences. So
+  the stall is in the DRI3 buffer/fence handshake or picom's render-completion
+  fence, NOT anything yserver executes on the GPU.
+
+### Next investigation (the actual goal on accessible HW)
+1. **Cheapest first (no rebuild):** run picom with Mesa/GLX debug to see where
+   its render/swap blocks —
+   `LIBGL_DEBUG=verbose MESA_DEBUG=1 picom --backend glx --log-level=debug …`
+   Look for DRI3 buffer-alloc / fence-wait stalls or a swrast/DRI fallback.
+2. If that points at the server side, instrument yserver's DRI3 path: log ALL
+   DRI3 ops (Open, PixmapFromBuffers, BuffersFromPixmap, FenceFromFD) + every
+   xshmfence trigger/wait, so we can see which fence picom waits on that yserver
+   never triggers.
+3. Cross-check master (pre-spike) on fuji: is this stall pre-existing, or did the
+   spike regress it? (Spike touches Present NotifyMSC only, not DRI3/GL fences —
+   expected pre-existing, but confirm.)
+4. Also try `--backend xrender` on fuji: it bypasses GL/DRI3 entirely. If xrender
+   composites fine, that isolates the bug to the GLX/DRI3 buffer-fence path.
+
 ## Memory
 `~/.claude/.../memory/project_picom_compositor_diagnosis.md` has the condensed version.
