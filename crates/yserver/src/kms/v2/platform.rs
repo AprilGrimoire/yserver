@@ -509,6 +509,13 @@ pub(crate) struct PlatformBackend {
     pub(crate) outputs: Vec<OutputLayout>,
     pub(crate) fb_w: u16,
     pub(crate) fb_h: u16,
+    /// Latest kernel `(msc, ust_micros)` per output index, updated on each
+    /// pageflip retirement in `drain_page_flip_events`. Drives Present
+    /// vblank pacing (`present_get_ust_msc`): a compositor's
+    /// `PresentNotifyMSC` completes with these real values so its frame
+    /// clock advances at the display refresh rate. Empty until the first
+    /// flip retires.
+    pub(crate) ust_msc: std::collections::HashMap<usize, (u64, u64)>,
 
     // Input side
     input_ctx: Option<crate::input::SendContext>,
@@ -869,6 +876,7 @@ impl PlatformBackend {
             outputs: layouts,
             fb_w,
             fb_h,
+            ust_msc: std::collections::HashMap::new(),
             input_ctx,
             #[cfg(target_os = "linux")]
             hotplug_monitor,
@@ -953,6 +961,7 @@ impl PlatformBackend {
             }],
             fb_w: 800,
             fb_h: 600,
+            ust_msc: std::collections::HashMap::new(),
             input_ctx: None,
             #[cfg(target_os = "linux")]
             hotplug_monitor,
@@ -1383,21 +1392,36 @@ impl PlatformBackend {
         fds
     }
 
-    pub(crate) fn drain_page_flip_events(&self) -> io::Result<Vec<usize>> {
+    pub(crate) fn drain_page_flip_events(&mut self) -> io::Result<Vec<usize>> {
         use ::drm::control::crtc;
 
-        let mut flipped: Vec<crtc::Handle> = Vec::new();
-        crate::drm::page_flip::drain_events(&self.device, |c| flipped.push(c))?;
+        // Capture the kernel vblank (msc=frame, ust=duration) alongside the
+        // CRTC so Present pacing can complete NotifyMSC with real values.
+        let mut flipped: Vec<(crtc::Handle, u32, std::time::Duration)> = Vec::new();
+        crate::drm::page_flip::drain_events(&self.device, |c, frame, dur| {
+            flipped.push((c, frame, dur));
+        })?;
 
         let mut output_indices = Vec::with_capacity(flipped.len());
-        for crtc in flipped {
+        for (crtc, frame, dur) in flipped {
             let Some(output_idx) = self.outputs.iter().position(|o| o.output.crtc == crtc) else {
                 log::warn!("v2: pageflip-complete for unknown CRTC {crtc:?}");
                 continue;
             };
+            // u32 frame → u64 MSC (kernel wraps at 2^32; monotonic enough
+            // for a frame clock within a session). UST in microseconds.
+            let ust = u64::try_from(dur.as_micros()).unwrap_or(u64::MAX);
+            self.ust_msc.insert(output_idx, (u64::from(frame), ust));
             output_indices.push(output_idx);
         }
         Ok(output_indices)
+    }
+
+    /// Latest kernel `(msc, ust_micros)` for the primary output (index 0),
+    /// or `(0, 0)` before the first pageflip retires. Consumed by the
+    /// Present vblank-pacing path to complete `PresentNotifyMSC`.
+    pub(crate) fn present_get_ust_msc(&self) -> (u64, u64) {
+        self.ust_msc.get(&0).copied().unwrap_or((0, 0))
     }
 
     /// VkContext accessor for the engine. Returns `None` on the

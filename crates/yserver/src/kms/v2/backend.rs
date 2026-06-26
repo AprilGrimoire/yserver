@@ -16742,6 +16742,10 @@ impl Backend for KmsBackendV2 {
         self.drain_completed_present_events_impl()
     }
 
+    fn present_get_ust_msc(&self) -> (u64, u64) {
+        self.platform.present_get_ust_msc()
+    }
+
     fn present_capabilities(&self, _window: u32) -> PresentCaps {
         // Mirror v1's conservative "Copy-path only" caps. syncobj
         // tracks Dri3Caps::syncobj. flip_path / async_may_tear stay

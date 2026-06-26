@@ -833,6 +833,19 @@ fn drain_present_completions(state: &mut ServerState, backend: &mut dyn Backend)
         // here.
         crate::core_loop::process_request::fire_present_completion_events(state, &entry);
     }
+
+    // Vblank-paced Present clock: mirror the backend's latest kernel
+    // (msc, ust) from the most recent pageflip and fire any parked
+    // NotifyMSC whose target is now satisfied. Keeps a compositor's
+    // `present` frame clock (picom) advancing at the display refresh rate —
+    // without it an unsatisfied NotifyMSC was dropped and the clock froze
+    // after one frame.
+    let (msc, ust) = backend.present_get_ust_msc();
+    if msc > 0 {
+        state.present_kernel_msc = msc;
+        state.present_kernel_ust = ust;
+        crate::core_loop::process_request::fire_due_present_notify_msc(state, msc, ust);
+    }
 }
 
 /// F2: pop every pending host event off the backend and fan it out

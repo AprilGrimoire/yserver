@@ -99,7 +99,7 @@ fn submit_flip_inner(
     )
 }
 
-pub fn drain_events<F: FnMut(crtc::Handle)>(
+pub fn drain_events<F: FnMut(crtc::Handle, u32, std::time::Duration)>(
     device: &Device,
     mut on_page_flip: F,
 ) -> io::Result<()> {
@@ -110,14 +110,22 @@ pub fn drain_events<F: FnMut(crtc::Handle)>(
 }
 
 /// Dispatch a single drm event: invoke `on_page_flip` for `Event::PageFlip`
-/// with the completing CRTC handle; ignore `Vblank` and `Unknown`.
+/// with the completing CRTC handle, the kernel vblank `frame` (MSC) and the
+/// completion `duration` (UST timestamp); ignore `Vblank` and `Unknown`.
+///
+/// The MSC/UST are forwarded for Present vblank pacing — a compositor
+/// (picom) drives its frame clock off `PresentNotifyMSC`, which must
+/// complete with the real kernel `(msc, ust)` at each pageflip.
 ///
 /// Factored out of [`drain_events`] so the per-event routing is unit-testable
 /// without a real DRM fd (synthetic [`Event::PageFlip`] values can be
 /// constructed via the public `PageFlipEvent` fields).
-fn dispatch_event<F: FnMut(crtc::Handle)>(event: Event, on_page_flip: &mut F) {
+fn dispatch_event<F: FnMut(crtc::Handle, u32, std::time::Duration)>(
+    event: Event,
+    on_page_flip: &mut F,
+) {
     if let Event::PageFlip(ev) = event {
-        on_page_flip(ev.crtc);
+        on_page_flip(ev.crtc, ev.frame, ev.duration);
     }
 }
 
@@ -133,22 +141,22 @@ mod tests {
     fn dispatch_event_passes_crtc_handle_for_page_flip() {
         let handle: crtc::Handle = from_u32(42).expect("non-zero raw handle");
         let event = Event::PageFlip(PageFlipEvent {
-            frame: 0,
-            duration: Duration::ZERO,
+            frame: 7,
+            duration: Duration::from_micros(123),
             crtc: handle,
         });
 
-        let mut seen: Vec<crtc::Handle> = Vec::new();
-        dispatch_event(event, &mut |c| seen.push(c));
+        let mut seen: Vec<(crtc::Handle, u32, Duration)> = Vec::new();
+        dispatch_event(event, &mut |c, frame, dur| seen.push((c, frame, dur)));
 
-        assert_eq!(seen, vec![handle]);
+        assert_eq!(seen, vec![(handle, 7, Duration::from_micros(123))]);
     }
 
     #[test]
     fn dispatch_event_ignores_unknown() {
         let event = Event::Unknown(Vec::new());
         let mut called = 0u32;
-        dispatch_event(event, &mut |_| called += 1);
+        dispatch_event(event, &mut |_, _, _| called += 1);
         assert_eq!(called, 0);
     }
 }

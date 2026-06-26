@@ -1902,6 +1902,15 @@ pub trait Backend: Send {
         Vec::new()
     }
 
+    /// Latest kernel `(msc, ust_micros)` for the primary output, updated on
+    /// each pageflip retirement. Drives Present vblank pacing: deferred
+    /// `PresentNotifyMSC` completions fire with these real values so a
+    /// compositor's frame clock advances at the display refresh rate.
+    /// Default `(0, 0)` for backends without real vblanks.
+    fn present_get_ust_msc(&self) -> (u64, u64) {
+        (0, 0)
+    }
+
     // ──────────────────────────────────────────────────────────────
     // GLX_EXT_texture_from_pixmap export-lifetime management
     // ──────────────────────────────────────────────────────────────

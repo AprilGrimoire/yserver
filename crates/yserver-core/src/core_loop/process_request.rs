@@ -7724,12 +7724,22 @@ fn handle_present_request(
         }
         x11present::NOTIFY_MSC => {
             if let Some(req) = x11present::parse_notify_msc(body) {
-                let current_msc = state
-                    .present_msc
-                    .get(&ResourceId(req.window))
-                    .copied()
-                    .unwrap_or(0);
-                if notify_msc_satisfied(current_msc, req.target_msc, req.divisor, req.remainder) {
+                // Vblank-paced clock: the current MSC is the real kernel
+                // value from the last pageflip (mirrored into ServerState).
+                // If already satisfied (and we have a real flip to time
+                // against), complete now; otherwise PARK the request and let
+                // a future pageflip fire it (drain_present_completions). On
+                // master these were dropped when unsatisfied, which froze a
+                // compositor's `present` frame clock after one frame.
+                let current_msc = state.present_kernel_msc;
+                let satisfied = current_msc > 0
+                    && notify_msc_satisfied(
+                        current_msc,
+                        req.target_msc,
+                        req.divisor,
+                        req.remainder,
+                    );
+                if satisfied {
                     fire_present_notify_msc_complete_events(
                         state,
                         byte_order,
@@ -7737,13 +7747,20 @@ fn handle_present_request(
                         req.window,
                         req.serial,
                         current_msc,
+                        state.present_kernel_ust,
                     );
+                } else {
+                    state
+                        .present_pending_msc
+                        .push(crate::server::PendingNotifyMsc {
+                            window: req.window,
+                            serial: req.serial,
+                            target_msc: req.target_msc,
+                            divisor: req.divisor,
+                            remainder: req.remainder,
+                            byte_order,
+                        });
                 }
-                state
-                    .present_msc
-                    .entry(ResourceId(req.window))
-                    .and_modify(|msc| *msc = (*msc).max(req.target_msc).saturating_add(1))
-                    .or_insert(req.target_msc.saturating_add(1));
             }
             debug!("client {} #{} PRESENT::NotifyMSC", client_id.0, sequence.0);
         }
@@ -8232,6 +8249,7 @@ fn fire_present_notify_msc_complete_events(
     window: u32,
     serial: u32,
     current_msc: u64,
+    ust: u64,
 ) {
     use yserver_protocol::x11::present as x11present;
     const COMPLETE_NOTIFY_MASK: u32 = 0x2;
@@ -8265,16 +8283,45 @@ fn fire_present_notify_msc_complete_events(
             serial,
             x11present::COMPLETE_KIND_NOTIFY_MSC,
             x11present::COMPLETE_MODE_COPY,
-            0,
+            ust,
             current_msc,
         );
         debug!(
-            "PRESENT NotifyMSC CompleteNotify -> client {} eid=0x{eid:x} ({} bytes)",
+            "PRESENT NotifyMSC CompleteNotify -> client {} eid=0x{eid:x} msc={current_msc} ust={ust} ({} bytes)",
             owner.0,
             ev.len()
         );
         let _ = write_to_client(client, owner, &ev);
     }
+}
+
+/// Fire every parked `NotifyMSC` (NOTIFY_MSC handler) whose target MSC is now
+/// satisfied by the real kernel `(msc, ust)` from the latest pageflip.
+/// Called from `drain_present_completions` after the backend advances the
+/// vblank clock — this is what keeps a compositor's `present` frame clock
+/// running at the display refresh rate.
+pub(crate) fn fire_due_present_notify_msc(state: &mut ServerState, msc: u64, ust: u64) {
+    if msc == 0 || state.present_pending_msc.is_empty() {
+        return;
+    }
+    const PRESENT_MAJOR_OPCODE: u8 = 145;
+    let mut still_pending = Vec::new();
+    for p in std::mem::take(&mut state.present_pending_msc) {
+        if notify_msc_satisfied(msc, p.target_msc, p.divisor, p.remainder) {
+            fire_present_notify_msc_complete_events(
+                state,
+                p.byte_order,
+                PRESENT_MAJOR_OPCODE,
+                p.window,
+                p.serial,
+                msc,
+                ust,
+            );
+        } else {
+            still_pending.push(p);
+        }
+    }
+    state.present_pending_msc = still_pending;
 }
 
 fn handle_dri3_request(
