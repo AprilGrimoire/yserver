@@ -197,6 +197,21 @@ pub fn process_request(
             header.opcode,
         );
     }
+    // Request-stream trace (FD-safe xtrace substitute): logs EVERY request's
+    // major opcode + minor (extension sub-opcode) + body length, per client.
+    // Enable with `reqtrace=trace` in RUST_LOG to capture exactly what a client
+    // (e.g. picom) sends — the tail before it goes quiet pinpoints what it's
+    // blocked after. Dedicated target so it can be toggled without the rest of
+    // this module's noise.
+    log::trace!(
+        target: "reqtrace",
+        "req client={} seq={} opcode={} minor={:#x} body_len={}",
+        client_id.0,
+        sequence.0,
+        header.opcode,
+        header.data,
+        body.len(),
+    );
     match header.opcode {
         // ── log-only no-ops (no reply, no state mutation) ──
         36 => log_void(client_id, sequence, "GrabServer"),
