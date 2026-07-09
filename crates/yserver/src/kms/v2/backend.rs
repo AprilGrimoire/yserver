@@ -1952,7 +1952,7 @@ impl KmsBackendV2 {
         for (i, layout) in base.platform.outputs.iter().enumerate() {
             let pool = crate::kms::vk::scanout::ScanoutBoPool::allocate(
                 Arc::clone(&vk),
-                Arc::clone(&base.platform.device),
+                std::rc::Rc::clone(&base.platform.device),
                 u32::from(layout.width),
                 u32::from(layout.height),
                 3,
@@ -17550,9 +17550,9 @@ impl Backend for KmsBackendV2 {
         if self.crtc_queue_sequence_unsupported {
             return Ok(0);
         }
-        // Arc<Device> clone sidesteps the simultaneous &self.platform /
+        // Rc<Device> clone sidesteps the simultaneous &self.platform /
         // &mut self.armed_vblank_targets borrow inside arm_idle_vblanks_with.
-        let device = self.platform.device.clone();
+        let device = std::rc::Rc::clone(&self.platform.device);
         let mut newly_unsupported = false;
         // Always arm relative=1 (next vblank). For picom's target=current+1
         // pacing this IS the requested target; for skip-ahead targets the

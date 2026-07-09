@@ -31,6 +31,7 @@
 use std::{
     io,
     os::fd::{AsFd, FromRawFd, OwnedFd},
+    rc::Rc,
     sync::Arc,
 };
 
@@ -226,7 +227,7 @@ pub struct ScanoutBo {
     pub vk_transfer: TransferResources,
     /// Shared DRM device handle (for un-registering the framebuffer
     /// + closing the GEM handle in Drop).
-    drm: Arc<crate::drm::Device>,
+    drm: Rc<crate::drm::Device>,
     /// Held to keep image+memory destructors anchored to a live
     /// device. Cloned per bo from the pool's Arc so individual bos
     /// can be moved/dropped independently.
@@ -285,7 +286,7 @@ impl ScanoutBo {
     /// error so the returned `Err` leaves no resources leaked.
     pub fn allocate(
         vk: Arc<VkContext>,
-        drm: Arc<crate::drm::Device>,
+        drm: Rc<crate::drm::Device>,
         width: u32,
         height: u32,
         scanout_modifiers: &[u64],
@@ -295,7 +296,7 @@ impl ScanoutBo {
         let mut errors = Vec::new();
 
         for plan in plans {
-            match Self::allocate_with_plan(Arc::clone(&vk), Arc::clone(&drm), width, height, plan) {
+            match Self::allocate_with_plan(vk.clone(), Rc::clone(&drm), width, height, plan) {
                 Ok(bo) => {
                     log::info!(
                         "scanout bo: {} succeeded ({}x{}, pitch {})",
@@ -320,7 +321,7 @@ impl ScanoutBo {
 
     fn allocate_with_plan(
         vk: Arc<VkContext>,
-        drm: Arc<crate::drm::Device>,
+        drm: Rc<crate::drm::Device>,
         width: u32,
         height: u32,
         plan: ScanoutAllocationPlan,
@@ -651,7 +652,7 @@ impl ScanoutBoPool {
     /// resources via `ScanoutBo::Drop`).
     pub fn allocate(
         vk: Arc<VkContext>,
-        drm: Arc<crate::drm::Device>,
+        drm: Rc<crate::drm::Device>,
         width: u32,
         height: u32,
         count: usize,
@@ -661,7 +662,7 @@ impl ScanoutBoPool {
         for _ in 0..count {
             bos.push(ScanoutBo::allocate(
                 Arc::clone(&vk),
-                Arc::clone(&drm),
+                Rc::clone(&drm),
                 width,
                 height,
                 scanout_modifiers,
