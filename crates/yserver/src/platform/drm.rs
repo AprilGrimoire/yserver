@@ -150,6 +150,18 @@ pub(crate) trait KmsPlatform {
     fn discover_outputs(&self, device: &crate::drm::Device) -> io::Result<Vec<Output>>;
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn primary_node_from_fd(fd: BorrowedFd<'_>) -> io::Result<DrmNode> {
+    crate::platform::drm_linux::LinuxDrmPlatform.node_from_fd(fd, DrmNodeKind::Primary)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn primary_node_from_fd(_fd: BorrowedFd<'_>) -> io::Result<DrmNode> {
+    Err(io::Error::other(
+        "DRM device identity is not implemented on this platform",
+    ))
+}
+
 /// Discover the currently connected KMS outputs on `device`.
 #[cfg(target_os = "linux")]
 pub(crate) fn discover_outputs(device: &crate::drm::Device) -> io::Result<Vec<Output>> {

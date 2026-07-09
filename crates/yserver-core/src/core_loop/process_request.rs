@@ -3303,13 +3303,8 @@ fn handle_randr_request(
 
             // Resolve connector name from crtc_id (validated above →
             // guaranteed to exist).
-            let connector = state
-                .randr
-                .outputs
-                .iter()
-                .find(|o| o.crtc_id == crtc)
-                .map(|o| o.name.clone());
-            let Some(connector) = connector else {
+            let output_row = state.randr.outputs.iter().find(|o| o.crtc_id == crtc);
+            let Some(output_row) = output_row else {
                 return emit_x11_error_with_minor(
                     state,
                     client_id,
@@ -3320,6 +3315,8 @@ fn handle_randr_request(
                     RANDR_MAJOR_OPCODE,
                 );
             };
+            let output_id = output_row.output_id;
+            let connector = output_row.name.clone();
             let mode_spec = resolved.map(|m| ModeSpec {
                 width: m.width,
                 height: m.height,
@@ -3331,7 +3328,13 @@ fn handle_randr_request(
             } else {
                 req_timestamp
             };
-            match backend.apply_crtc_config(&connector, mode_spec, i32::from(x), i32::from(y)) {
+            match backend.apply_crtc_config(
+                output_id,
+                &connector,
+                mode_spec,
+                i32::from(x),
+                i32::from(y),
+            ) {
                 Ok(true) => {
                     // Something actually changed. Single rebuild path: a CRTC
                     // set bumps lastSetTime (to the client timestamp) but NOT

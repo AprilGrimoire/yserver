@@ -1579,6 +1579,12 @@ fn tick_one_output(
     let compose_ticket = platform
         .acquire_fence_ticket()
         .map_err(|e| SceneError::Present(PresentError::Vk(e)))?;
+    let output_device_key = platform.outputs[output_idx].key.device_key;
+    let device = platform
+        .devices
+        .iter()
+        .find(|device| device.key == output_device_key)
+        .expect("scene output must reference a live KMS device");
     let pool = platform
         .scanout_pools
         .get_mut(output_idx)
@@ -1590,7 +1596,7 @@ fn tick_one_output(
     let record_start = std::time::Instant::now();
     let compose_result = record_compose_v2(
         &inner.vk,
-        &platform.device,
+        &device.device,
         &layout.output,
         bo,
         &inner.pipeline,

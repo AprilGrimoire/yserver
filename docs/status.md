@@ -43,14 +43,10 @@ Cross-cutting bugs and followups that don't fit a stage live in
   dispatcher, the `YSERVER_RENDER_MODEL` env knob, and the
   4 stub modules (compositor / render / event / fonts) were
   deleted: 14,596 lines removed across 14 files. What remains in
-  `kms/backend.rs` is ~650 lines of shared helpers (rasterisers,
-  wire-byte readers, `ClipMaskCache`, `OutputLayout`, `platform_init`,
-  `parse_add_glyphs`) still consumed by v2. The `kms/scheduler/`
-  subdir survives the deletion because v2 still uses
-  `damage::OutputDamageState` (as a dead-stored field on
-  `OutputLayout`) and `paint_batch::BatchResource` (the v2 frame
-  builder's retire-pin trait); a follow-up cleanup can fold those
-  into v2 proper.
+  `kms/backend.rs` is shared helper/data code (rasterisers, wire-byte
+  readers, `ClipMaskCache`, `ActiveOutput`, `platform_init`,
+  `parse_add_glyphs`) still consumed by v2. The old scheduler batch
+  resource abstraction now lives under `kms/v2/batch_resource.rs`.
 - 2026-06-19 gitk/Cinnamon follow-up: the remaining title-strip /
   grey-window investigation produced a concrete v2 resolver fix.
   `resolve_paint_target` now keeps walking the window hierarchy
@@ -208,12 +204,17 @@ Cross-cutting bugs and followups that don't fit a stage live in
   sysfs parent matching, connector/encoder/CRTC/primary-plane assignment,
   EDID / `IN_FORMATS` parsing, and RANDR-facing connector metadata now
   live in `platform::drm_linux`; `drm::modeset` is reduced to direct
-  atomic modeset operations on already-discovered outputs. This is not
-  PRIME provider protocol yet; it is the OS boundary needed before
-  adding cross-GPU topology and provider matching. Validation: focused
-  `platform::drm`, `platform::drm_linux`, and `render_node` tests, full
-  `cargo test -p yserver --lib`, and CI-style `cargo clippy
-  --all-targets -- -D warnings`.
+  atomic modeset operations on already-discovered outputs. Follow-up
+  groundwork moved the v2 platform owner to a device list plus
+  `ActiveOutput` records carrying device-qualified `OutputKey`s, so
+  RANDR output/CRTC ids are keyed by `(DRM device key, connector name)`
+  and provider ids have their own stable allocator slot. This is not
+  PRIME provider protocol yet; it is the OS/topology boundary needed
+  before adding cross-GPU provider replies and routing. Validation:
+  focused `platform::drm`,
+  `platform::drm_linux`, and `render_node` tests, full `cargo test -p
+  yserver --lib`, and CI-style `cargo clippy --all-targets -- -D
+  warnings`.
 - **2026-06-08 COW architectural reset**: the active Cinnamon blocker
   is now treated as a structural COW/model bug, not another
   scene-assembly edge case. Replacement design doc:
