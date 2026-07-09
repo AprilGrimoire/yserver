@@ -196,6 +196,20 @@ Cross-cutting bugs and followups that don't fit a stage live in
   and KMS unit coverage exercise identity seeding, round-trip cache
   updates, and RANDR request validation. Hardware smoke for
   `redshift`/VT-switch persistence is still pending.
+- **2026-07-08 PRIME platform boundary groundwork**: DRM node
+  discovery is now factored behind `platform::drm::DrmPlatform`.
+  Startup KMS-card selection uses platform-enumerated primary nodes,
+  stable major/minor device keys, and the existing KMS/connector probe
+  policy; `kms::render_node` now delegates sibling render-node lookup
+  to the same platform layer. The shared `platform::drm` module now
+  carries only the trait, node types, and KMS-card selection policy;
+  Linux-specific `/dev/dri` enumeration plus sysfs parent matching
+  lives in `platform::drm_linux`. This is not PRIME provider protocol
+  yet; it is the OS boundary needed before adding cross-GPU topology
+  and provider matching. Validation: focused `platform::drm`,
+  `platform::drm_linux`, and `render_node` tests, full `cargo test -p
+  yserver --lib`, and CI-style `cargo clippy --all-targets -- -D
+  warnings`.
 - **2026-06-08 COW architectural reset**: the active Cinnamon blocker
   is now treated as a structural COW/model bug, not another
   scene-assembly edge case. Replacement design doc:
