@@ -45,18 +45,41 @@ pub const RR_GET_SCREEN_RESOURCES: u8 = 8;
 pub const RR_GET_OUTPUT_INFO: u8 = 9;
 pub const RR_LIST_OUTPUT_PROPERTIES: u8 = 10;
 pub const RR_QUERY_OUTPUT_PROPERTY: u8 = 11;
+pub const RR_CONFIGURE_OUTPUT_PROPERTY: u8 = 12;
+pub const RR_CHANGE_OUTPUT_PROPERTY: u8 = 13;
+pub const RR_DELETE_OUTPUT_PROPERTY: u8 = 14;
 pub const RR_GET_OUTPUT_PROPERTY: u8 = 15;
+pub const RR_CREATE_MODE: u8 = 16;
+pub const RR_DESTROY_MODE: u8 = 17;
+pub const RR_ADD_OUTPUT_MODE: u8 = 18;
+pub const RR_DELETE_OUTPUT_MODE: u8 = 19;
 pub const RR_GET_CRTC_INFO: u8 = 20;
 pub const RR_SET_CRTC_CONFIG: u8 = 21;
 pub const RR_GET_CRTC_GAMMA_SIZE: u8 = 22;
 pub const RR_GET_CRTC_GAMMA: u8 = 23;
 pub const RR_SET_CRTC_GAMMA: u8 = 24;
 pub const RR_GET_SCREEN_RESOURCES_CURRENT: u8 = 25;
+pub const RR_SET_CRTC_TRANSFORM: u8 = 26;
 pub const RR_GET_CRTC_TRANSFORM: u8 = 27;
 pub const RR_GET_PANNING: u8 = 28;
+pub const RR_SET_PANNING: u8 = 29;
+pub const RR_SET_OUTPUT_PRIMARY: u8 = 30;
 pub const RR_GET_OUTPUT_PRIMARY: u8 = 31;
 pub const RR_GET_PROVIDERS: u8 = 32;
+pub const RR_GET_PROVIDER_INFO: u8 = 33;
+pub const RR_SET_PROVIDER_OFFLOAD_SINK: u8 = 34;
+pub const RR_SET_PROVIDER_OUTPUT_SOURCE: u8 = 35;
+pub const RR_LIST_PROVIDER_PROPERTIES: u8 = 36;
+pub const RR_QUERY_PROVIDER_PROPERTY: u8 = 37;
+pub const RR_CONFIGURE_PROVIDER_PROPERTY: u8 = 38;
+pub const RR_CHANGE_PROVIDER_PROPERTY: u8 = 39;
+pub const RR_DELETE_PROVIDER_PROPERTY: u8 = 40;
+pub const RR_GET_PROVIDER_PROPERTY: u8 = 41;
 pub const RR_GET_MONITORS: u8 = 42;
+pub const RR_SET_MONITOR: u8 = 43;
+pub const RR_DELETE_MONITOR: u8 = 44;
+pub const RR_CREATE_LEASE: u8 = 45;
+pub const RR_FREE_LEASE: u8 = 46;
 
 pub const NOTIFY_MASK_SCREEN_CHANGE: u16 = 1 << 0;
 pub const NOTIFY_MASK_CRTC_CHANGE: u16 = 1 << 1;
@@ -67,6 +90,8 @@ pub const EVENT_NOTIFY: u8 = 1;
 pub const NOTIFY_CRTC_CHANGE: u8 = 0;
 pub const NOTIFY_OUTPUT_CHANGE: u8 = 1;
 pub const ROTATION_ROTATE_0: u16 = 1;
+pub const SET_CONFIG_SUCCESS: u8 = 0;
+pub const SET_CONFIG_FAILED: u8 = 3;
 pub const SUBPIXEL_UNKNOWN: u16 = 0;
 pub const CONNECTION_CONNECTED: u8 = 0;
 
@@ -173,6 +198,62 @@ pub struct SetScreenSizeRequest {
     pub mm_height: u32,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct SetCrtcTransformRequest {
+    pub crtc: u32,
+    pub transform: [i32; 9],
+    pub filter_name_len: u16,
+}
+
+impl SetCrtcTransformRequest {
+    #[must_use]
+    pub fn is_identity_transform(&self) -> bool {
+        self.transform == [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x0001_0000]
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct SetPanningRequest {
+    pub crtc: u32,
+    pub timestamp: u32,
+    pub left: u16,
+    pub top: u16,
+    pub width: u16,
+    pub height: u16,
+    pub track_left: u16,
+    pub track_top: u16,
+    pub track_width: u16,
+    pub track_height: u16,
+    pub border_left: i16,
+    pub border_top: i16,
+    pub border_right: i16,
+    pub border_bottom: i16,
+}
+
+impl SetPanningRequest {
+    #[must_use]
+    pub fn is_disabled(&self) -> bool {
+        self.left == 0
+            && self.top == 0
+            && self.width == 0
+            && self.height == 0
+            && self.track_left == 0
+            && self.track_top == 0
+            && self.track_width == 0
+            && self.track_height == 0
+            && self.border_left == 0
+            && self.border_top == 0
+            && self.border_right == 0
+            && self.border_bottom == 0
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct SetOutputPrimaryRequest {
+    pub window: u32,
+    pub output: u32,
+}
+
 // ── Request parsers ───────────────────────────────────────────────────────────
 
 pub fn parse_query_version(body: &[u8]) -> Option<QueryVersionRequest> {
@@ -276,6 +357,59 @@ pub fn parse_set_screen_size_request(body: &[u8]) -> Option<SetScreenSizeRequest
         height: read_u16_le(&body[6..]),
         mm_width: read_u32_le(&body[8..]),
         mm_height: read_u32_le(&body[12..]),
+    })
+}
+
+pub fn parse_set_crtc_transform_request(body: &[u8]) -> Option<SetCrtcTransformRequest> {
+    if body.len() < 44 {
+        return None;
+    }
+    let mut transform = [0i32; 9];
+    for (idx, slot) in transform.iter_mut().enumerate() {
+        let offset = 4 + idx * 4;
+        *slot = i32::from_le_bytes(body[offset..offset + 4].try_into().ok()?);
+    }
+    let filter_name_len = read_u16_le(&body[40..]);
+    let padded_filter_len = pad4(usize::from(filter_name_len));
+    if body.len() < 44usize.saturating_add(padded_filter_len) {
+        return None;
+    }
+    Some(SetCrtcTransformRequest {
+        crtc: read_u32_le(body),
+        transform,
+        filter_name_len,
+    })
+}
+
+pub fn parse_set_panning_request(body: &[u8]) -> Option<SetPanningRequest> {
+    if body.len() < 32 {
+        return None;
+    }
+    Some(SetPanningRequest {
+        crtc: read_u32_le(body),
+        timestamp: read_u32_le(&body[4..]),
+        left: read_u16_le(&body[8..]),
+        top: read_u16_le(&body[10..]),
+        width: read_u16_le(&body[12..]),
+        height: read_u16_le(&body[14..]),
+        track_left: read_u16_le(&body[16..]),
+        track_top: read_u16_le(&body[18..]),
+        track_width: read_u16_le(&body[20..]),
+        track_height: read_u16_le(&body[22..]),
+        border_left: i16::from_le_bytes(body[24..26].try_into().ok()?),
+        border_top: i16::from_le_bytes(body[26..28].try_into().ok()?),
+        border_right: i16::from_le_bytes(body[28..30].try_into().ok()?),
+        border_bottom: i16::from_le_bytes(body[30..32].try_into().ok()?),
+    })
+}
+
+pub fn parse_set_output_primary_request(body: &[u8]) -> Option<SetOutputPrimaryRequest> {
+    if body.len() < 8 {
+        return None;
+    }
+    Some(SetOutputPrimaryRequest {
+        window: read_u32_le(body),
+        output: read_u32_le(&body[4..]),
     })
 }
 
@@ -728,6 +862,23 @@ pub fn encode_get_panning_reply(
     put(byte_order, &mut out, timestamp); // bytes 8-11
     out.extend_from_slice(&[0u8; 24]); // 12 × u16 fields, all zero
     debug_assert_eq!(out.len(), 36);
+    out
+}
+
+/// Encodes a `SetPanning` reply. `status` is one of the RRSetConfig*
+/// values; yserver only accepts disabled/no-op panning and returns
+/// `SET_CONFIG_FAILED` for non-zero panning because that would require
+/// a transformed/composited viewport path.
+pub fn encode_set_panning_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    status: u8,
+    timestamp: u32,
+) -> Vec<u8> {
+    let mut out = fixed_reply(byte_order, sequence, status, 0);
+    put(byte_order, &mut out, timestamp);
+    out.extend_from_slice(&[0u8; 20]);
+    debug_assert_eq!(out.len(), 32);
     out
 }
 

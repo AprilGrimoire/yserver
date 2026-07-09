@@ -62,7 +62,7 @@ const fn extension_request_swap_table(major: u8, minor: u8) -> Option<&'static [
 
 const fn randr_request_swap_table(minor: u8) -> Option<&'static [FieldEntry]> {
     use FieldEntry::{ElementArrayTail, Fixed};
-    use FieldKind::{U16, U32};
+    use FieldKind::{I16, U16, U32};
 
     macro_rules! u32f {
         ($off:expr) => {
@@ -80,8 +80,47 @@ const fn randr_request_swap_table(minor: u8) -> Option<&'static [FieldEntry]> {
             }
         };
     }
+    macro_rules! i16f {
+        ($off:expr) => {
+            Fixed {
+                offset: $off,
+                kind: I16,
+            }
+        };
+    }
 
     Some(match minor {
+        super::randr::RR_GET_CRTC_TRANSFORM | super::randr::RR_GET_PANNING => &[u32f!(0)],
+        super::randr::RR_SET_CRTC_TRANSFORM => &[
+            u32f!(0),
+            u32f!(4),
+            u32f!(8),
+            u32f!(12),
+            u32f!(16),
+            u32f!(20),
+            u32f!(24),
+            u32f!(28),
+            u32f!(32),
+            u32f!(36),
+            u16f!(40),
+        ],
+        super::randr::RR_SET_PANNING => &[
+            u32f!(0),
+            u32f!(4),
+            u16f!(8),
+            u16f!(10),
+            u16f!(12),
+            u16f!(14),
+            u16f!(16),
+            u16f!(18),
+            u16f!(20),
+            u16f!(22),
+            i16f!(24),
+            i16f!(26),
+            i16f!(28),
+            i16f!(30),
+        ],
+        super::randr::RR_SET_OUTPUT_PRIMARY => &[u32f!(0), u32f!(4)],
         super::randr::RR_SET_CRTC_GAMMA => {
             &[u32f!(0), u16f!(4), ElementArrayTail { from: 8, kind: U16 }]
         }
@@ -783,5 +822,17 @@ mod tests {
         assert_eq!(u16::from_le_bytes([body[4], body[5]]), 2);
         assert_eq!(u16::from_le_bytes([body[8], body[9]]), 1);
         assert_eq!(u16::from_le_bytes([body[18], body[19]]), 6);
+    }
+
+    #[test]
+    fn randr_crtc_id_requests_swap_crtc() {
+        for minor in [
+            crate::x11::randr::RR_GET_CRTC_TRANSFORM,
+            crate::x11::randr::RR_GET_PANNING,
+        ] {
+            let mut body = vec![0x00, 0x00, 0x00, 0x02];
+            swap_request_body(128, minor, ClientByteOrder::BigEndian, &mut body);
+            assert_eq!(u32::from_le_bytes([body[0], body[1], body[2], body[3]]), 2);
+        }
     }
 }

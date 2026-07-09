@@ -3311,6 +3311,7 @@ impl KmsBackendV2 {
             state.randr.width_mm,
             state.randr.height_mm,
         );
+        let prev_primary = state.randr.primary_output;
         let (outputs, mode_table) = self.randr_outputs_and_modes();
         let new_ts = set_time.unwrap_or(prev_ts);
         let ts_now = state.timestamp_now();
@@ -3323,6 +3324,15 @@ impl KmsBackendV2 {
         state.randr.screen_height = prev_screen.1;
         state.randr.width_mm = prev_screen.2;
         state.randr.height_mm = prev_screen.3;
+        if prev_primary == 0
+            || state
+                .randr
+                .outputs
+                .iter()
+                .any(|o| o.output_id == prev_primary && o.connected)
+        {
+            state.randr.primary_output = prev_primary;
+        }
         state.randr.config_timestamp = if config_changed { ts_now } else { prev_ct };
     }
 
