@@ -34,15 +34,19 @@ use crate::{
     present::{self, State},
 };
 
+#[allow(dead_code)]
 const DRM_TOKEN: u64 = 1;
+#[allow(dead_code)]
 const INPUT_TOKEN: u64 = 2;
+#[allow(dead_code)]
 const SIGNAL_TOKEN: u64 = 3;
 
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
-pub fn run_loop(
+pub(crate) fn run_loop(
     device: &Rc<Device>,
-    output: &drm::modeset::Output,
+    output: &crate::platform::drm::Output,
     swapchain: &mut Swapchain,
     input_ctx: Option<&mut input::Context>,
     signal_fd: &SignalFd,
@@ -152,10 +156,11 @@ pub fn run_loop(
 }
 
 #[cfg(target_os = "freebsd")]
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
-pub fn run_loop(
+pub(crate) fn run_loop(
     device: &Rc<Device>,
-    output: &drm::modeset::Output,
+    output: &crate::platform::drm::Output,
     swapchain: &mut Swapchain,
     input_ctx: Option<&mut input::Context>,
     signal_kq: &Kqueue,

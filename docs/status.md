@@ -202,14 +202,18 @@ Cross-cutting bugs and followups that don't fit a stage live in
   stable major/minor device keys, and the existing KMS/connector probe
   policy; `kms::render_node` now delegates sibling render-node lookup
   to the same platform layer. The shared `platform::drm` module now
-  carries only the trait, node types, and KMS-card selection policy;
-  Linux-specific `/dev/dri` enumeration plus sysfs parent matching
-  lives in `platform::drm_linux`. This is not PRIME provider protocol
-  yet; it is the OS boundary needed before adding cross-GPU topology
-  and provider matching. Validation: focused `platform::drm`,
-  `platform::drm_linux`, and `render_node` tests, full `cargo test -p
-  yserver --lib`, and CI-style `cargo clippy --all-targets -- -D
-  warnings`.
+  carries the node types, normalized KMS `Mode`/`Output` records,
+  `DrmPlatform`, `KmsPlatform`, KMS-card selection policy, and the KMS
+  output-discovery entry point. Linux-specific `/dev/dri` enumeration,
+  sysfs parent matching, connector/encoder/CRTC/primary-plane assignment,
+  EDID / `IN_FORMATS` parsing, and RANDR-facing connector metadata now
+  live in `platform::drm_linux`; `drm::modeset` is reduced to direct
+  atomic modeset operations on already-discovered outputs. This is not
+  PRIME provider protocol yet; it is the OS boundary needed before
+  adding cross-GPU topology and provider matching. Validation: focused
+  `platform::drm`, `platform::drm_linux`, and `render_node` tests, full
+  `cargo test -p yserver --lib`, and CI-style `cargo clippy
+  --all-targets -- -D warnings`.
 - **2026-06-08 COW architectural reset**: the active Cinnamon blocker
   is now treated as a structural COW/model bug, not another
   scene-assembly edge case. Replacement design doc:

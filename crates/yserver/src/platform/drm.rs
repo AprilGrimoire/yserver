@@ -15,7 +15,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use ::drm::control::{Device as _, connector};
+use ::drm::control::{Device as _, Mode as DrmMode, connector, crtc, plane, property};
 
 /// Stable kernel device identity for a DRM node.
 ///
@@ -58,6 +58,77 @@ pub(crate) struct KmsCardCandidate {
     pub(crate) has_connected_connector: bool,
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Mode {
+    pub(crate) name: String,
+    pub(crate) width: u16,
+    pub(crate) height: u16,
+    pub(crate) vrefresh: u32,
+    pub(crate) preferred: bool,
+    /// Real kernel timing (from `drmModeModeInfo`), carried through so
+    /// the RANDR `ModeInfo` reply reproduces the exact fractional refresh
+    /// Xorg reports (e.g. 59.95, not integer 60). `clock_khz == 0` means
+    /// timing is unknown (synthetic/test modes) and the RANDR layer falls
+    /// back to synthesising blanking. See `yserver_core::randr::ModeTiming`.
+    pub(crate) clock_khz: u32,
+    pub(crate) hsync_start: u16,
+    pub(crate) hsync_end: u16,
+    pub(crate) htotal: u16,
+    pub(crate) vsync_start: u16,
+    pub(crate) vsync_end: u16,
+    pub(crate) vtotal: u16,
+    /// Raw `DRM_MODE_FLAG_*` bits; mapped to RANDR flags at report time.
+    pub(crate) flags: u32,
+}
+
+/// Normalized KMS topology for one connected output.
+#[derive(Debug)]
+pub(crate) struct Output {
+    pub(crate) connector: connector::Handle,
+    pub(crate) connector_name: String,
+    pub(crate) crtc: crtc::Handle,
+    pub(crate) plane: plane::Handle,
+    pub(crate) mode: DrmMode,
+    pub(crate) picked: Mode,
+    pub(crate) plane_fb_id_prop: property::Handle,
+    pub(crate) plane_crtc_id_prop: property::Handle,
+    /// Cached explicit-sync plane property. `None` means the driver
+    /// did not expose it during modeset discovery; page-flip submission
+    /// falls back to lookup so compatibility stays unchanged.
+    pub(crate) plane_in_fence_fd_prop: Option<property::Handle>,
+    /// Cached explicit-sync CRTC property. See
+    /// [`Self::plane_in_fence_fd_prop`].
+    pub(crate) crtc_out_fence_ptr_prop: Option<property::Handle>,
+    /// DRM modifiers accepted by the primary plane for XRGB8888
+    /// scanout, parsed from the optional IN_FORMATS property. Empty
+    /// means the driver did not expose IN_FORMATS or parsing failed;
+    /// callers should fall back to conservative legacy probing.
+    pub(crate) scanout_modifiers: Vec<u64>,
+    /// EDID-derived physical width of the connected display in
+    /// millimeters. 0 if the connector did not report a size (e.g.
+    /// virtio-gpu, displays without EDID); callers should fall back
+    /// to a 96-DPI synthesis from pixel dimensions.
+    pub(crate) mm_width: u32,
+    /// EDID-derived physical height; see [`Self::mm_width`].
+    pub(crate) mm_height: u32,
+    /// Raw EDID blob read from the connector's `EDID` property (128
+    /// bytes, or 256 with an extension block). Empty when the connector
+    /// exposes no EDID (virtio-gpu, headless). Served to RANDR clients
+    /// as the `EDID`/`EDID_DATA` output property so monitor-identity
+    /// matching (mate/mutter `monitors.xml`) works.
+    pub(crate) edid: Vec<u8>,
+    /// RANDR `ConnectorType` property value name mapped from the DRM
+    /// connector interface (`"DisplayPort"`, `"HDMI"`, `"DVI-D"`,
+    /// `"VGA"`, `"Panel"`, ...; `"unknown"` when unmappable).
+    pub(crate) connector_type: String,
+    /// The connector's full local mode list, preferred-first, as
+    /// reported by the kernel/EDID. `picked` is the boot default and
+    /// is always present in this list. Used by RANDR to advertise the
+    /// selectable mode set (`GetOutputInfo` / `GetScreenResources`) and
+    /// by `apply_crtc_config` to resolve a client-requested mode.
+    pub(crate) modes: Vec<Mode>,
+}
+
 /// Platform boundary for DRM node enumeration and node relationship
 /// queries. Common KMS/RANDR code should use this instead of directly
 /// walking OS-specific device filesystems.
@@ -67,6 +138,29 @@ pub(crate) trait DrmPlatform {
     fn node_from_fd(&self, fd: BorrowedFd<'_>, kind: DrmNodeKind) -> io::Result<DrmNode>;
     fn render_node_for_primary(&self, primary: &DrmNode) -> io::Result<Option<DrmNode>>;
     fn open_node(&self, node: &DrmNode) -> io::Result<OwnedFd>;
+}
+
+/// Platform boundary for KMS connector/output discovery on an already-open
+/// primary DRM node.
+///
+/// The returned `Output` records are yserver's normalized KMS topology:
+/// connected connector, selected mode, assigned CRTC, assigned primary
+/// plane, scanout modifiers, EDID, and RANDR-facing connector metadata.
+pub(crate) trait KmsPlatform {
+    fn discover_outputs(&self, device: &crate::drm::Device) -> io::Result<Vec<Output>>;
+}
+
+/// Discover the currently connected KMS outputs on `device`.
+#[cfg(target_os = "linux")]
+pub(crate) fn discover_outputs(device: &crate::drm::Device) -> io::Result<Vec<Output>> {
+    crate::platform::drm_linux::LinuxDrmPlatform.discover_outputs(device)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn discover_outputs(_device: &crate::drm::Device) -> io::Result<Vec<Output>> {
+    Err(io::Error::other(
+        "KMS output discovery is not implemented on this platform",
+    ))
 }
 
 /// Resolve the KMS card yserver should drive at startup.

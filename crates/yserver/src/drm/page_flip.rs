@@ -17,9 +17,9 @@ use drm::control::{
     AtomicCommitFlags, Device as ControlDevice, Event, atomic::AtomicModeReq, crtc, framebuffer,
 };
 
-use crate::drm::{
-    Device,
-    modeset::{Output, PropMap},
+use crate::{
+    drm::{Device, modeset::PropMap},
+    platform::drm::Output,
 };
 
 #[cfg(target_os = "linux")]
@@ -143,7 +143,12 @@ pub(crate) fn queue_crtc_sequence(
     Ok(req.sequence)
 }
 
-pub fn submit_flip(device: &Device, output: &Output, fb_id: framebuffer::Handle) -> io::Result<()> {
+#[allow(dead_code)]
+pub(crate) fn submit_flip(
+    device: &Device,
+    output: &Output,
+    fb_id: framebuffer::Handle,
+) -> io::Result<()> {
     submit_flip_inner(device, output, fb_id, None, None)
 }
 
@@ -157,7 +162,7 @@ pub fn submit_flip(device: &Device, output: &Output, fb_id: framebuffer::Handle)
 /// commit (rc=0). On `-EBUSY` (or any other error) the caller still
 /// owns the fd and must close it. `out_fence_holder` is written with
 /// the new fence fd that the caller owns.
-pub fn submit_flip_with_fences(
+pub(crate) fn submit_flip_with_fences(
     device: &Device,
     output: &Output,
     fb_id: framebuffer::Handle,

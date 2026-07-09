@@ -685,7 +685,7 @@ unsafe impl Send for KmsBackendV2 {}
 /// falls back to synthesised blanking. The low 6 `DRM_MODE_FLAG_*` bits
 /// (sync polarity / interlace / doublescan) coincide with the RANDR
 /// `RR_*` flag bits; higher DRM-only bits are masked off.
-fn mode_timing(m: &crate::drm::modeset::Mode) -> Option<yserver_core::randr::ModeTiming> {
+fn mode_timing(m: &crate::platform::drm::Mode) -> Option<yserver_core::randr::ModeTiming> {
     if m.clock_khz == 0 {
         return None;
     }
@@ -1134,7 +1134,7 @@ impl KmsBackendV2 {
         layout: Option<String>,
         commit: fn(
             &crate::drm::Device,
-            &crate::drm::modeset::Output,
+            &crate::platform::drm::Output,
             ::drm::control::framebuffer::Handle,
         ) -> io::Result<()>,
     ) -> io::Result<Self> {
@@ -1274,7 +1274,7 @@ impl KmsBackendV2 {
         layout: Option<String>,
         commit: fn(
             &crate::drm::Device,
-            &crate::drm::modeset::Output,
+            &crate::platform::drm::Output,
             ::drm::control::framebuffer::Handle,
         ) -> io::Result<()>,
     ) -> io::Result<Self> {
@@ -11507,7 +11507,7 @@ impl Backend for KmsBackendV2 {
         // discover_outputs reads connector/mode/property state and
         // computes a hypothetical CRTC/plane assignment but commits
         // nothing, so it is safe to call while outputs are live.
-        let discovered = crate::drm::modeset::discover_outputs(&self.platform.device)?;
+        let discovered = crate::platform::drm::discover_outputs(&self.platform.device)?;
         let mut changed = false;
         let mut seen: HashSet<String> = HashSet::new();
         for out in &discovered {
@@ -11667,7 +11667,7 @@ impl Backend for KmsBackendV2 {
                 // Re-discover all outputs to get a fresh Output with the
                 // correct CRTC/plane/property assignments. We filter to
                 // the one matching `connector`.
-                let discovered = match crate::drm::modeset::discover_outputs(&self.platform.device)
+                let discovered = match crate::platform::drm::discover_outputs(&self.platform.device)
                 {
                     Ok(v) => v,
                     Err(e) => {
@@ -18607,7 +18607,7 @@ mod tests {
         // A real 2560x1440@59.95 mode: timing must pass through verbatim,
         // and DRM-only flag bits above the RANDR RR_* range must be masked
         // so we never advertise a bit RANDR would misinterpret.
-        let m = crate::drm::modeset::Mode {
+        let m = crate::platform::drm::Mode {
             name: "2560x1440".into(),
             width: 2560,
             height: 1440,
@@ -18632,7 +18632,7 @@ mod tests {
         assert_eq!(t.mode_flags, 0x5, "DRM-only bits masked to RR_* range");
 
         // Synthetic/nested mode (no clock) => None => RANDR synthesises.
-        let synthetic = crate::drm::modeset::Mode {
+        let synthetic = crate::platform::drm::Mode {
             width: 800,
             height: 600,
             vrefresh: 60,

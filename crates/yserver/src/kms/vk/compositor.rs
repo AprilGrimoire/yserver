@@ -15,7 +15,10 @@ use super::{
     device::VkContext,
     scanout::{BoPhase, ScanoutBo},
 };
-use crate::drm::{Device as DrmDevice, modeset::Output, page_flip::submit_flip_with_fences};
+use crate::{
+    drm::{Device as DrmDevice, page_flip::submit_flip_with_fences},
+    platform::drm::Output,
+};
 
 /// Backend switch for which scanout path is active. Phase 4.1.5
 /// retired the pixman alternatives — Vulkan composite is the sole
@@ -128,7 +131,8 @@ pub struct CompositeScene {
 ///    `OUT_FENCE_PTR`. On accept: bo → `Pending` + adopt the
 ///    out-fence; on reject: revert to `Free`, close the held fd.
 #[allow(clippy::too_many_arguments)]
-pub fn record_and_present_composite(
+#[allow(dead_code)]
+pub(crate) fn record_and_present_composite(
     vk: &VkContext,
     drm: &DrmDevice,
     output: &Output,
@@ -229,6 +233,7 @@ pub fn record_and_present_composite(
     }
 }
 
+#[allow(dead_code)]
 fn record_composite_command_buffer(
     vk: &VkContext,
     bo: &ScanoutBo,
