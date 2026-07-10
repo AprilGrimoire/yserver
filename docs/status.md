@@ -210,7 +210,11 @@ Cross-cutting bugs and followups that don't fit a stage live in
   RANDR output/CRTC ids are keyed by `(DRM device key, connector name)`
   and provider ids have their own stable allocator slot. This is not
   PRIME provider protocol yet; it is the OS/topology boundary needed
-  before adding cross-GPU provider replies and routing. Validation:
+  before adding cross-GPU provider replies and routing. The KMS startup
+  path accepts both "no KMS device" and "KMS device with no connected
+  outputs" as headless states with an empty active-output layout. Device-
+  dependent services such as scanout, cursor planes, and DRI3 remain
+  unavailable in the no-device state. Validation:
   focused `platform::drm`,
   `platform::drm_linux`, and `render_node` tests, full `cargo test -p
   yserver --lib`, and CI-style `cargo clippy --all-targets -- -D

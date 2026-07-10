@@ -7,7 +7,7 @@
 //! functions + plain-data types v2 still uses:
 //!
 //! - `ActiveOutput` / `Rect` / `PlatformInit` / `platform_init` —
-//!   per-output bring-up that v2's `PlatformBackend::open_with_commit`
+//!   device/output bring-up that v2's `PlatformBackend::open_with_commit`
 //!   delegates into.
 //! - Wire-byte helpers (`read_i16_pair`, `read_rect`) consumed by v2's
 //!   poly_* dispatch.
@@ -27,7 +27,7 @@
 //! v1; a future rename to something like `kms::raster` is fine but
 //! not load-bearing.
 
-use std::{io, rc::Rc};
+use std::{io, path::PathBuf, rc::Rc};
 
 use crate::{
     drm,
@@ -185,6 +185,43 @@ pub(crate) fn bresenham_segment(x0: i32, y0: i32, x1: i32, y1: i32, out: &mut Ve
             err += dx;
             y += sy;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unused_commit(
+        _device: &crate::drm::Device,
+        _output: &crate::platform::drm::Output,
+        _fb: ::drm::control::framebuffer::Handle,
+    ) -> io::Result<()> {
+        unreachable!("no output should be committed when every DRM open fails")
+    }
+
+    #[test]
+    fn platform_init_accepts_all_open_failures_as_headless() {
+        let suffix = std::process::id();
+        let first = std::env::temp_dir().join(format!("yserver-missing-drm-{suffix}-a"));
+        let second = std::env::temp_dir().join(format!("yserver-missing-drm-{suffix}-b"));
+
+        let init = platform_init(&[first, second], unused_commit)
+            .expect("missing DRM paths should produce a headless platform");
+
+        assert!(init.devices.is_empty());
+        assert!(init.layouts.is_empty());
+        assert_eq!((init.fb_w, init.fb_h), (0, 0));
+    }
+
+    #[test]
+    fn platform_init_accepts_empty_device_list_as_headless() {
+        let init = platform_init(&[], unused_commit)
+            .expect("an empty DRM device list should produce a headless platform");
+
+        assert!(init.devices.is_empty());
+        assert!(init.layouts.is_empty());
+        assert_eq!((init.fb_w, init.fb_h), (0, 0));
     }
 }
 
@@ -463,57 +500,56 @@ pub(crate) fn primary_output_center(outputs: &[ActiveOutput], fb_w: u16, fb_h: u
     )
 }
 
-/// Transient handoff from platform bring-up to the long-lived KMS
-/// backend.
+/// One DRM/KMS device opened during platform bring-up.
 ///
-/// Stage 1 (`platform_init` / `platform_init_with_fd`) opens or wraps
-/// the DRM device, derives its stable `device_key`, discovers connected
-/// outputs, commits initial scanout buffers, and lays those outputs out
-/// in the virtual screen. Stage 2 (`PlatformBackend::from_platform_init`)
-/// consumes this value, moves the device/output records into
-/// `PlatformBackend`, and allocates the runtime Vulkan/KMS resources.
-///
-/// No `PlatformInit` is retained after backend construction succeeds.
-pub(crate) struct PlatformInit {
-    pub(crate) device_key: crate::platform::drm::DrmDeviceKey,
+/// This is the init-time counterpart of v2's runtime `KmsDevice`: it
+/// carries the stable platform device identity, the opened primary-node
+/// handle, and the optional render-node sibling used by DRI3.
+pub(crate) struct PlatformInitDevice {
+    pub(crate) key: crate::platform::drm::DrmDeviceKey,
     pub(crate) device: Rc<drm::Device>,
     pub(crate) render_node_fd: Option<std::os::fd::OwnedFd>,
     pub(crate) render_node_path: Option<std::path::PathBuf>,
+}
+
+/// Seat-provided primary-node fd paired with the path it represents.
+///
+/// Libseat mode opens DRM nodes outside `drm::Device::open`, but the
+/// rest of platform bring-up still needs the path for logging and for
+/// `drm::Device::from_owned_fd`'s identity/debug state.
+pub(crate) struct PlatformInitFd {
+    pub(crate) path: PathBuf,
+    pub(crate) card_fd: std::os::fd::OwnedFd,
+}
+
+/// Transient handoff from platform bring-up to the long-lived KMS backend.
+///
+/// Stage 1 (`platform_init` / `platform_init_with_fds`) opens or wraps KMS
+/// devices, derives each stable device key, discovers connected outputs,
+/// commits initial scanout buffers, and lays those outputs out in the
+/// virtual screen. Stage 2 (`PlatformBackend::from_platform_init`) consumes
+/// this value, moves the device/output records into `PlatformBackend`, and
+/// allocates the runtime Vulkan/KMS resources.
+///
+/// Startup receives an ordered device vector and attempts to open each entry.
+/// The current runtime still activates initial scanout only on the first
+/// successfully opened device, while later entries are carried as
+/// topology/provider material for later PRIME work.
+///
+/// No `PlatformInit` is retained after backend construction succeeds.
+pub(crate) struct PlatformInit {
+    pub(crate) devices: Vec<PlatformInitDevice>,
     pub(crate) layouts: Vec<ActiveOutput>,
     pub(crate) fb_w: u16,
     pub(crate) fb_h: u16,
     pub(crate) input_ctx: Option<crate::input::SendContext>,
 }
 
-/// Shared DRM / outputs / libinput bring-up for the v1 and v2
-/// backends. Extracted in Stage 1b so both `KmsBackend::open_with_commit`
-/// and `KmsBackendV2::open` use the same code path.
-///
-/// **Vulkan / pipelines / scanout pools / scheduler / pixmap pool**
-/// stay in the v1-specific portion of `open_with_commit` for now —
-/// v2 doesn't build any of that in Stage 1b (paint paths are
-/// stubbed). Stage 2 promotes the appropriate subset into the
-/// real `PlatformBackend` component.
-///
-/// # Errors
-///
-/// Propagates DRM open / output discovery / per-output commit
-/// failures. On bring-up error any output already committed gets
-/// disabled before returning so the next caller starts clean.
-pub(crate) fn platform_init(
+fn render_node_for_device(
     device_path: &str,
-    commit: fn(
-        &crate::drm::Device,
-        &crate::platform::drm::Output,
-        ::drm::control::framebuffer::Handle,
-    ) -> io::Result<()>,
-) -> io::Result<PlatformInit> {
-    let device = Rc::new(drm::Device::open(device_path)?);
-    let primary_node =
-        crate::platform::drm::primary_node_from_fd(std::os::fd::AsFd::as_fd(&*device))?;
-    let device_key = primary_node.key;
-    let (render_node_fd, render_node_path) = match crate::kms::render_node::open_for_card(&*device)
-    {
+    device: &drm::Device,
+) -> (Option<std::os::fd::OwnedFd>, Option<PathBuf>) {
+    match crate::kms::render_node::open_for_card(device) {
         Ok((fd, path)) => {
             use std::os::fd::AsRawFd;
             let raw = fd.as_raw_fd();
@@ -534,19 +570,30 @@ pub(crate) fn platform_init(
         }
         Err(err) => {
             log::warn!(
-                "DRI3 render node unavailable: {err}; DRI3 import path will be \
-                     unavailable but the rest of yserver continues"
+                "DRI3 render node unavailable for {device_path}: {err}; DRI3 import path will be \
+                     unavailable on this device but the rest of yserver continues"
             );
             (None, None)
         }
-    };
-    let outputs = crate::platform::drm::discover_outputs(&device)?;
+    }
+}
 
-    // Horizontal layout in connector order. If anything fails part
-    // way through bring-up, disable everything we have already
-    // committed so the next caller starts from a clean slate.
+/// Commit initial scanout on the selected startup device.
+///
+/// This is about boot-time KMS activation, not RANDR's single
+/// client-visible primary output marker.
+fn activate_initial_scanout_outputs(
+    device_key: crate::platform::drm::DrmDeviceKey,
+    device: &Rc<drm::Device>,
+    next_x: &mut i32,
+    commit: fn(
+        &crate::drm::Device,
+        &crate::platform::drm::Output,
+        ::drm::control::framebuffer::Handle,
+    ) -> io::Result<()>,
+) -> io::Result<Vec<ActiveOutput>> {
+    let outputs = crate::platform::drm::discover_outputs(device)?;
     let mut layouts: Vec<ActiveOutput> = Vec::with_capacity(outputs.len());
-    let mut next_x: i32 = 0;
     let mut bring_up_err: Option<io::Error> = None;
     for output in outputs {
         let w = output.picked.width;
@@ -554,7 +601,7 @@ pub(crate) fn platform_init(
         let mut buffers = Vec::with_capacity(2);
         let mut buffer_err: Option<io::Error> = None;
         for _ in 0..2 {
-            match drm::Buffer::new(Rc::clone(&device), w, h) {
+            match drm::Buffer::new(Rc::clone(device), w, h) {
                 Ok(b) => buffers.push(b),
                 Err(e) => {
                     buffer_err = Some(e);
@@ -567,19 +614,94 @@ pub(crate) fn platform_init(
             break;
         }
         let initial_fb = buffers[0].fb_id();
-        if let Err(e) = commit(&device, &output, initial_fb) {
+        if let Err(e) = commit(device, &output, initial_fb) {
             bring_up_err = Some(e);
             break;
         }
         let swapchain = drm::Swapchain::with_initial_scanout(buffers, 0);
-        layouts.push(ActiveOutput::new(device_key, output, swapchain, next_x, 0));
-        next_x = next_x.saturating_add(i32::from(w));
+        layouts.push(ActiveOutput::new(device_key, output, swapchain, *next_x, 0));
+        *next_x = (*next_x).saturating_add(i32::from(w));
     }
     if let Some(err) = bring_up_err {
         for done in layouts.iter().rev() {
-            let _ = drm::modeset::disable_output(&device, &done.output);
+            let _ = drm::modeset::disable_output(device, &done.output);
         }
         return Err(err);
+    }
+    Ok(layouts)
+}
+
+/// Shared DRM / outputs / libinput bring-up for the v1 and v2
+/// backends. Extracted in Stage 1b so both `KmsBackend::open_with_commit`
+/// and `KmsBackendV2::open` use the same code path.
+///
+/// **Vulkan / pipelines / scanout pools / scheduler / pixmap pool**
+/// stay in the v1-specific portion of `open_with_commit` for now —
+/// v2 doesn't build any of that in Stage 1b (paint paths are
+/// stubbed). Stage 2 promotes the appropriate subset into the
+/// real `PlatformBackend` component.
+///
+/// # Errors
+///
+/// Propagates output discovery / per-output commit failures for devices that
+/// open successfully. Individual DRM open failures are logged and skipped;
+/// if none open, the returned platform has an empty device/output topology.
+/// On bring-up error any output already committed gets disabled before
+/// returning so the next caller starts clean.
+pub(crate) fn platform_init(
+    device_paths: &[PathBuf],
+    commit: fn(
+        &crate::drm::Device,
+        &crate::platform::drm::Output,
+        ::drm::control::framebuffer::Handle,
+    ) -> io::Result<()>,
+) -> io::Result<PlatformInit> {
+    let mut devices: Vec<PlatformInitDevice> = Vec::with_capacity(device_paths.len());
+    let mut layouts: Vec<ActiveOutput> = Vec::new();
+    let mut next_x: i32 = 0;
+    let mut open_errors: Vec<String> = Vec::new();
+    for device_path in device_paths {
+        let device_path_str = device_path.to_string_lossy().into_owned();
+        let device = match drm::Device::open(&device_path_str) {
+            Ok(device) => Rc::new(device),
+            Err(err) => {
+                log::warn!(
+                    "yserver: skipping DRM device {}: open failed: {err}",
+                    device_path.display()
+                );
+                open_errors.push(format!("{}: open failed: {err}", device_path.display()));
+                continue;
+            }
+        };
+        let primary_node =
+            crate::platform::drm::primary_node_from_fd(std::os::fd::AsFd::as_fd(&*device))?;
+        let device_key = primary_node.key;
+        let (render_node_fd, render_node_path) = render_node_for_device(&device_path_str, &device);
+        if devices.is_empty() {
+            layouts = activate_initial_scanout_outputs(device_key, &device, &mut next_x, commit)?;
+        } else {
+            log::info!(
+                "yserver: opened secondary KMS device {} as provider/topology data; \
+                 initial scanout remains on the first opened device",
+                device_path.display()
+            );
+        }
+        devices.push(PlatformInitDevice {
+            key: device_key,
+            device,
+            render_node_fd,
+            render_node_path,
+        });
+    }
+    if devices.is_empty() {
+        if open_errors.is_empty() {
+            log::info!("platform_init: no DRM devices supplied; starting headless");
+        } else {
+            log::warn!(
+                "platform_init: no DRM devices opened; starting headless. Tried:\n  {}",
+                open_errors.join("\n  ")
+            );
+        }
     }
 
     // fb_w / fb_h carry the virtual-screen extent. Saturating
@@ -605,10 +727,7 @@ pub(crate) fn platform_init(
     };
 
     Ok(PlatformInit {
-        device_key,
-        device,
-        render_node_fd,
-        render_node_path,
+        devices,
         layouts,
         fb_w,
         fb_h,
@@ -616,8 +735,8 @@ pub(crate) fn platform_init(
     })
 }
 
-/// Seat-aware variant of [`platform_init`]. Uses a seat-provided DRM card fd
-/// (from `libseat::Seat::open_device`) instead of opening the path directly.
+/// Seat-aware variant of [`platform_init`]. Uses seat-provided DRM card fds
+/// (from `libseat::Seat::open_device`) instead of opening paths directly.
 ///
 /// The only difference from `platform_init` is how `device` is constructed:
 /// we call `drm::Device::from_owned_fd` (which does NOT call `drmSetMaster`
@@ -631,88 +750,45 @@ pub(crate) fn platform_init(
 ///
 /// # Errors
 ///
-/// Returns the same errors as [`platform_init`] except that the first device
-/// open is replaced by an ioctl on the already-open fd. A failure here is
-/// FATAL when in libseat mode (see plan §"Startup policy").
-pub(crate) fn platform_init_with_fd(
-    device_path: &str,
-    card_fd: std::os::fd::OwnedFd,
+/// Returns the same errors as [`platform_init`] except that device opens are
+/// replaced by ioctls on already-open fds.
+pub(crate) fn platform_init_with_fds(
+    device_fds: Vec<PlatformInitFd>,
     commit: fn(
         &crate::drm::Device,
         &crate::platform::drm::Output,
         ::drm::control::framebuffer::Handle,
     ) -> io::Result<()>,
 ) -> io::Result<PlatformInit> {
-    // Wrap the seat-provided fd. No path open, no drmSetMaster.
-    let device = Rc::new(drm::Device::from_owned_fd(card_fd, device_path)?);
-    let primary_node =
-        crate::platform::drm::primary_node_from_fd(std::os::fd::AsFd::as_fd(&*device))?;
-    let device_key = primary_node.key;
-    let (render_node_fd, render_node_path) = match crate::kms::render_node::open_for_card(&*device)
-    {
-        Ok((fd, path)) => {
-            use std::os::fd::AsRawFd;
-            let raw = fd.as_raw_fd();
-            let stat_minor = std::fs::metadata(&path)
-                .ok()
-                .map(|m| {
-                    use std::os::unix::fs::MetadataExt;
-                    let rdev = m.rdev();
-                    ((rdev >> 8) & 0xff, rdev & 0xff)
-                })
-                .map(|(maj, min)| format!("{maj}:{min}"))
-                .unwrap_or_else(|| "?".into());
-            log::info!(
-                "DRI3 render node ready (sibling of {device_path}): fd={raw} \
-                     path={path:?} rdev={stat_minor} (render node minor should be >=128)"
-            );
-            (Some(fd), Some(path))
-        }
-        Err(err) => {
-            log::warn!(
-                "DRI3 render node unavailable: {err}; DRI3 import path will be \
-                     unavailable but the rest of yserver continues"
-            );
-            (None, None)
-        }
-    };
-    let outputs = crate::platform::drm::discover_outputs(&device)?;
-
-    let mut layouts: Vec<ActiveOutput> = Vec::with_capacity(outputs.len());
+    let mut devices: Vec<PlatformInitDevice> = Vec::with_capacity(device_fds.len());
+    let mut layouts: Vec<ActiveOutput> = Vec::new();
     let mut next_x: i32 = 0;
-    let mut bring_up_err: Option<io::Error> = None;
-    for output in outputs {
-        let w = output.picked.width;
-        let h = output.picked.height;
-        let mut buffers = Vec::with_capacity(2);
-        let mut buffer_err: Option<io::Error> = None;
-        for _ in 0..2 {
-            match drm::Buffer::new(Rc::clone(&device), w, h) {
-                Ok(b) => buffers.push(b),
-                Err(e) => {
-                    buffer_err = Some(e);
-                    break;
-                }
-            }
+    for init_fd in device_fds {
+        let device_path_str = init_fd.path.to_string_lossy().into_owned();
+        // Wrap the seat-provided fd. No path open, no drmSetMaster.
+        let device = Rc::new(drm::Device::from_owned_fd(
+            init_fd.card_fd,
+            &device_path_str,
+        )?);
+        let primary_node =
+            crate::platform::drm::primary_node_from_fd(std::os::fd::AsFd::as_fd(&*device))?;
+        let device_key = primary_node.key;
+        let (render_node_fd, render_node_path) = render_node_for_device(&device_path_str, &device);
+        if devices.is_empty() {
+            layouts = activate_initial_scanout_outputs(device_key, &device, &mut next_x, commit)?;
+        } else {
+            log::info!(
+                "yserver: opened secondary KMS device {} via seat as provider/topology data; \
+                 initial scanout remains on the first opened device",
+                init_fd.path.display()
+            );
         }
-        if let Some(e) = buffer_err {
-            bring_up_err = Some(e);
-            break;
-        }
-        let initial_fb = buffers[0].fb_id();
-        if let Err(e) = commit(&device, &output, initial_fb) {
-            bring_up_err = Some(e);
-            break;
-        }
-        let swapchain = drm::Swapchain::with_initial_scanout(buffers, 0);
-        layouts.push(ActiveOutput::new(device_key, output, swapchain, next_x, 0));
-        next_x = next_x.saturating_add(i32::from(w));
-    }
-    if let Some(err) = bring_up_err {
-        for done in layouts.iter().rev() {
-            let _ = drm::modeset::disable_output(&device, &done.output);
-        }
-        return Err(err);
+        devices.push(PlatformInitDevice {
+            key: device_key,
+            device,
+            render_node_fd,
+            render_node_path,
+        });
     }
 
     let fb_w: u16 = layouts
@@ -729,10 +805,7 @@ pub(crate) fn platform_init_with_fd(
     // In libseat mode, libinput is built on the core thread via
     // Context::new_libseat (caller's responsibility). No SendContext here.
     Ok(PlatformInit {
-        device_key,
-        device,
-        render_node_fd,
-        render_node_path,
+        devices,
         layouts,
         fb_w,
         fb_h,

@@ -260,8 +260,15 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     let console_guard = crate::kms::console::ConsoleGuard::acquire(opts.vt)?;
     #[cfg(not(target_os = "linux"))]
     let console_guard: Option<()> = None;
-    let device_path = resolve_drm_device()?;
-    log::info!("yserver: opening DRM device {device_path}");
+    let device_paths = resolve_drm_devices()?;
+    log::info!(
+        "yserver: opening DRM devices (primary first): {}",
+        device_paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
 
     // Open the seat first so DRM + input device opens can route through
     // it in libseat mode. Falls back to `Seat::Direct` silently when
@@ -271,7 +278,8 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     // Build the backend in seat-aware fashion. In libseat mode the DRM
     // card is opened through the seat and libinput lives on the core
     // thread. In Direct mode today's behaviour is preserved exactly.
-    let mut backend = build_kms_backend_v2(seat, &device_path, console_guard, opts.layout.clone())?;
+    let mut backend =
+        build_kms_backend_v2(seat, &device_paths, console_guard, opts.layout.clone())?;
     let (fb_w, fb_h) = backend.fb_dimensions();
     log::info!("yserver: scanout {fb_w}x{fb_h}");
 
@@ -556,20 +564,20 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
 /// `seat`. This is the single decision point for the mode branch.
 ///
 /// **Libseat mode** (`seat == Seat::Libseat`):
-/// - Opens the DRM card through the seat (FATAL on failure — once libseat
-///   has the session, direct device opens won't get DRM master).
+/// - Opens the ordered DRM card list through the seat. Individual failures
+///   are skipped, and an empty result starts without KMS scanout.
 /// - Builds a `crate::input::Context` on the core thread via
 ///   `Context::new_libseat` (FATAL on failure for the same reason).
 /// - Returns a `KmsBackendV2` with `is_libseat_mode() == true`.
 ///
 /// **Direct mode** (`seat == Seat::Direct`):
-/// - Calls `KmsBackendV2::open(device_path, console_guard, layout)` — the
+/// - Calls `KmsBackendV2::open(device_paths, console_guard, layout)` — the
 ///   direct-device path, with optional VT_PROCESS arming when a real
 ///   controlling console is present.
 /// - Returns a `KmsBackendV2` with `is_libseat_mode() == false`.
 fn build_kms_backend_v2(
     seat: crate::seat::Seat,
-    device_path: &str,
+    device_paths: &[std::path::PathBuf],
     console_guard: crate::kms::ConsoleGuardOpt,
     layout: Option<String>,
 ) -> io::Result<crate::kms::v2::KmsBackendV2> {
@@ -590,7 +598,7 @@ fn build_kms_backend_v2(
             })?;
             crate::kms::v2::KmsBackendV2::open_libseat(
                 seat,
-                device_path,
+                device_paths,
                 console_guard,
                 core_libinput,
                 seat_fd,
@@ -601,14 +609,13 @@ fn build_kms_backend_v2(
         crate::seat::Seat::Direct => {
             // Direct path: open DRM + libinput directly, optionally
             // arming VT_PROCESS if we have a controlling console.
-            crate::kms::v2::KmsBackendV2::open(device_path, console_guard, layout)
+            crate::kms::v2::KmsBackendV2::open(device_paths, console_guard, layout)
         }
     }
 }
 
-fn resolve_drm_device() -> io::Result<String> {
-    crate::platform::drm::resolve_default_kms_device()
-        .map(|path| path.to_string_lossy().into_owned())
+fn resolve_drm_devices() -> io::Result<Vec<std::path::PathBuf>> {
+    crate::platform::drm::resolve_default_kms_devices()
 }
 
 #[cfg(target_os = "linux")]

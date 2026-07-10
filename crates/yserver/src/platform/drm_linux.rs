@@ -234,8 +234,10 @@ fn assign_outputs(connectors: &[ConnectorCandidate]) -> Result<Vec<Assignment>, 
 ///   modes
 /// - greedy assignment cannot place every connector (returns the stranded
 ///   connector's name in the error message)
-/// - no connector is connected at all (typical when running without
-///   `vng --graphics`)
+///
+/// A device with no connected connectors returns an empty output list.
+/// This lets the KMS backend start with zero active outputs and wait for
+/// RANDR/hotplug to populate the layout later.
 ///
 /// # Panics
 /// Panics only on internal invariant violations: a connector tracked in
@@ -321,10 +323,7 @@ fn discover_outputs(device: &Device) -> io::Result<Vec<Output>> {
     }
 
     if candidates.is_empty() {
-        return Err(io::Error::other(
-            "no connected output — vng with --graphics required for modeset path; \
-             headless mode does not exercise this",
-        ));
+        return Ok(Vec::new());
     }
 
     let assignments = assign_outputs(&candidates).map_err(|name| {

@@ -1177,12 +1177,12 @@ impl KmsBackendV2 {
     /// `PlatformBackend::open_with_commit`, plus FontLoader / XKB
     /// init failures from `KmsCore::new`.
     pub fn open(
-        device_path: &str,
+        device_paths: &[std::path::PathBuf],
         console_guard: crate::kms::ConsoleGuardOpt,
         layout: Option<String>,
     ) -> io::Result<Self> {
         Self::open_with_commit(
-            device_path,
+            device_paths,
             console_guard,
             layout,
             drm::modeset::commit_modeset,
@@ -1190,7 +1190,7 @@ impl KmsBackendV2 {
     }
 
     fn open_with_commit(
-        device_path: &str,
+        device_paths: &[std::path::PathBuf],
         console_guard: crate::kms::ConsoleGuardOpt,
         layout: Option<String>,
         commit: fn(
@@ -1199,7 +1199,7 @@ impl KmsBackendV2 {
             ::drm::control::framebuffer::Handle,
         ) -> io::Result<()>,
     ) -> io::Result<Self> {
-        let platform = PlatformBackend::open_with_commit(device_path, commit)?;
+        let platform = PlatformBackend::open_with_commit(device_paths, commit)?;
         let (fb_w, fb_h) = (platform.fb_w, platform.fb_h);
         let mut core = KmsCore::new(fb_w, fb_h, layout)?;
         // Warp the pointer to the centre of the primary output at startup
@@ -1307,7 +1307,7 @@ impl KmsBackendV2 {
     /// `PlatformBackend::open_with_commit_fd`.
     pub fn open_libseat(
         seat: crate::seat::Seat,
-        device_path: &str,
+        device_paths: &[std::path::PathBuf],
         console_guard: crate::kms::ConsoleGuardOpt,
         core_libinput: crate::input::Context,
         seat_fd: std::os::fd::RawFd,
@@ -1316,7 +1316,7 @@ impl KmsBackendV2 {
     ) -> io::Result<Self> {
         Self::open_libseat_with_commit(
             seat,
-            device_path,
+            device_paths,
             console_guard,
             core_libinput,
             seat_fd,
@@ -1328,7 +1328,7 @@ impl KmsBackendV2 {
 
     fn open_libseat_with_commit(
         seat: crate::seat::Seat,
-        device_path: &str,
+        device_paths: &[std::path::PathBuf],
         console_guard: crate::kms::ConsoleGuardOpt,
         core_libinput: crate::input::Context,
         seat_fd: std::os::fd::RawFd,
@@ -1340,24 +1340,47 @@ impl KmsBackendV2 {
             ::drm::control::framebuffer::Handle,
         ) -> io::Result<()>,
     ) -> io::Result<Self> {
-        // Get the card fd from the seat.
-        let card_fd = {
+        // Get card fds from the seat. Individual failures are logged and
+        // skipped; an empty result continues as a headless platform.
+        let mut device_fds = Vec::with_capacity(device_paths.len());
+        let mut open_errors: Vec<String> = Vec::new();
+        for device_path in device_paths {
             let inner = seat.libseat_inner().ok_or_else(|| {
                 io::Error::other("open_libseat_with_commit: seat is not in libseat mode")
             })?;
-            inner
+            match inner
                 .borrow_mut()
-                .open_device(
-                    std::path::Path::new(device_path),
-                    crate::seat::DeviceKind::Drm { is_kms: true },
-                )
-                .map_err(|e| {
-                    io::Error::other(format!(
-                        "libseat mode: opening DRM card {device_path} via seat failed: {e}"
-                    ))
-                })?
-        };
-        let platform = PlatformBackend::open_with_commit_fd(device_path, card_fd, commit)?;
+                .open_device(device_path, crate::seat::DeviceKind::Drm { is_kms: true })
+            {
+                Ok(card_fd) => {
+                    device_fds.push(crate::kms::backend::PlatformInitFd {
+                        path: device_path.clone(),
+                        card_fd,
+                    });
+                }
+                Err(e) => {
+                    log::warn!(
+                        "libseat mode: skipping DRM card {}: open via seat failed: {e}",
+                        device_path.display()
+                    );
+                    open_errors.push(format!(
+                        "{}: open via seat failed: {e}",
+                        device_path.display()
+                    ));
+                }
+            }
+        }
+        if device_fds.is_empty() {
+            if open_errors.is_empty() {
+                log::info!("libseat mode: no DRM devices supplied; starting headless");
+            } else {
+                log::warn!(
+                    "libseat mode: no DRM devices opened; starting headless. Tried:\n  {}",
+                    open_errors.join("\n  ")
+                );
+            }
+        }
+        let platform = PlatformBackend::open_with_commit_fd(device_fds, commit)?;
         let (fb_w, fb_h) = (platform.fb_w, platform.fb_h);
         let mut core = KmsCore::new(fb_w, fb_h, layout)?;
         // Warp the pointer to the centre of the primary output at startup
@@ -2015,7 +2038,13 @@ impl KmsBackendV2 {
         for (i, layout) in base.platform.outputs.iter().enumerate() {
             let pool = crate::kms::vk::scanout::ScanoutBoPool::allocate(
                 Arc::clone(&vk),
-                std::rc::Rc::clone(&base.platform.primary_device().device),
+                std::rc::Rc::clone(
+                    &base
+                        .platform
+                        .primary_device()
+                        .expect("live-scene fixture has a DRM device")
+                        .device,
+                ),
                 u32::from(layout.width),
                 u32::from(layout.height),
                 3,
@@ -11613,7 +11642,9 @@ impl Backend for KmsBackendV2 {
         // discover_outputs reads connector/mode/property state and
         // computes a hypothetical CRTC/plane assignment but commits
         // nothing, so it is safe to call while outputs are live.
-        let primary = self.platform.primary_device();
+        let Some(primary) = self.platform.primary_device() else {
+            return Ok(());
+        };
         let device_key = primary.key;
         let discovered = crate::platform::drm::discover_outputs(&primary.device)?;
         let mut changed = false;
@@ -17151,8 +17182,7 @@ impl Backend for KmsBackendV2 {
         let path = self
             .platform
             .primary_device()
-            .render_node_path
-            .as_deref()
+            .and_then(|device| device.render_node_path.as_deref())
             .ok_or_else(|| {
                 io::Error::other("DRI3 unavailable — render node was not resolved at backend init")
             })?;
@@ -17163,7 +17193,12 @@ impl Backend for KmsBackendV2 {
     fn dri3_capabilities(&self) -> Dri3Caps {
         // DRI3 entirely unavailable when render-node fd or Vulkan
         // weren't resolved at backend init.
-        if self.platform.primary_device().render_node_fd.is_none() || self.platform.vk.is_none() {
+        if self
+            .platform
+            .primary_device()
+            .is_none_or(|device| device.render_node_fd.is_none())
+            || self.platform.vk.is_none()
+        {
             return Dri3Caps::unsupported();
         }
         let vk = self.platform.vk.as_ref().expect("vk Some by branch above");
@@ -25378,7 +25413,10 @@ mod tests {
         // droppable. The cap accessor doesn't actually use the
         // fd, just checks Some-ness.
         let mut b = b;
-        b.platform.primary_device_mut().render_node_fd = Some(
+        b.platform
+            .primary_device_mut()
+            .expect("test fixture has a DRM device")
+            .render_node_fd = Some(
             std::fs::OpenOptions::new()
                 .read(true)
                 .open("/dev/null")

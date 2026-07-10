@@ -50,8 +50,9 @@ use crate::{
     drm,
     kms::{
         backend::{
-            ActiveOutput, OutputKey, PlatformInit, platform_init as core_platform_init,
-            platform_init_with_fd as core_platform_init_with_fd,
+            ActiveOutput, OutputKey, PlatformInit, PlatformInitFd,
+            platform_init as core_platform_init,
+            platform_init_with_fds as core_platform_init_with_fds,
         },
         v2::{
             store::Storage,
@@ -676,24 +677,20 @@ pub(crate) fn recompute_fb_extent_from(layouts: &[(i32, i32, u16, u16)]) -> (u16
 }
 
 impl PlatformBackend {
-    /// Libseat-mode constructor. Accepts a seat-provided card fd via
-    /// [`core_platform_init_with_fd`]; all other bring-up is identical to
+    /// Libseat-mode constructor. Accepts seat-provided card fds via
+    /// [`core_platform_init_with_fds`]; all other bring-up is identical to
     /// [`open_with_commit`]. In libseat mode `input_ctx` is always `None`
     /// here — the caller builds `crate::input::Context` on the core thread
     /// via `Context::new_libseat` and stores it on `KmsBackendV2` directly.
     pub(crate) fn open_with_commit_fd(
-        device_path: &str,
-        card_fd: std::os::fd::OwnedFd,
+        device_fds: Vec<PlatformInitFd>,
         commit: fn(
             &drm::Device,
             &crate::platform::drm::Output,
             ::drm::control::framebuffer::Handle,
         ) -> io::Result<()>,
     ) -> io::Result<Self> {
-        // Refuse software-only Vulkan BEFORE touching DRM (no modeset,
-        // no master, console stays intact). See the preflight's docs.
-        crate::kms::vk::device::ensure_hardware_vulkan_for_scanout().map_err(io::Error::other)?;
-        let platform_init = core_platform_init_with_fd(device_path, card_fd, commit)?;
+        let platform_init = core_platform_init_with_fds(device_fds, commit)?;
         Self::from_platform_init(platform_init)
     }
 
@@ -709,17 +706,14 @@ impl PlatformBackend {
     /// failures from `OpsCommandPool::new`. `ScanoutBoPool` failures
     /// per-output are non-fatal — that output is marked `None` and skipped.
     pub(crate) fn open_with_commit(
-        device_path: &str,
+        device_paths: &[PathBuf],
         commit: fn(
             &drm::Device,
             &crate::platform::drm::Output,
             ::drm::control::framebuffer::Handle,
         ) -> io::Result<()>,
     ) -> io::Result<Self> {
-        // Refuse software-only Vulkan BEFORE touching DRM (no modeset,
-        // no master, console stays intact). See the preflight's docs.
-        crate::kms::vk::device::ensure_hardware_vulkan_for_scanout().map_err(io::Error::other)?;
-        let platform_init = core_platform_init(device_path, commit)?;
+        let platform_init = core_platform_init(device_paths, commit)?;
         Self::from_platform_init(platform_init)
     }
 
@@ -729,15 +723,16 @@ impl PlatformBackend {
     /// [`open_with_commit_fd`] (libseat mode).
     fn from_platform_init(platform_init: PlatformInit) -> io::Result<Self> {
         let PlatformInit {
-            device_key,
-            device,
-            render_node_fd,
-            render_node_path,
+            devices,
             layouts,
             fb_w,
             fb_h,
             input_ctx,
         } = platform_init;
+        // Runtime allocation is still single-scanout-device here. With no
+        // KMS devices there are no layouts, so scanout/cursor allocation is
+        // skipped while the Vulkan-backed X11 core remains available.
+        let primary_drm = devices.first().map(|device| Rc::clone(&device.device));
 
         let vk = match VkContext::new() {
             Ok(v) => v,
@@ -765,9 +760,18 @@ impl PlatformBackend {
         // Venus (virtio-gpu) reports VIRTUAL_GPU, not CPU, so it is not
         // affected; the env override exists for any deliberate
         // software-scanout setup (e.g. lavapipe under vng).
-        if vk.is_software_rasterizer()
+        if !layouts.is_empty()
+            && vk.is_software_rasterizer()
             && std::env::var_os("YSERVER_ALLOW_SOFTWARE_VULKAN").is_none()
         {
+            for layout in layouts.iter().rev() {
+                if let Some(device) = devices
+                    .iter()
+                    .find(|device| device.key == layout.key.device_key)
+                {
+                    let _ = drm::modeset::disable_output(&device.device, &layout.output);
+                }
+            }
             return Err(io::Error::other(format!(
                 "v2 PlatformBackend: the only Vulkan device is a software rasterizer \
                  (device_type=CPU, driver_id={:?} — llvmpipe/lavapipe). Driving real KMS \
@@ -778,6 +782,11 @@ impl PlatformBackend {
                  To override (e.g. virtio-gpu under vng), set YSERVER_ALLOW_SOFTWARE_VULKAN=1.",
                 vk.driver_id,
             )));
+        }
+        if layouts.is_empty() && vk.is_software_rasterizer() {
+            log::info!(
+                "v2 PlatformBackend: using software Vulkan for headless rendering; no KMS outputs are active"
+            );
         }
 
         let ops_command_pool = OpsCommandPool::new(Arc::clone(&vk))
@@ -806,9 +815,14 @@ impl PlatformBackend {
         for (i, layout) in layouts.iter().enumerate() {
             let w = u32::from(layout.width);
             let h = u32::from(layout.height);
+            let Some(primary_drm) = primary_drm.as_ref() else {
+                return Err(io::Error::other(
+                    "v2 PlatformBackend: active output exists without a KMS device",
+                ));
+            };
             match ScanoutBoPool::allocate(
                 Arc::clone(&vk),
-                Rc::clone(&device),
+                Rc::clone(primary_drm),
                 w,
                 h,
                 3,
@@ -834,11 +848,20 @@ impl PlatformBackend {
         let first_pageflip_logged = vec![false; layouts.len()];
 
         // Stage 5 Phase B — bring up the DRM cursor plane. Failure
-        // is non-fatal; v2 falls back to the SW scene cursor path.
+        // is non-fatal; v2 falls back to the SW scene cursor path. With
+        // zero active outputs there are no CRTCs to bind, so skip the
+        // hardware cursor path until a later hotplug/modeset creates one.
         let crtc_handles: Vec<::drm::control::crtc::Handle> =
             layouts.iter().map(|l| l.output.crtc).collect();
-        let cursor_plane =
-            match crate::kms::cursor_plane::CursorPlane::new(Rc::clone(&device), &crtc_handles) {
+        let cursor_plane = if crtc_handles.is_empty() {
+            log::info!("v2 PlatformBackend: no active CRTCs; hardware cursor init deferred");
+            None
+        } else {
+            let primary_drm = primary_drm.as_ref().ok_or_else(|| {
+                io::Error::other("v2 PlatformBackend: active CRTC exists without a KMS device")
+            })?;
+            match crate::kms::cursor_plane::CursorPlane::new(Rc::clone(primary_drm), &crtc_handles)
+            {
                 Ok(plane) => {
                     log::info!(
                         "v2 PlatformBackend: hardware cursor plane initialised (64x64 ARGB8888)"
@@ -851,7 +874,8 @@ impl PlatformBackend {
                     );
                     None
                 }
-            };
+            }
+        };
 
         // Stage 5 Task 6.1: backend-internal poll FD + wakeup
         // eventfd for deferred PRESENT completion. The eventfd lives
@@ -893,12 +917,15 @@ impl PlatformBackend {
             scanout_pools.iter().filter(|p| p.is_some()).count(),
         );
 
-        let devices = vec![KmsDevice {
-            key: device_key,
-            device,
-            render_node_fd,
-            render_node_path,
-        }];
+        let devices: Vec<KmsDevice> = devices
+            .into_iter()
+            .map(|device| KmsDevice {
+                key: device.key,
+                device: device.device,
+                render_node_fd: device.render_node_fd,
+                render_node_path: device.render_node_path,
+            })
+            .collect();
 
         Ok(Self {
             devices,
@@ -1412,17 +1439,13 @@ impl PlatformBackend {
         self.input_ctx.take()
     }
 
-    pub(crate) fn primary_device(&self) -> &KmsDevice {
-        self.devices
-            .first()
-            .expect("PlatformBackend always has at least one KMS device")
+    pub(crate) fn primary_device(&self) -> Option<&KmsDevice> {
+        self.devices.first()
     }
 
     #[cfg(test)]
-    pub(crate) fn primary_device_mut(&mut self) -> &mut KmsDevice {
-        self.devices
-            .first_mut()
-            .expect("PlatformBackend always has at least one KMS device")
+    pub(crate) fn primary_device_mut(&mut self) -> Option<&mut KmsDevice> {
+        self.devices.first_mut()
     }
 
     pub(crate) fn device_for_key(
@@ -2972,7 +2995,9 @@ impl PlatformBackend {
         &mut self,
         client_configured: &HashSet<OutputKey>,
     ) -> io::Result<RescanResult> {
-        let device = self.primary_device();
+        let Some(device) = self.primary_device() else {
+            return Ok(RescanResult::default());
+        };
         let device_key = device.key;
         let discovered = crate::platform::drm::discover_outputs(&device.device)?;
         let discovered_order: Vec<OutputKey> = discovered
@@ -3279,6 +3304,11 @@ mod tests {
             (0i32, 1440i32, 2560u16, 1440u16),
         ];
         assert_eq!(super::recompute_fb_extent_from(layouts), (2560, 2880));
+    }
+
+    #[test]
+    fn recompute_fb_extent_empty_layout_is_zero() {
+        assert_eq!(super::recompute_fb_extent_from(&[]), (0, 0));
     }
 
     /// Fence acquire on a no-Vk fixture returns the

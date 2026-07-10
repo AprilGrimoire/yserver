@@ -175,70 +175,86 @@ pub(crate) fn discover_outputs(_device: &crate::drm::Device) -> io::Result<Vec<O
     ))
 }
 
-/// Resolve the KMS card yserver should drive at startup.
+/// Resolve the KMS cards yserver should open at startup.
 ///
 /// `YSERVER_DRM_DEVICE` remains an explicit override. Otherwise this
 /// delegates enumeration and node-relationship details to the current
 /// platform implementation, then applies yserver's shared policy:
-/// keep only KMS-capable primary nodes and prefer one with a connected
-/// display.
-pub(crate) fn resolve_default_kms_device() -> io::Result<PathBuf> {
+/// keep only KMS-capable primary nodes and order the returned list with
+/// the primary scanout candidate first. An empty list is a valid headless
+/// result; the KMS backend can still serve X11 clients without scanout.
+pub(crate) fn resolve_default_kms_devices() -> io::Result<Vec<PathBuf>> {
     if let Ok(explicit) = std::env::var("YSERVER_DRM_DEVICE") {
-        return Ok(PathBuf::from(explicit));
+        return Ok(vec![PathBuf::from(explicit)]);
     }
-    resolve_default_kms_device_for_system()
+    resolve_default_kms_devices_for_system()
 }
 
 #[cfg(target_os = "linux")]
-fn resolve_default_kms_device_for_system() -> io::Result<PathBuf> {
-    resolve_default_kms_device_with(&crate::platform::drm_linux::LinuxDrmPlatform)
+fn resolve_default_kms_devices_for_system() -> io::Result<Vec<PathBuf>> {
+    resolve_default_kms_devices_with(&crate::platform::drm_linux::LinuxDrmPlatform)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn resolve_default_kms_device_for_system() -> io::Result<PathBuf> {
+fn resolve_default_kms_devices_for_system() -> io::Result<Vec<PathBuf>> {
     Err(io::Error::other(
         "automatic DRM device discovery is not implemented on this platform; \
          set YSERVER_DRM_DEVICE to a primary DRM node",
     ))
 }
 
-fn resolve_default_kms_device_with(platform: &impl DrmPlatform) -> io::Result<PathBuf> {
+fn resolve_default_kms_devices_with(platform: &impl DrmPlatform) -> io::Result<Vec<PathBuf>> {
     let candidates = discover_kms_candidates(platform)?;
-    if let Some(chosen) = pick_kms_card_candidate(&candidates) {
+    let ordered = order_kms_card_candidates(candidates);
+    if let Some(chosen) = ordered.first() {
         log::info!(
-            "yserver: selected DRM device {} (connected_display={})",
+            "yserver: selected primary DRM device {} (connected_display={})",
             chosen.node.path.display(),
             chosen.has_connected_connector
         );
-        return Ok(chosen.node.path.clone());
+        for secondary in ordered.iter().skip(1) {
+            log::info!(
+                "yserver: discovered secondary DRM device {} (connected_display={})",
+                secondary.node.path.display(),
+                secondary.has_connected_connector
+            );
+        }
+        return Ok(ordered
+            .into_iter()
+            .map(|candidate| candidate.node.path)
+            .collect());
     }
 
-    Err(io::Error::other(format!(
-        "no KMS-capable DRM device found. Tried:\n  {}\n\
-         Override with YSERVER_DRM_DEVICE=<primary DRM node>.",
-        if candidates.is_empty() {
-            "(no platform primary DRM nodes)".to_string()
-        } else {
-            candidates
-                .iter()
-                .map(|c| c.node.path.display().to_string())
-                .collect::<Vec<_>>()
-                .join("\n  ")
-        }
-    )))
+    log::info!("yserver: no KMS-capable DRM devices discovered; starting headless");
+    Ok(Vec::new())
 }
 
-/// Choose a DRM device from KMS-capable candidates, preferring one that
-/// has at least one connected connector.
+/// Return the index of the primary DRM device from KMS-capable candidates.
 ///
 /// `candidates` must be in platform priority order. The first candidate
 /// with a connected connector wins; if none report a connection we fall
 /// back to the first candidate. The fallback preserves headless paths.
-fn pick_kms_card_candidate(candidates: &[KmsCardCandidate]) -> Option<&KmsCardCandidate> {
+fn primary_kms_card_candidate_index(candidates: &[KmsCardCandidate]) -> Option<usize> {
     candidates
         .iter()
-        .find(|c| c.has_connected_connector)
-        .or_else(|| candidates.first())
+        .position(|c| c.has_connected_connector)
+        .or(if candidates.is_empty() { None } else { Some(0) })
+}
+
+/// Return KMS-capable candidates with the selected primary first.
+///
+/// The remaining candidates keep their original platform enumeration
+/// order. This lets startup carry a full device vector while preserving
+/// the existing "one primary scanout device" policy.
+fn order_kms_card_candidates(mut candidates: Vec<KmsCardCandidate>) -> Vec<KmsCardCandidate> {
+    let Some(primary_idx) = primary_kms_card_candidate_index(&candidates) else {
+        return candidates;
+    };
+    let primary = candidates.remove(primary_idx);
+    let mut ordered = Vec::with_capacity(candidates.len() + 1);
+    ordered.push(primary);
+    ordered.extend(candidates);
+    ordered
 }
 
 fn discover_kms_candidates(platform: &impl DrmPlatform) -> io::Result<Vec<KmsCardCandidate>> {
@@ -284,12 +300,17 @@ fn discover_kms_candidates(platform: &impl DrmPlatform) -> io::Result<Vec<KmsCar
     }
 
     if candidates.is_empty() && !reasons.is_empty() {
-        return Err(io::Error::other(format!(
-            "no KMS-capable DRM device found. Tried:\n  {}",
+        log::warn!(
+            "yserver: no KMS-capable DRM devices could be opened; starting headless. Tried:\n  {}",
             reasons.join("\n  ")
-        )));
+        );
     }
     Ok(candidates)
+}
+
+#[cfg(test)]
+fn pick_kms_card_candidate(candidates: &[KmsCardCandidate]) -> Option<&KmsCardCandidate> {
+    primary_kms_card_candidate_index(candidates).map(|idx| &candidates[idx])
 }
 
 pub(crate) fn open_path_cloexec(path: &Path) -> io::Result<OwnedFd> {
@@ -370,6 +391,42 @@ mod tests {
         assert_eq!(
             pick_kms_card_candidate(&cands).unwrap().node.path,
             PathBuf::from("/mock/primary0")
+        );
+    }
+
+    #[test]
+    fn order_kms_card_candidates_moves_primary_connected_candidate_first() {
+        let ordered = order_kms_card_candidates(vec![
+            candidate("/mock/primary0", false),
+            candidate("/mock/primary1", true),
+            candidate("/mock/primary2", false),
+        ]);
+        let paths: Vec<PathBuf> = ordered.into_iter().map(|c| c.node.path).collect();
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/mock/primary1"),
+                PathBuf::from("/mock/primary0"),
+                PathBuf::from("/mock/primary2"),
+            ]
+        );
+    }
+
+    #[test]
+    fn order_kms_card_candidates_keeps_platform_order_when_first_is_primary() {
+        let ordered = order_kms_card_candidates(vec![
+            candidate("/mock/primary0", true),
+            candidate("/mock/primary1", true),
+            candidate("/mock/primary2", false),
+        ]);
+        let paths: Vec<PathBuf> = ordered.into_iter().map(|c| c.node.path).collect();
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/mock/primary0"),
+                PathBuf::from("/mock/primary1"),
+                PathBuf::from("/mock/primary2"),
+            ]
         );
     }
 
