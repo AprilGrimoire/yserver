@@ -642,10 +642,11 @@ pub(crate) struct PlatformBackend {
     /// on `KmsBackendV2` can reach it from the external test crate.
     force_next_submit_failure: bool,
 
-    /// Stage 5 Phase B — DRM hardware cursor plane. `None` if init
-    /// failed (best-effort; SW fallback kicks in) or on the test
-    /// fixture. The shared dumb buffer + per-CRTC visibility map
-    /// live inside `CursorPlane` itself.
+    /// Stage 5 Phase B — DRM hardware cursor plane. `None` either while a
+    /// headless primary device has no active CRTC yet, after permanent init
+    /// failure (`hw_cursor_disabled == true`), or on the test fixture. The
+    /// shared dumb buffer + per-CRTC visibility map live inside
+    /// `CursorPlane` itself.
     pub(crate) cursor_plane: Option<crate::kms::cursor_plane::CursorPlane>,
     /// Latest root-space cursor position + hotspot that the kernel
     /// rejected with `EBUSY` on at least one CRTC. Re-issued at the next
@@ -655,14 +656,13 @@ pub(crate) struct PlatformBackend {
     /// "by how much it moved". Cleared on full commit success or on
     /// `cursor_plane_hide_all` (VT-leave).
     cursor_pending_move: Option<(i32, i32, u16, u16)>,
-    /// Auto-fallback latch: set when a cursor-plane bind ioctl fails
-    /// with an errno that means the driver doesn't implement the
-    /// (legacy) cursor ioctls at all (Apple DCP / Asahi returns
-    /// `ENXIO`). Once set, `cursor_plane_available` reports `false`
-    /// so `tick_one_output`'s `hw_can_run` gate closes and the scene
-    /// composites the SW cursor instead. One-way / sticky: a driver
-    /// that rejects the cursor ioctl on the first bind will reject it
-    /// forever, so there's no point re-probing every frame.
+    /// Auto-fallback latch: set when cursor-plane initialization fails,
+    /// active-CRTC topology lacks full plane coverage, or a bind ioctl proves
+    /// the driver doesn't implement the legacy cursor path. Once set,
+    /// `cursor_plane_available` reports `false` so `tick_one_output`'s
+    /// `hw_can_run` gate closes and the scene composites the SW cursor
+    /// instead. One-way / sticky: permanent device capability failures must
+    /// not be re-probed on every topology change or frame.
     hw_cursor_disabled: bool,
 }
 
@@ -774,6 +774,7 @@ impl PlatformBackend {
         // `enable_connector`. With no KMS devices there are no layouts, so
         // scanout/cursor allocation is skipped while the Vulkan-backed X11
         // core remains available.
+        let primary_device_key = devices.first().map(|device| device.key);
         let primary_drm = devices.first().map(|device| Rc::clone(&device.device));
 
         let vk = match VkContext::new() {
@@ -893,11 +894,14 @@ impl PlatformBackend {
         // is non-fatal; v2 falls back to the SW scene cursor path. With
         // zero active outputs there are no CRTCs to bind, so skip the
         // hardware cursor path until a later hotplug/modeset creates one.
-        let crtc_handles: Vec<::drm::control::crtc::Handle> =
-            layouts.iter().map(|l| l.output.crtc).collect();
-        let cursor_plane = if crtc_handles.is_empty() {
+        let crtc_handles: Vec<::drm::control::crtc::Handle> = layouts
+            .iter()
+            .filter(|layout| Some(layout.key.device_key) == primary_device_key)
+            .map(|layout| layout.output.crtc)
+            .collect();
+        let (cursor_plane, hw_cursor_disabled) = if crtc_handles.is_empty() {
             log::info!("v2 PlatformBackend: no active CRTCs; hardware cursor init deferred");
-            None
+            (None, false)
         } else {
             let primary_drm = primary_drm.as_ref().ok_or_else(|| {
                 io::Error::other("v2 PlatformBackend: active CRTC exists without a KMS device")
@@ -908,13 +912,13 @@ impl PlatformBackend {
                     log::info!(
                         "v2 PlatformBackend: hardware cursor plane initialised (64x64 ARGB8888)"
                     );
-                    Some(plane)
+                    (Some(plane), false)
                 }
                 Err(e) => {
                     log::warn!(
                         "v2 PlatformBackend: cursor plane init failed ({e}); SW cursor fallback",
                     );
-                    None
+                    (None, true)
                 }
             }
         };
@@ -993,7 +997,7 @@ impl PlatformBackend {
             shutting_down: false,
             cursor_plane,
             cursor_pending_move: None,
-            hw_cursor_disabled: false,
+            hw_cursor_disabled,
             submit_group,
             last_flush_outcome: None,
             force_next_submit_failure: false,
@@ -1148,6 +1152,65 @@ impl PlatformBackend {
         self.primary_device()
             .zip(self.outputs.get(output_idx))
             .is_some_and(|(device, output)| device.key == output.key.device_key)
+    }
+
+    /// Return the primary device and its active CRTCs when hardware-cursor
+    /// initialization is still pending. `None + !hw_cursor_disabled` is the
+    /// intentional headless/deferred state; `None + hw_cursor_disabled` is a
+    /// permanent software-cursor decision and must not retry.
+    fn pending_cursor_init_inputs(
+        &self,
+    ) -> Option<(
+        crate::platform::drm::DrmDeviceKey,
+        Rc<drm::Device>,
+        Vec<::drm::control::crtc::Handle>,
+    )> {
+        if self.cursor_plane.is_some() || self.hw_cursor_disabled {
+            return None;
+        }
+        let device = self.primary_device()?;
+        let device_key = device.key;
+        let drm = Rc::clone(&device.device);
+        let crtcs: Vec<_> = self
+            .outputs
+            .iter()
+            .filter(|output| output.key.device_key == device_key)
+            .map(|output| output.output.crtc)
+            .collect();
+        (!crtcs.is_empty()).then_some((device_key, drm, crtcs))
+    }
+
+    fn ensure_cursor_plane_with<F>(&mut self, factory: F)
+    where
+        F: FnOnce(
+            Rc<drm::Device>,
+            &[::drm::control::crtc::Handle],
+        ) -> io::Result<crate::kms::cursor_plane::CursorPlane>,
+    {
+        let Some((device_key, device, crtcs)) = self.pending_cursor_init_inputs() else {
+            return;
+        };
+        match factory(device, &crtcs) {
+            Ok(plane) => {
+                log::info!(
+                    "v2 cursor: deferred hardware cursor initialized on DRM device {device_key} \
+                     for {} active CRTC(s)",
+                    crtcs.len()
+                );
+                self.cursor_plane = Some(plane);
+            }
+            Err(e) => {
+                log::warn!(
+                    "v2 cursor: deferred hardware cursor init failed on DRM device {device_key} \
+                     ({e}); latching the device to software cursor composition"
+                );
+                self.hw_cursor_disabled = true;
+            }
+        }
+    }
+
+    fn ensure_cursor_plane_for_active_outputs(&mut self) {
+        self.ensure_cursor_plane_with(crate::kms::cursor_plane::CursorPlane::new);
     }
 
     /// Apply the all-or-nothing cursor policy after an active-output
@@ -2831,6 +2894,7 @@ impl PlatformBackend {
         self.fb_w = fb_w;
         self.fb_h = fb_h;
         self.prune_present_clocks_to_live_outputs();
+        self.ensure_cursor_plane_for_active_outputs();
         self.latch_hw_cursor_off_if_topology_unsupported();
 
         log::info!(
@@ -3262,6 +3326,7 @@ impl PlatformBackend {
         self.fb_w = fb_w;
         self.fb_h = fb_h;
         self.prune_present_clocks_to_live_outputs();
+        self.ensure_cursor_plane_for_active_outputs();
         self.latch_hw_cursor_off_if_topology_unsupported();
         Ok(rescan)
     }
@@ -3424,6 +3489,62 @@ mod tests {
         assert_eq!(platform.output_index_for_crtc(right), Some(0));
         assert_eq!(platform.output_index_for_crtc(wrong_device), None);
         assert!(platform.cursor_plane_owns_output(0));
+    }
+
+    #[test]
+    fn deferred_cursor_init_waits_for_a_primary_device_crtc() {
+        let mut platform = PlatformBackend::for_tests();
+        platform.outputs.clear();
+
+        platform.ensure_cursor_plane_with(|_, _| panic!("factory must not run headless"));
+
+        assert!(platform.cursor_plane.is_none());
+        assert!(!platform.hw_cursor_disabled());
+        assert!(platform.pending_cursor_init_inputs().is_none());
+    }
+
+    #[test]
+    fn deferred_cursor_init_uses_the_primary_device_crtcs() {
+        let platform = PlatformBackend::for_tests();
+        let expected_device = platform.devices[0].key;
+        let expected_crtc = platform.outputs[0].output.crtc;
+
+        let (device_key, _, crtcs) = platform
+            .pending_cursor_init_inputs()
+            .expect("active primary output should trigger deferred init");
+
+        assert_eq!(device_key, expected_device);
+        assert_eq!(crtcs, vec![expected_crtc]);
+    }
+
+    #[test]
+    fn deferred_cursor_init_ignores_secondary_device_outputs() {
+        let mut platform = PlatformBackend::for_tests();
+        platform.outputs[0].key.device_key = crate::platform::drm::DrmDeviceKey {
+            major: 226,
+            minor: 99,
+        };
+
+        assert!(platform.pending_cursor_init_inputs().is_none());
+        assert!(!platform.hw_cursor_disabled());
+    }
+
+    #[test]
+    fn deferred_cursor_init_failure_latches_without_retry() {
+        let mut platform = PlatformBackend::for_tests();
+        let expected_crtc = platform.outputs[0].output.crtc;
+
+        platform.ensure_cursor_plane_with(|_, crtcs| {
+            assert_eq!(crtcs, &[expected_crtc]);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "synthetic cursor init failure",
+            ))
+        });
+
+        assert!(platform.cursor_plane.is_none());
+        assert!(platform.hw_cursor_disabled());
+        platform.ensure_cursor_plane_with(|_, _| panic!("latched failure must not retry"));
     }
 
     #[test]

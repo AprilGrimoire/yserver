@@ -240,6 +240,10 @@ Cross-cutting bugs and followups that don't fit a stage live in
   every active CRTC or the entire device uses software cursors. Drivers
   exposing only legacy cursor ioctls retain an optimistic bind probe, but
   an unsupported bind on any CRTC latches the whole device to software.
+  Headless startup now retains a real pending cursor-init state: enabling
+  the primary DRM device's first output initializes the cursor plane from
+  the newly active CRTC set, while an initialization failure latches the
+  device to software instead of retrying on every later topology change.
   Provider wire replies and source/sink offload routing remain the next
   PRIME layer. Validation: `cargo test -p yserver-core`, `cargo test -p
   yserver --lib`, `cargo test --workspace --all-targets`, `cargo
