@@ -478,15 +478,16 @@ pub(crate) const WAKEUP_EVENTFD_TOKEN: u64 = u64::MAX;
 ///
 /// Apple's DCP display driver (Asahi) returns `ENXIO` from
 /// `DRM_IOCTL_MODE_CURSOR2`; other atomic-only drivers may return
-/// `ENODEV` / `EOPNOTSUPP`. Recoverable / ambiguous errors (`EBUSY`,
-/// `EINVAL`, non-OS errors) must NOT latch — `EBUSY` is transient and
-/// latching it would needlessly kill the HW cursor on drivers that do
-/// support the ioctl (e.g. amdgpu). This mirrors Xorg's modesetting
+/// `ENODEV` / `EOPNOTSUPP`. `EINVAL` also latches: after the explicit
+/// cursor-plane topology check has accepted the device (or the driver
+/// exposed only legacy cursor ioctls), a bind rejected on one CRTC means
+/// this device cannot satisfy yserver's all-output cursor policy. `EBUSY`
+/// remains transient and must not latch. This mirrors Xorg's modesetting
 /// driver, which clears `use_hw_cursor` when the cursor ioctl fails.
 fn cursor_err_disables_hw(e: &io::Error) -> bool {
     matches!(
         e.raw_os_error(),
-        Some(libc::ENXIO | libc::ENODEV | libc::EOPNOTSUPP)
+        Some(libc::ENXIO | libc::ENODEV | libc::EOPNOTSUPP | libc::EINVAL)
     )
 }
 
@@ -499,6 +500,30 @@ pub(crate) struct SequenceCompletion {
     pub(crate) crtc_id_raw: u32,
     pub(crate) time_ns: i64,
     pub(crate) sequence: u64,
+}
+
+/// Process-local identity of one KMS CRTC.
+///
+/// DRM object handles are scoped to a DRM device. Two GPUs may both expose
+/// (for example) CRTC handle 42, so a raw `crtc::Handle` is not sufficient as
+/// a map key or event-routing identity once more than one card is open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct CrtcKey {
+    pub(crate) device_key: crate::platform::drm::DrmDeviceKey,
+    pub(crate) crtc: ::drm::control::crtc::Handle,
+}
+
+impl CrtcKey {
+    pub(crate) fn new(
+        device_key: crate::platform::drm::DrmDeviceKey,
+        crtc: ::drm::control::crtc::Handle,
+    ) -> Self {
+        Self { device_key, crtc }
+    }
+
+    fn for_output(output: &ActiveOutput) -> Self {
+        Self::new(output.key.device_key, output.output.crtc)
+    }
 }
 
 pub(crate) struct KmsDevice {
@@ -516,13 +541,13 @@ pub(crate) struct PlatformBackend {
     pub(crate) outputs: Vec<ActiveOutput>,
     pub(crate) fb_w: u16,
     pub(crate) fb_h: u16,
-    /// Latest kernel `(msc, ust_micros)` per output index, updated on each
-    /// pageflip retirement in `drain_page_flip_events`. Drives Present
-    /// vblank pacing (`present_get_ust_msc`): a compositor's
-    /// `PresentNotifyMSC` completes with these real values so its frame
-    /// clock advances at the display refresh rate. Empty until the first
-    /// flip retires.
-    pub(crate) ust_msc: std::collections::HashMap<usize, (u64, u64)>,
+    /// Latest kernel `(msc, ust_micros)` per device-qualified CRTC, updated
+    /// on each pageflip retirement in `drain_page_flip_events`. Drives
+    /// Present vblank pacing (`present_get_ust_msc`): a compositor's
+    /// `PresentNotifyMSC` completes with these real values so its frame clock
+    /// advances at the display refresh rate. Empty until the first flip
+    /// retires.
+    pub(crate) ust_msc: std::collections::HashMap<CrtcKey, (u64, u64)>,
 
     /// Per-output software MSC fallback. Some KMS drivers (notably
     /// apple_drm on Asahi) report `frame == 0` in every page-flip
@@ -539,7 +564,7 @@ pub(crate) struct PlatformBackend {
     /// advancing MSC at the actual pageflip cadence. On drivers that
     /// report a real `frame > 0` this map stays empty (the real value
     /// is used directly).
-    pub(crate) software_msc: std::collections::HashMap<usize, u64>,
+    pub(crate) software_msc: std::collections::HashMap<CrtcKey, u64>,
 
     // Input side
     input_ctx: Option<crate::input::SendContext>,
@@ -647,12 +672,27 @@ pub(crate) struct RescanResult {
     pub added_keys: Vec<OutputKey>,
     pub dropped_keys: Vec<OutputKey>,
     pub dropped_old_indices: Vec<usize>,
-    pub added_count: usize,
-    /// Task 5.2: newly-connected connectors discovered by a *runtime*
-    /// rescan are NOT auto-enabled — they're surfaced here (with their
-    /// advertised modes/dimensions) so the backend can register them
-    /// off in the connector registry and fire `OutputChangeNotify`.
-    pub added_outputs: Vec<(OutputKey, crate::platform::drm::Output)>,
+    /// Snapshot of every currently connected connector on every opened DRM
+    /// device. The backend reconciles this with its stable RANDR registry;
+    /// connectors absent from `outputs` remain registered but off.
+    pub connected: Vec<ConnectorSnapshot>,
+}
+
+/// Device-qualified, non-owning connector state used to synchronize the
+/// stable RANDR registry with KMS discovery.
+#[derive(Debug, Clone)]
+pub(crate) struct ConnectorSnapshot {
+    pub(crate) key: OutputKey,
+    pub(crate) modes: Vec<crate::platform::drm::Mode>,
+}
+
+impl ConnectorSnapshot {
+    fn from_output(key: OutputKey, output: &crate::platform::drm::Output) -> Self {
+        Self {
+            key,
+            modes: output.modes.clone(),
+        }
+    }
 }
 
 /// Pure recompute of the virtual-screen extent from `(x, y, width, height)`.
@@ -729,9 +769,11 @@ impl PlatformBackend {
             fb_h,
             input_ctx,
         } = platform_init;
-        // Runtime allocation is still single-scanout-device here. With no
-        // KMS devices there are no layouts, so scanout/cursor allocation is
-        // skipped while the Vulkan-backed X11 core remains available.
+        // Startup activates outputs only on the primary scanout device.
+        // Later RANDR requests may allocate pools on secondary devices via
+        // `enable_connector`. With no KMS devices there are no layouts, so
+        // scanout/cursor allocation is skipped while the Vulkan-backed X11
+        // core remains available.
         let primary_drm = devices.first().map(|device| Rc::clone(&device.device));
 
         let vk = match VkContext::new() {
@@ -1094,6 +1136,55 @@ impl PlatformBackend {
         self.cursor_plane.is_some() && !self.hw_cursor_disabled
     }
 
+    /// The current cursor-plane object is allocated from the primary DRM
+    /// device. Secondary-device outputs must use the software cursor until
+    /// cursor planes become per-device resources.
+    #[must_use]
+    pub(crate) fn cursor_plane_available_for_output(&self, output_idx: usize) -> bool {
+        self.cursor_plane_available() && self.cursor_plane_owns_output(output_idx)
+    }
+
+    fn cursor_plane_owns_output(&self, output_idx: usize) -> bool {
+        self.primary_device()
+            .zip(self.outputs.get(output_idx))
+            .is_some_and(|(device, output)| device.key == output.key.device_key)
+    }
+
+    /// Apply the all-or-nothing cursor policy after an active-output
+    /// topology change. If the primary device's explicitly exposed cursor
+    /// planes cannot cover every active CRTC simultaneously, hide any
+    /// existing hardware cursor and permanently latch the whole device to
+    /// software cursor composition.
+    fn latch_hw_cursor_off_if_topology_unsupported(&mut self) {
+        if self.hw_cursor_disabled {
+            return;
+        }
+        let Some(device_key) = self.primary_device().map(|device| device.key) else {
+            return;
+        };
+        let crtcs: Vec<_> = self
+            .outputs
+            .iter()
+            .filter(|output| output.key.device_key == device_key)
+            .map(|output| output.output.crtc)
+            .collect();
+        let Some(plane) = self.cursor_plane.as_ref() else {
+            return;
+        };
+        if plane.supports_crtcs(&crtcs) {
+            return;
+        }
+
+        log::warn!(
+            "v2 cursor: cursor planes on DRM device {device_key} cannot cover all active CRTCs; \
+             disabling HW cursor for the entire device"
+        );
+        if let Err(e) = self.cursor_plane_hide_all() {
+            log::warn!("v2 cursor: failed to hide cursor while disabling partial support: {e}");
+        }
+        self.hw_cursor_disabled = true;
+    }
+
     /// True iff the HW cursor strategy has been latched off because a
     /// bind ioctl failed with a "driver doesn't support cursor ioctls"
     /// errno (see [`cursor_err_disables_hw`]). Diagnostic / test hook.
@@ -1167,6 +1258,11 @@ impl PlatformBackend {
         let Some(layout) = self.outputs.get(output_idx) else {
             return Err(io::Error::new(io::ErrorKind::NotFound, "no such output"));
         };
+        if !self.cursor_plane_owns_output(output_idx) {
+            return Err(io::Error::other(
+                "cursor plane does not belong to this output's DRM device",
+            ));
+        }
         let crtc = layout.output.crtc;
         let layout_x = layout.x;
         let layout_y = layout.y;
@@ -1204,9 +1300,11 @@ impl PlatformBackend {
     ) -> io::Result<()> {
         // Snapshot output layouts so the per-CRTC ioctls below can
         // borrow `&mut self.cursor_plane` exclusively.
+        let cursor_device_key = self.primary_device().map(|device| device.key);
         let layouts: Vec<(::drm::control::crtc::Handle, i32, i32)> = self
             .outputs
             .iter()
+            .filter(|layout| Some(layout.key.device_key) == cursor_device_key)
             .map(|l| (l.output.crtc, l.x, l.y))
             .collect();
         let Some(plane) = self.cursor_plane.as_mut() else {
@@ -1297,9 +1395,11 @@ impl PlatformBackend {
         hot_y: u16,
     ) -> io::Result<u32> {
         // Snapshot first (see `cursor_plane_rebind_visible_crtcs`).
+        let cursor_device_key = self.primary_device().map(|device| device.key);
         let layouts: Vec<(::drm::control::crtc::Handle, i32, i32)> = self
             .outputs
             .iter()
+            .filter(|layout| Some(layout.key.device_key) == cursor_device_key)
             .map(|l| (l.output.crtc, l.x, l.y))
             .collect();
         let Some(plane) = self.cursor_plane.as_mut() else {
@@ -1352,7 +1452,12 @@ impl PlatformBackend {
         let Some(plane) = self.cursor_plane.as_ref() else {
             return false;
         };
-        for l in &self.outputs {
+        let cursor_device_key = self.primary_device().map(|device| device.key);
+        for l in self
+            .outputs
+            .iter()
+            .filter(|layout| Some(layout.key.device_key) == cursor_device_key)
+        {
             let dx = x - i32::from(hot_x) - l.x;
             let dy = y - i32::from(hot_y) - l.y;
             let intersects = cursor_footprint_intersects_output(
@@ -1381,6 +1486,9 @@ impl PlatformBackend {
         let Some(layout) = self.outputs.get(output_idx) else {
             return Err(io::Error::new(io::ErrorKind::NotFound, "no such output"));
         };
+        if !self.cursor_plane_owns_output(output_idx) {
+            return Ok(());
+        }
         let crtc = layout.output.crtc;
         let Some(plane) = self.cursor_plane.as_mut() else {
             return Err(io::Error::other("cursor plane unavailable"));
@@ -1406,8 +1514,13 @@ impl PlatformBackend {
         // Union of currently-tracked CRTCs and current output CRTCs.
         // Output disable could have removed a CRTC from `outputs`
         // while a stale visibility entry survives; iterate both.
-        let mut crtcs: Vec<::drm::control::crtc::Handle> =
-            self.outputs.iter().map(|l| l.output.crtc).collect();
+        let cursor_device_key = self.primary_device().map(|device| device.key);
+        let mut crtcs: Vec<::drm::control::crtc::Handle> = self
+            .outputs
+            .iter()
+            .filter(|layout| Some(layout.key.device_key) == cursor_device_key)
+            .map(|layout| layout.output.crtc)
+            .collect();
         let Some(plane) = self.cursor_plane.as_mut() else {
             return Err(io::Error::other("cursor plane unavailable"));
         };
@@ -1457,6 +1570,55 @@ impl PlatformBackend {
 
     pub(crate) fn device_for_output(&self, key: &OutputKey) -> Option<&KmsDevice> {
         self.device_for_key(key.device_key)
+    }
+
+    fn output_index_for_crtc(&self, crtc_key: CrtcKey) -> Option<usize> {
+        self.outputs
+            .iter()
+            .position(|output| CrtcKey::for_output(output) == crtc_key)
+    }
+
+    /// Retire Present clocks for CRTCs no longer present in the active
+    /// topology. Called after connector disable, reconfiguration, and rescan
+    /// so a removed pipe cannot leave a permanently dominant global MSC or
+    /// collide with the same raw CRTC handle on another DRM device.
+    fn prune_present_clocks_to_live_outputs(&mut self) {
+        let live: HashSet<CrtcKey> = self.outputs.iter().map(CrtcKey::for_output).collect();
+        self.ust_msc.retain(|key, _| live.contains(key));
+        self.software_msc.retain(|key, _| live.contains(key));
+    }
+
+    /// Discover connected connectors on every DRM device retained by the
+    /// platform. Results stay device-qualified even when two cards expose the
+    /// same connector name or raw DRM object handles.
+    pub(crate) fn discover_connected_outputs(
+        &self,
+    ) -> io::Result<Vec<(OutputKey, crate::platform::drm::Output)>> {
+        let mut connected = Vec::new();
+        for device in &self.devices {
+            let outputs = crate::platform::drm::discover_outputs(&device.device).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("discover outputs on DRM device {}: {e}", device.key),
+                )
+            })?;
+            connected.extend(outputs.into_iter().map(|output| {
+                (
+                    OutputKey::new(device.key, output.connector_name.clone()),
+                    output,
+                )
+            }));
+        }
+        Ok(connected)
+    }
+
+    pub(crate) fn discover_connector_snapshots(&self) -> io::Result<Vec<ConnectorSnapshot>> {
+        self.discover_connected_outputs().map(|outputs| {
+            outputs
+                .into_iter()
+                .map(|(key, output)| ConnectorSnapshot::from_output(key, &output))
+                .collect()
+        })
     }
 
     pub(crate) fn poll_fds(&self) -> Vec<(RawFd, BackendFdKind)> {
@@ -1516,16 +1678,13 @@ impl PlatformBackend {
 
         let mut output_indices = Vec::with_capacity(flipped.len());
         for (device_key, crtc, frame, dur) in flipped {
-            let Some(output_idx) = self.outputs.iter().position(|o| o.output.crtc == crtc) else {
-                log::warn!("v2: pageflip-complete for unknown CRTC {crtc:?}");
-                continue;
-            };
-            if self.outputs[output_idx].key.device_key != device_key {
+            let crtc_key = CrtcKey::new(device_key, crtc);
+            let Some(output_idx) = self.output_index_for_crtc(crtc_key) else {
                 log::warn!(
-                    "v2: pageflip-complete for CRTC {crtc:?} on unexpected device {device_key}"
+                    "v2: pageflip-complete for unknown CRTC {crtc:?} on device {device_key}"
                 );
                 continue;
-            }
+            };
             // u32 frame → u64 MSC (kernel wraps at 2^32; monotonic enough
             // for a frame clock within a session). UST in microseconds.
             let ust = u64::try_from(dur.as_micros()).unwrap_or(u64::MAX);
@@ -1541,11 +1700,11 @@ impl PlatformBackend {
             let msc = if frame == 0 {
                 let next = self
                     .software_msc
-                    .get(&output_idx)
+                    .get(&crtc_key)
                     .copied()
                     .unwrap_or(0)
                     .saturating_add(1);
-                self.software_msc.insert(output_idx, next);
+                self.software_msc.insert(crtc_key, next);
                 log::debug!(
                     target: "yserver::kms::v2::platform",
                     "v2 pageflip software-msc fallback output={output_idx} msc={next} \
@@ -1559,7 +1718,7 @@ impl PlatformBackend {
                 target: "yserver::kms::v2::platform",
                 "v2 pageflip ust_msc output={output_idx} msc={msc} kernel_frame={frame} kernel_ust_micros={ust}"
             );
-            self.ust_msc.insert(output_idx, (msc, ust));
+            self.ust_msc.insert(crtc_key, (msc, ust));
             output_indices.push(output_idx);
         }
         Ok((output_indices, sequenced))
@@ -2401,6 +2560,8 @@ impl PlatformBackend {
         let (fb_w, fb_h) = recompute_fb_extent_from(&layouts);
         self.fb_w = fb_w;
         self.fb_h = fb_h;
+        self.prune_present_clocks_to_live_outputs();
+        self.latch_hw_cursor_off_if_topology_unsupported();
 
         log::info!(
             "v2 disable_connector: {connector} disabled; fb now {}×{}",
@@ -2669,6 +2830,8 @@ impl PlatformBackend {
         let (fb_w, fb_h) = recompute_fb_extent_from(&layouts);
         self.fb_w = fb_w;
         self.fb_h = fb_h;
+        self.prune_present_clocks_to_live_outputs();
+        self.latch_hw_cursor_off_if_topology_unsupported();
 
         log::info!(
             "v2 enable_connector: {connector} enabled {}×{}@{} at ({x},{y}); fb now {}×{}",
@@ -2988,37 +3151,42 @@ impl PlatformBackend {
         }
     }
 
-    /// Re-scan connectors on the existing device, dropping missing
-    /// outputs, refreshing surviving output metadata, and adding newly
-    /// connected outputs.
+    /// Re-scan connectors on every opened DRM device, dropping missing active
+    /// outputs, refreshing survivors, and reporting every connected connector
+    /// to the backend's stable RANDR registry.
     pub(crate) fn requery_outputs_and_modeset(
         &mut self,
         client_configured: &HashSet<OutputKey>,
+        known_connected: &HashSet<OutputKey>,
     ) -> io::Result<RescanResult> {
-        let Some(device) = self.primary_device() else {
+        if self.devices.is_empty() {
             return Ok(RescanResult::default());
-        };
-        let device_key = device.key;
-        let discovered = crate::platform::drm::discover_outputs(&device.device)?;
-        let discovered_order: Vec<OutputKey> = discovered
-            .iter()
-            .map(|o| OutputKey::new(device_key, o.connector_name.clone()))
-            .collect();
-        let discovered_keys: HashSet<OutputKey> = discovered
-            .iter()
-            .map(|o| OutputKey::new(device_key, o.connector_name.clone()))
-            .collect();
-        let current_keys: HashSet<OutputKey> = self
-            .outputs
-            .iter()
-            .map(|layout| layout.key.clone())
-            .collect();
-        let mut discovered_by_key: HashMap<OutputKey, crate::platform::drm::Output> = discovered
-            .into_iter()
-            .map(|o| (OutputKey::new(device_key, o.connector_name.clone()), o))
-            .collect();
+        }
 
-        let mut rescan = RescanResult::default();
+        let discovered = self.discover_connected_outputs()?;
+        let connected: Vec<ConnectorSnapshot> = discovered
+            .iter()
+            .map(|(key, output)| ConnectorSnapshot::from_output(key.clone(), output))
+            .collect();
+        let discovered_order: Vec<OutputKey> =
+            discovered.iter().map(|(key, _)| key.clone()).collect();
+        let discovered_keys: HashSet<OutputKey> = discovered_order.iter().cloned().collect();
+        let mut discovered_by_key: HashMap<OutputKey, crate::platform::drm::Output> =
+            discovered.into_iter().collect();
+
+        let mut rescan = RescanResult {
+            added_keys: discovered_order
+                .iter()
+                .filter(|key| !known_connected.contains(*key))
+                .cloned()
+                .collect(),
+            dropped_keys: known_connected
+                .difference(&discovered_keys)
+                .cloned()
+                .collect(),
+            connected,
+            ..RescanResult::default()
+        };
         for (idx, layout) in self.outputs.iter().enumerate() {
             let output_key = layout.key.clone();
             if discovered_keys.contains(&output_key) {
@@ -3029,8 +3197,12 @@ impl PlatformBackend {
                 layout.output.connector_name,
             );
             rescan.dropped_old_indices.push(idx);
-            rescan.dropped_keys.push(output_key);
+            if !rescan.dropped_keys.contains(&output_key) {
+                rescan.dropped_keys.push(output_key);
+            }
         }
+        rescan.dropped_keys.sort();
+        rescan.dropped_keys.dedup();
         rescan.dropped_old_indices.sort_unstable_by(|a, b| b.cmp(a));
         for idx in rescan.dropped_old_indices.iter().copied() {
             self.outputs.remove(idx);
@@ -3068,30 +3240,16 @@ impl PlatformBackend {
             }
         }
 
-        // Task 5.2: a *runtime* rescan (hotplug / VT-resume) does NOT
-        // auto-enable a newly-connected connector. Xorg leaves
-        // `output->crtc = NULL` until a client configures it; we mirror
-        // that — no scanout pool, no modeset, not added to
-        // `self.outputs`, so it contributes nothing to the virtual
-        // extent and stays dark. The connector is surfaced in
-        // `added_outputs` so the backend registers it off (connected,
-        // no CRTC) and fires `OutputChangeNotify`. Boot auto-enable lives
-        // in `open_with_commit`, a distinct entry point that never calls
-        // this runtime-rescan path.
-        for name in discovered_order {
-            if current_keys.contains(&name) {
-                continue;
-            }
-            let Some(output) = discovered_by_key.remove(&name) else {
-                continue;
-            };
+        // A runtime rescan (hotplug / VT-resume) never auto-enables a newly
+        // connected connector. Secondary-device connectors and hotplugged
+        // connectors remain registry-only/off until a RANDR client enables
+        // them. `connected` above carries their modes to the backend.
+        for key in &rescan.added_keys {
             log::info!(
-                "v2 rescan: new connector {} discovered — registering OFF (client must enable)",
-                output.connector_name,
+                "v2 rescan: new connector {} on {} discovered — registering OFF (client must enable)",
+                key.connector_name,
+                key.device_key,
             );
-            rescan.added_keys.push(name.clone());
-            rescan.added_outputs.push((name, output));
-            rescan.added_count += 1;
         }
 
         self.recompact_horizontal_layout(client_configured);
@@ -3103,6 +3261,8 @@ impl PlatformBackend {
         let (fb_w, fb_h) = recompute_fb_extent_from(&layouts);
         self.fb_w = fb_w;
         self.fb_h = fb_h;
+        self.prune_present_clocks_to_live_outputs();
+        self.latch_hw_cursor_off_if_topology_unsupported();
         Ok(rescan)
     }
 
@@ -3137,9 +3297,11 @@ impl PlatformBackend {
         // Snapshot output layouts so the per-CRTC ioctls can borrow
         // `&mut self.cursor_plane` exclusively (mirrors
         // `cursor_plane_rebind_visible_crtcs`).
+        let cursor_device_key = self.primary_device().map(|device| device.key);
         let layouts: Vec<(::drm::control::crtc::Handle, i32, i32)> = self
             .outputs
             .iter()
+            .filter(|layout| Some(layout.key.device_key) == cursor_device_key)
             .map(|l| (l.output.crtc, l.x, l.y))
             .collect();
         // Safe to unwrap — checked above.
@@ -3224,11 +3386,75 @@ fn cursor_footprint_intersects_output(dx: i32, dy: i32, cw: i32, ch: i32, w: i32
 mod tests {
     use super::*;
 
+    #[test]
+    fn crtc_identity_includes_the_drm_device() {
+        let crtc = ::drm::control::from_u32(7).unwrap();
+        let first = CrtcKey::new(
+            crate::platform::drm::DrmDeviceKey {
+                major: 226,
+                minor: 0,
+            },
+            crtc,
+        );
+        let second = CrtcKey::new(
+            crate::platform::drm::DrmDeviceKey {
+                major: 226,
+                minor: 1,
+            },
+            crtc,
+        );
+
+        assert_ne!(first, second);
+        assert_eq!(HashSet::from([first, second]).len(), 2);
+    }
+
+    #[test]
+    fn output_lookup_rejects_same_crtc_handle_from_another_device() {
+        let platform = PlatformBackend::for_tests();
+        let output = &platform.outputs[0];
+        let right = CrtcKey::new(output.key.device_key, output.output.crtc);
+        let wrong_device = CrtcKey::new(
+            crate::platform::drm::DrmDeviceKey {
+                major: 226,
+                minor: 99,
+            },
+            output.output.crtc,
+        );
+
+        assert_eq!(platform.output_index_for_crtc(right), Some(0));
+        assert_eq!(platform.output_index_for_crtc(wrong_device), None);
+        assert!(platform.cursor_plane_owns_output(0));
+    }
+
+    #[test]
+    fn present_clock_pruning_uses_device_qualified_crtcs() {
+        let mut platform = PlatformBackend::for_tests();
+        let output = &platform.outputs[0];
+        let live = CrtcKey::for_output(output);
+        let colliding = CrtcKey::new(
+            crate::platform::drm::DrmDeviceKey {
+                major: 226,
+                minor: 99,
+            },
+            output.output.crtc,
+        );
+        platform.ust_msc.insert(live, (3, 30));
+        platform.ust_msc.insert(colliding, (9, 90));
+        platform.software_msc.insert(live, 3);
+        platform.software_msc.insert(colliding, 9);
+
+        platform.prune_present_clocks_to_live_outputs();
+
+        assert_eq!(platform.ust_msc, HashMap::from([(live, (3, 30))]));
+        assert_eq!(platform.software_msc, HashMap::from([(live, 3)]));
+    }
+
     /// HW-cursor auto-fallback policy: an ioctl error that means the
     /// driver doesn't implement the (legacy) cursor ioctls must latch
     /// the strategy off so the scene falls back to the SW cursor.
     /// Apple's DCP driver (Asahi) returns `ENXIO`; some drivers return
-    /// `ENODEV` / `EOPNOTSUPP`. Recoverable errors (`EBUSY`) must NOT
+    /// `ENODEV` / `EOPNOTSUPP`; `EINVAL` is treated as a CRTC-level
+    /// incompatibility under the all-or-nothing device policy. `EBUSY` must NOT
     /// latch — those are transient and latching would needlessly kill
     /// the HW cursor on drivers that DO support it (e.g. amdgpu).
     #[test]
@@ -3244,14 +3470,14 @@ mod tests {
         assert!(cursor_err_disables_hw(&Error::from_raw_os_error(
             libc::EOPNOTSUPP
         )));
+        assert!(cursor_err_disables_hw(&Error::from_raw_os_error(
+            libc::EINVAL
+        )));
         // Transient / recoverable: must keep the HW path alive.
         assert!(!cursor_err_disables_hw(&Error::from_raw_os_error(
             libc::EBUSY
         )));
-        // Generic / ambiguous: don't latch on these either.
-        assert!(!cursor_err_disables_hw(&Error::from_raw_os_error(
-            libc::EINVAL
-        )));
+        // A non-OS error remains ambiguous and does not latch.
         assert!(!cursor_err_disables_hw(&Error::other("not an os error")));
     }
 

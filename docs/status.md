@@ -219,6 +219,32 @@ Cross-cutting bugs and followups that don't fit a stage live in
   `platform::drm_linux`, and `render_node` tests, full `cargo test -p
   yserver --lib`, and CI-style `cargo clippy --all-targets -- -D
   warnings`.
+- **2026-07-10 PRIME device-qualified topology and lifecycle**: KMS
+  startup now seeds the stable RANDR connector registry from every
+  opened DRM device, while keeping secondary-device connectors
+  connected-but-off until a RANDR client explicitly enables them.
+  Hotplug re-probe and VT resume discover all devices, reconcile mode
+  lists and connection state without duplicating notifications, and
+  retain stable output/CRTC ids across disconnect/reconnect. Raw DRM
+  CRTC handles are now qualified by device for page-flip routing,
+  Present clocks, idle-vblank arms, and lifecycle pruning; lack of
+  `DRM_IOCTL_CRTC_QUEUE_SEQUENCE` is likewise latched per device rather
+  than disabling pacing globally. RANDR gamma hooks now use the CRTC
+  XID and resolve it back to a device-qualified output key, preventing
+  equal connector names on different cards from sharing a LUT. The
+  existing hardware cursor allocation is explicitly limited to outputs
+  on its primary DRM device; secondary-device outputs use software
+  cursor composition until cursor planes become per-device resources.
+  Cursor support is all-or-nothing per DRM device: when universal cursor
+  planes are exposed, they must admit a distinct-plane assignment for
+  every active CRTC or the entire device uses software cursors. Drivers
+  exposing only legacy cursor ioctls retain an optimistic bind probe, but
+  an unsupported bind on any CRTC latches the whole device to software.
+  Provider wire replies and source/sink offload routing remain the next
+  PRIME layer. Validation: `cargo test -p yserver-core`, `cargo test -p
+  yserver --lib`, `cargo test --workspace --all-targets`, `cargo
+  clippy --all-targets -- -D warnings`, and `cargo +nightly fmt --all
+  -- --check`. Live multi-GPU hardware smoke remains pending.
 - **2026-06-08 COW architectural reset**: the active Cinnamon blocker
   is now treated as a structural COW/model bug, not another
   scene-assembly edge case. Replacement design doc:

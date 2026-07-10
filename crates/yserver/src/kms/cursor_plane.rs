@@ -25,12 +25,17 @@
 //! haven't retired the transition yet (the multi-output double-cursor
 //! hazard).
 
-use std::{collections::HashMap, io, mem, ptr::NonNull, rc::Rc};
+use std::{
+    collections::{HashMap, HashSet},
+    io, mem,
+    ptr::NonNull,
+    rc::Rc,
+};
 
 use drm::{
     Device as DrmDevice, DriverCapability,
     buffer::{Buffer, DrmFourcc},
-    control::{Device as ControlDevice, crtc, dumbbuffer::DumbBuffer},
+    control::{Device as ControlDevice, PlaneType, crtc, dumbbuffer::DumbBuffer},
 };
 
 use crate::drm::Device;
@@ -77,17 +82,119 @@ pub struct CursorPlane {
     /// init / VT-leave / full modeset (forces the next show to
     /// re-upload).
     uploaded_version: Option<u64>,
+    /// Compatibility masks for explicitly exposed universal cursor planes.
+    /// `None` means the driver exposed no cursor planes, in which case the
+    /// legacy cursor ioctls remain an optimistic runtime probe. When present,
+    /// every active CRTC must have a distinct compatible plane or the whole
+    /// DRM device falls back to software cursors.
+    explicit_plane_crtcs: Option<Vec<HashSet<crtc::Handle>>>,
+}
+
+/// Whether distinct cursor planes can be assigned to every required CRTC.
+/// A plane object can only be active on one CRTC at a time even when its
+/// `possible_crtcs` mask contains several pipes, so simple union coverage is
+/// insufficient for a cursor straddling an output boundary.
+fn cursor_planes_cover_crtcs(
+    required_crtcs: &[crtc::Handle],
+    plane_crtcs: &[HashSet<crtc::Handle>],
+) -> bool {
+    let mut required = required_crtcs.to_vec();
+    required.sort_by_key(|crtc| u32::from(*crtc));
+    required.dedup();
+    required.sort_by_key(|crtc| {
+        plane_crtcs
+            .iter()
+            .filter(|possible| possible.contains(crtc))
+            .count()
+    });
+
+    fn assign(
+        required: &[crtc::Handle],
+        plane_crtcs: &[HashSet<crtc::Handle>],
+        used: &mut [bool],
+        index: usize,
+    ) -> bool {
+        if index == required.len() {
+            return true;
+        }
+        for (plane_index, possible) in plane_crtcs.iter().enumerate() {
+            if used[plane_index] || !possible.contains(&required[index]) {
+                continue;
+            }
+            used[plane_index] = true;
+            if assign(required, plane_crtcs, used, index + 1) {
+                return true;
+            }
+            used[plane_index] = false;
+        }
+        false
+    }
+
+    assign(
+        &required,
+        plane_crtcs,
+        &mut vec![false; plane_crtcs.len()],
+        0,
+    )
+}
+
+fn discover_cursor_plane_crtcs(device: &Device) -> io::Result<Vec<HashSet<crtc::Handle>>> {
+    let resources = device.resource_handles()?;
+    let mut cursor_planes = Vec::new();
+    for handle in device.plane_handles()? {
+        let info = device.get_plane(handle)?;
+        let props = device.get_properties(handle)?;
+        let map = props.as_hashmap(device)?;
+        let Some(type_info) = map.get("type") else {
+            continue;
+        };
+        let raw = props
+            .iter()
+            .find(|(property, _)| **property == type_info.handle())
+            .map(|(_, value)| *value)
+            .unwrap_or(0);
+        if raw != PlaneType::Cursor as u64 {
+            continue;
+        }
+        cursor_planes.push(
+            resources
+                .filter_crtcs(info.possible_crtcs())
+                .into_iter()
+                .collect(),
+        );
+    }
+    Ok(cursor_planes)
 }
 
 impl CursorPlane {
-    /// Allocate the cursor dumb buffer + mmap it. Discovers cursor
-    /// planes for `crtcs` and creates a DRM framebuffer for the atomic
-    /// path. Falls back to legacy ioctls on any per-CRTC discovery
-    /// failure.
+    /// Allocate the cursor dumb buffer + mmap it. If the driver exposes
+    /// universal cursor planes, they must provide a distinct compatible
+    /// plane for every requested CRTC; partial device support rejects the
+    /// hardware cursor for the entire DRM device. A driver exposing no
+    /// cursor planes retains the legacy-ioctl runtime probe.
     ///
     /// # Errors
-    /// `create_dumb_buffer` or `map_dumb_buffer` ioctl failures.
+    /// Cursor-plane topology discovery, incomplete CRTC coverage,
+    /// `create_dumb_buffer`, or `map_dumb_buffer` failures.
     pub fn new(device: Rc<Device>, crtcs: &[crtc::Handle]) -> io::Result<Self> {
+        let cursor_planes = discover_cursor_plane_crtcs(&device)?;
+        let explicit_plane_crtcs = if cursor_planes.is_empty() {
+            log::debug!(
+                "cursor: no universal cursor planes exposed; assuming legacy cursor ioctl support"
+            );
+            None
+        } else if cursor_planes_cover_crtcs(crtcs, &cursor_planes) {
+            Some(cursor_planes)
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "cursor planes cannot cover all {} active CRTCs on this DRM device",
+                    crtcs.len()
+                ),
+            ));
+        };
+
         // Query the driver's preferred cursor dimensions. amdgpu commonly
         // reports 128×128 or 256×256; i915 typically 64×64. We MUST use
         // the reported size — see [`HW_CURSOR_FALLBACK_W`] for the
@@ -116,11 +223,6 @@ impl CursorPlane {
         // Zero-fill the plane buffer up front.
         unsafe { std::ptr::write_bytes(ptr.as_ptr(), 0, len) };
 
-        // crtcs parameter retained for API stability and future expansion;
-        // legacy `set_cursor2`/`move_cursor` route by CRTC handle directly,
-        // no per-CRTC plane discovery needed.
-        let _ = crtcs;
-
         Ok(Self {
             device,
             dumb: Some(dumb),
@@ -131,7 +233,18 @@ impl CursorPlane {
             height,
             visible: HashMap::new(),
             uploaded_version: None,
+            explicit_plane_crtcs,
         })
+    }
+
+    /// Whether this device's explicitly exposed cursor planes can cover all
+    /// requested CRTCs simultaneously. Drivers exposing no universal cursor
+    /// planes return true and are probed through legacy ioctls at bind time.
+    #[must_use]
+    pub fn supports_crtcs(&self, crtcs: &[crtc::Handle]) -> bool {
+        self.explicit_plane_crtcs
+            .as_ref()
+            .is_none_or(|planes| cursor_planes_cover_crtcs(crtcs, planes))
     }
 
     /// Copy a cursor image into the plane buffer. `bgra_bytes` is a
@@ -393,6 +506,40 @@ impl Drop for CursorPlane {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_crtc(raw: u32) -> crtc::Handle {
+        ::drm::control::from_u32(raw).unwrap()
+    }
+
+    #[test]
+    fn cursor_plane_coverage_requires_every_crtc() {
+        let a = test_crtc(11);
+        let b = test_crtc(12);
+        let planes = vec![HashSet::from([a])];
+
+        assert!(cursor_planes_cover_crtcs(&[a], &planes));
+        assert!(!cursor_planes_cover_crtcs(&[a, b], &planes));
+    }
+
+    #[test]
+    fn cursor_plane_coverage_requires_distinct_simultaneous_planes() {
+        let a = test_crtc(11);
+        let b = test_crtc(12);
+        let shared_only = vec![HashSet::from([a, b])];
+        let independently_drivable = vec![HashSet::from([a, b]), HashSet::from([a, b])];
+
+        assert!(!cursor_planes_cover_crtcs(&[a, b], &shared_only));
+        assert!(cursor_planes_cover_crtcs(&[a, b], &independently_drivable));
+    }
+
+    #[test]
+    fn cursor_plane_coverage_finds_non_greedy_matching() {
+        let a = test_crtc(11);
+        let b = test_crtc(12);
+        let planes = vec![HashSet::from([a, b]), HashSet::from([a])];
+
+        assert!(cursor_planes_cover_crtcs(&[a, b], &planes));
+    }
 
     /// Phase B regression: `is_visible_on` tracks per-CRTC binding
     /// independently.

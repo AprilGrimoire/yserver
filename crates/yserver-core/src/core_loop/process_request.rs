@@ -2305,14 +2305,6 @@ fn handle_randr_request(
 ) -> io::Result<RequestOutcome> {
     use yserver_protocol::x11::{ClientByteOrder, randr as x11randr};
     const RANDR_MAJOR_OPCODE: u8 = 128;
-    fn connector_name_for_crtc(state: &ServerState, crtc: u32) -> Option<String> {
-        state
-            .randr
-            .outputs
-            .iter()
-            .find(|output| output.crtc_id == crtc)
-            .map(|output| output.name.clone())
-    }
     fn crtc_is_leased(_state: &ServerState, _crtc: u32) -> bool {
         false
     }
@@ -2822,7 +2814,7 @@ fn handle_randr_request(
                     RANDR_MAJOR_OPCODE,
                 );
             };
-            let Some(connector) = connector_name_for_crtc(state, req.crtc) else {
+            if !crtc_exists(state, req.crtc) {
                 return emit_x11_error_with_minor(
                     state,
                     client_id,
@@ -2832,11 +2824,11 @@ fn handle_randr_request(
                     u16::from(header.data),
                     RANDR_MAJOR_OPCODE,
                 );
-            };
+            }
             let buf = x11randr::encode_get_crtc_gamma_size_reply(
                 byte_order,
                 sequence,
-                backend.crtc_gamma_size(&connector),
+                backend.crtc_gamma_size(req.crtc),
             );
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
@@ -2856,7 +2848,7 @@ fn handle_randr_request(
                     RANDR_MAJOR_OPCODE,
                 );
             };
-            let Some(connector) = connector_name_for_crtc(state, req.crtc) else {
+            if !crtc_exists(state, req.crtc) {
                 return emit_x11_error_with_minor(
                     state,
                     client_id,
@@ -2866,8 +2858,8 @@ fn handle_randr_request(
                     u16::from(header.data),
                     RANDR_MAJOR_OPCODE,
                 );
-            };
-            let (red, green, blue) = backend.get_crtc_gamma(&connector);
+            }
+            let (red, green, blue) = backend.get_crtc_gamma(req.crtc);
             let buf =
                 x11randr::encode_get_crtc_gamma_reply(byte_order, sequence, &red, &green, &blue);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
@@ -2889,7 +2881,7 @@ fn handle_randr_request(
                 );
             };
             let crtc = u32::from_le_bytes(crtc_bytes.try_into().unwrap());
-            let Some(connector) = connector_name_for_crtc(state, crtc) else {
+            if !crtc_exists(state, crtc) {
                 return emit_x11_error_with_minor(
                     state,
                     client_id,
@@ -2899,7 +2891,7 @@ fn handle_randr_request(
                     u16::from(header.data),
                     RANDR_MAJOR_OPCODE,
                 );
-            };
+            }
             if crtc_is_leased(state, crtc) {
                 return emit_x11_error_with_minor(
                     state,
@@ -2937,7 +2929,7 @@ fn handle_randr_request(
                     RANDR_MAJOR_OPCODE,
                 );
             }
-            let gamma_size = backend.crtc_gamma_size(&connector);
+            let gamma_size = backend.crtc_gamma_size(crtc);
             if size != gamma_size {
                 return emit_x11_error_with_minor(
                     state,
@@ -2966,8 +2958,8 @@ fn handle_randr_request(
                 .map(|chunk| u16::from_le_bytes(chunk.try_into().unwrap()))
                 .collect();
 
-            if let Err(e) = backend.set_crtc_gamma(&connector, &red, &green, &blue) {
-                log::warn!("RRSetCrtcGamma apply failed for {connector}: {e}");
+            if let Err(e) = backend.set_crtc_gamma(crtc, &red, &green, &blue) {
+                log::warn!("RRSetCrtcGamma apply failed for CRTC 0x{crtc:x}: {e}");
             }
             return Ok(RequestOutcome::Handled);
         }
@@ -37736,7 +37728,7 @@ mod tests {
             &body,
         )
         .expect("set gamma");
-        assert_eq!(backend.get_crtc_gamma("DP-1"), (red, green, blue));
+        assert_eq!(backend.get_crtc_gamma(2), (red, green, blue));
 
         handle_randr_request(
             &mut state,

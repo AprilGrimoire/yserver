@@ -1446,7 +1446,7 @@ fn tick_one_output(
     let cursor_prev_pos_before = inner.outputs[output_idx].cursor_prev_pos;
     let last_present_cursor_rect = inner.outputs[output_idx].last_present_cursor_rect;
     let last_present_cursor_version = inner.outputs[output_idx].last_present_cursor_version;
-    let hw_available = platform.cursor_plane_available();
+    let hw_available = platform.cursor_plane_available_for_output(output_idx);
     let hw_can_run = hw_strategy_enabled && hw_available;
     let prev_mode = inner.outputs[output_idx].last_frame_cursor_mode;
     // Phase 5.1 — `cow_host_xid` is threaded directly from the
