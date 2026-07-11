@@ -529,8 +529,11 @@ impl CrtcKey {
 pub(crate) struct KmsDevice {
     pub(crate) key: crate::platform::drm::DrmDeviceKey,
     pub(crate) device: Rc<drm::Device>,
-    pub(crate) render_node_fd: Option<std::os::fd::OwnedFd>,
-    pub(crate) render_node_path: Option<PathBuf>,
+    pub(crate) render_node: Option<crate::kms::render_node::OpenedRenderNode>,
+    /// Physical device from `VkContext::instance` whose
+    /// `VK_EXT_physical_device_drm` identity matches this DRM device.
+    /// `None` when the Vulkan implementation does not expose a match.
+    pub(crate) vulkan_physical_device: Option<vk::PhysicalDevice>,
 }
 
 /// v2's real DRM/Vk/libinput owner. Replaces the flat field set
@@ -777,7 +780,16 @@ impl PlatformBackend {
         let primary_device_key = devices.first().map(|device| device.key);
         let primary_drm = devices.first().map(|device| Rc::clone(&device.device));
 
-        let vk = match VkContext::new() {
+        let vk_result = devices.first().map_or_else(VkContext::new, |device| {
+            VkContext::new_for_drm(
+                device.key,
+                device
+                    .render_node
+                    .as_ref()
+                    .map(|render_node| render_node.key()),
+            )
+        });
+        let vk = match vk_result {
             Ok(v) => v,
             Err(e) => {
                 return Err(io::Error::other(format!(
@@ -791,6 +803,42 @@ impl PlatformBackend {
             vk.driver_id,
             vk.device_type,
         );
+
+        let mut vulkan_devices_by_drm = HashMap::with_capacity(devices.len());
+        for device in &devices {
+            let render_node_key = device
+                .render_node
+                .as_ref()
+                .map(|render_node| render_node.key());
+            let physical_device = vk
+                .physical_device_for_drm(device.key, render_node_key)
+                .map_err(|e| {
+                    io::Error::other(format!(
+                        "v2 PlatformBackend: ambiguous Vulkan mapping for DRM device {}: {e}",
+                        device.key
+                    ))
+                })?;
+            match physical_device {
+                Some(physical_device) => log::info!(
+                    "v2 PlatformBackend: DRM primary {} render {:?} maps to Vulkan physical device {:?}",
+                    device.key,
+                    render_node_key,
+                    physical_device,
+                ),
+                None if vk.drm_physical_devices.is_empty() => log::warn!(
+                    "v2 PlatformBackend: Vulkan exposes no VK_EXT_physical_device_drm identities; \
+                     DRM primary {} render {:?} has no explicit Vulkan mapping",
+                    device.key,
+                    render_node_key,
+                ),
+                None => log::warn!(
+                    "v2 PlatformBackend: no Vulkan physical device matches DRM primary {} render {:?}",
+                    device.key,
+                    render_node_key,
+                ),
+            }
+            vulkan_devices_by_drm.insert(device.key, physical_device);
+        }
 
         // Refuse to drive real KMS scanout off a software rasterizer.
         // If the only Vulkan device is llvmpipe/lavapipe (CPU type) —
@@ -968,8 +1016,8 @@ impl PlatformBackend {
             .map(|device| KmsDevice {
                 key: device.key,
                 device: device.device,
-                render_node_fd: device.render_node_fd,
-                render_node_path: device.render_node_path,
+                render_node: device.render_node,
+                vulkan_physical_device: vulkan_devices_by_drm.get(&device.key).copied().flatten(),
             })
             .collect();
 
@@ -1028,8 +1076,8 @@ impl PlatformBackend {
             devices: vec![KmsDevice {
                 key: device_key,
                 device,
-                render_node_fd: None,
-                render_node_path: None,
+                render_node: None,
+                vulkan_physical_device: None,
             }],
             outputs: vec![ActiveOutput::new(
                 device_key,

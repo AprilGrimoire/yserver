@@ -10,6 +10,30 @@ use std::{
     sync::Arc,
 };
 
+use crate::platform::drm::DrmDeviceKey;
+
+/// Kernel DRM-node identities reported by one Vulkan physical device through
+/// `VK_EXT_physical_device_drm`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VulkanDrmIdentity {
+    pub(crate) primary: Option<DrmDeviceKey>,
+    pub(crate) render: Option<DrmDeviceKey>,
+}
+
+/// Non-owning mapping from a DRM identity to a physical-device handle owned by
+/// this context's Vulkan instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VulkanDrmPhysicalDevice {
+    pub(crate) physical_device: vk::PhysicalDevice,
+    pub(crate) identity: VulkanDrmIdentity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DrmDeviceSelection {
+    primary: DrmDeviceKey,
+    render: Option<DrmDeviceKey>,
+}
+
 /// Lives for the entire backend lifetime. Drop order matters: device
 /// before instance; instance-level loaders before instance.
 ///
@@ -24,6 +48,11 @@ pub struct VkContext {
     pub instance: ash::Instance,
     pub debug_utils_instance: ash::ext::debug_utils::Instance,
     pub physical_device: vk::PhysicalDevice,
+    /// Every physical device from this instance that reports
+    /// `VK_EXT_physical_device_drm`, paired with its primary/render nodes.
+    /// This inventory lets the platform map secondary DRM devices without
+    /// creating their logical Vulkan devices yet.
+    pub(crate) drm_physical_devices: Vec<VulkanDrmPhysicalDevice>,
     pub device: ash::Device,
     pub external_semaphore_fd: ash::khr::external_semaphore_fd::Device,
     pub external_memory_fd: Option<ash::khr::external_memory_fd::Device>,
@@ -79,6 +108,25 @@ impl VkContext {
     }
 
     pub fn new() -> Result<Arc<Self>, VkInitError> {
+        Self::new_with_drm_selection(None)
+    }
+
+    /// Build the rendering context on the Vulkan physical device belonging to
+    /// the supplied KMS card. When the Vulkan implementation exposes DRM
+    /// identities, a mismatched generic discrete/integrated preference is not
+    /// allowed: scanout buffers must be allocated by the card that will scan
+    /// them out. Implementations exposing no DRM identities retain the legacy
+    /// scored fallback for portability.
+    pub(crate) fn new_for_drm(
+        primary: DrmDeviceKey,
+        render: Option<DrmDeviceKey>,
+    ) -> Result<Arc<Self>, VkInitError> {
+        Self::new_with_drm_selection(Some(DrmDeviceSelection { primary, render }))
+    }
+
+    fn new_with_drm_selection(
+        requested_drm: Option<DrmDeviceSelection>,
+    ) -> Result<Arc<Self>, VkInitError> {
         let entry = unsafe { ash::Entry::load()? };
         let app_info = vk::ApplicationInfo::default()
             .application_name(c"yserver")
@@ -140,18 +188,19 @@ impl VkContext {
             }
         };
 
-        let (physical_device, graphics_queue_family) = match pick_physical_device(&instance) {
-            Ok(t) => t,
-            Err(e) => {
-                unsafe {
-                    if let Some(m) = debug_messenger {
-                        debug_utils_instance.destroy_debug_utils_messenger(m, None);
+        let (physical_device, graphics_queue_family, drm_physical_devices) =
+            match pick_physical_device(&instance, requested_drm) {
+                Ok(t) => t,
+                Err(e) => {
+                    unsafe {
+                        if let Some(m) = debug_messenger {
+                            debug_utils_instance.destroy_debug_utils_messenger(m, None);
+                        }
+                        instance.destroy_instance(None);
                     }
-                    instance.destroy_instance(None);
+                    return Err(e);
                 }
-                return Err(e);
-            }
-        };
+            };
 
         // Device extensions actually used by Phase 4.1.2's
         // Vulkan-first scanout path:
@@ -320,6 +369,7 @@ impl VkContext {
             instance,
             debug_utils_instance,
             physical_device,
+            drm_physical_devices,
             device,
             external_semaphore_fd,
             external_memory_fd,
@@ -348,6 +398,28 @@ impl VkContext {
     #[must_use]
     pub fn is_software_rasterizer(&self) -> bool {
         self.device_type == vk::PhysicalDeviceType::CPU
+    }
+
+    /// Resolve a platform DRM device to a Vulkan physical device from this
+    /// instance. `Ok(None)` means that no exact identity was advertised;
+    /// duplicate claims are rejected rather than choosing arbitrarily.
+    pub(crate) fn physical_device_for_drm(
+        &self,
+        primary: DrmDeviceKey,
+        render: Option<DrmDeviceKey>,
+    ) -> Result<Option<vk::PhysicalDevice>, VkInitError> {
+        let requested = DrmDeviceSelection { primary, render };
+        let mut matching = self
+            .drm_physical_devices
+            .iter()
+            .filter(|candidate| drm_identity_matches(candidate.identity, requested));
+        let first = matching.next().map(|candidate| candidate.physical_device);
+        if matching.next().is_some() {
+            return Err(VkInitError::AmbiguousDrmDevice(format_drm_selection(
+                requested,
+            )));
+        }
+        Ok(first)
     }
 }
 
@@ -509,8 +581,12 @@ pub enum VkInitError {
     Loader(#[from] ash::LoadingError),
     #[error("vulkan: {0}")]
     Vk(vk::Result),
-    #[error("no suitable physical device (need graphics queue + drm format modifier ext)")]
+    #[error("no suitable physical device (need a graphics + transfer queue)")]
     NoSuitableDevice,
+    #[error("no suitable Vulkan physical device matches DRM device {0}")]
+    NoMatchingDrmDevice(String),
+    #[error("multiple Vulkan physical devices match DRM device {0}")]
+    AmbiguousDrmDevice(String),
 }
 
 impl From<vk::Result> for VkInitError {
@@ -519,31 +595,177 @@ impl From<vk::Result> for VkInitError {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PhysicalDeviceCandidate {
+    physical_device: vk::PhysicalDevice,
+    graphics_queue_family: Option<u32>,
+    score: u32,
+    drm_identity: Option<VulkanDrmIdentity>,
+}
+
 fn pick_physical_device(
     instance: &ash::Instance,
-) -> Result<(vk::PhysicalDevice, u32), VkInitError> {
+    requested_drm: Option<DrmDeviceSelection>,
+) -> Result<(vk::PhysicalDevice, u32, Vec<VulkanDrmPhysicalDevice>), VkInitError> {
     let devices = unsafe { instance.enumerate_physical_devices() }?;
 
-    let mut scored: Vec<(u32, vk::PhysicalDevice, u32)> = devices
+    let candidates: Vec<PhysicalDeviceCandidate> = devices
         .into_iter()
-        .filter_map(|pd| {
-            let props = unsafe { instance.get_physical_device_properties(pd) };
-            let queue_family = pick_graphics_queue_family(instance, pd)?;
+        .map(|physical_device| {
+            let props = unsafe { instance.get_physical_device_properties(physical_device) };
             let score = match props.device_type {
                 vk::PhysicalDeviceType::DISCRETE_GPU => 3,
                 vk::PhysicalDeviceType::INTEGRATED_GPU => 2,
                 vk::PhysicalDeviceType::VIRTUAL_GPU => 1,
                 _ => 0,
             };
-            Some((score, pd, queue_family))
+            Ok(PhysicalDeviceCandidate {
+                physical_device,
+                graphics_queue_family: pick_graphics_queue_family(instance, physical_device),
+                score,
+                drm_identity: physical_device_drm_identity(instance, physical_device)?,
+            })
+        })
+        .collect::<Result<_, VkInitError>>()?;
+
+    let drm_physical_devices = candidates
+        .iter()
+        .filter_map(|candidate| {
+            candidate
+                .drm_identity
+                .map(|identity| VulkanDrmPhysicalDevice {
+                    physical_device: candidate.physical_device,
+                    identity,
+                })
         })
         .collect();
-    scored.sort_by_key(|t| std::cmp::Reverse(t.0));
-    scored
-        .into_iter()
-        .next()
-        .map(|(_, pd, qf)| (pd, qf))
+
+    let selected = select_physical_device_candidate(&candidates, requested_drm)?;
+    let queue_family = selected
+        .graphics_queue_family
+        .ok_or(VkInitError::NoSuitableDevice)?;
+    Ok((selected.physical_device, queue_family, drm_physical_devices))
+}
+
+fn select_physical_device_candidate(
+    candidates: &[PhysicalDeviceCandidate],
+    requested_drm: Option<DrmDeviceSelection>,
+) -> Result<&PhysicalDeviceCandidate, VkInitError> {
+    if let Some(requested) = requested_drm {
+        let mut matching = candidates.iter().filter(|candidate| {
+            candidate.graphics_queue_family.is_some()
+                && candidate
+                    .drm_identity
+                    .is_some_and(|identity| drm_identity_matches(identity, requested))
+        });
+        if let Some(selected) = matching.next() {
+            if matching.next().is_some() {
+                return Err(VkInitError::AmbiguousDrmDevice(format_drm_selection(
+                    requested,
+                )));
+            }
+            log::info!(
+                "vulkan: selected physical device matching DRM {}",
+                format_drm_selection(requested)
+            );
+            return Ok(selected);
+        }
+
+        if candidates
+            .iter()
+            .any(|candidate| candidate.drm_identity.is_some())
+        {
+            return Err(VkInitError::NoMatchingDrmDevice(format_drm_selection(
+                requested,
+            )));
+        }
+
+        log::warn!(
+            "vulkan: no physical device exposes VK_EXT_physical_device_drm; \
+             falling back to generic device preference for DRM {}",
+            format_drm_selection(requested)
+        );
+    }
+
+    candidates
+        .iter()
+        .filter(|candidate| candidate.graphics_queue_family.is_some())
+        .max_by_key(|candidate| candidate.score)
         .ok_or(VkInitError::NoSuitableDevice)
+}
+
+fn physical_device_drm_identity(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+) -> Result<Option<VulkanDrmIdentity>, VkInitError> {
+    let extensions = unsafe { instance.enumerate_device_extension_properties(physical_device) }?;
+    let supports_drm_identity = extensions.iter().any(|property| {
+        property
+            .extension_name_as_c_str()
+            .map(|name| name == ash::ext::physical_device_drm::NAME)
+            .unwrap_or(false)
+    });
+    if !supports_drm_identity {
+        return Ok(None);
+    }
+
+    let mut drm = vk::PhysicalDeviceDrmPropertiesEXT::default();
+    let mut properties = vk::PhysicalDeviceProperties2::default().push_next(&mut drm);
+    unsafe {
+        instance.get_physical_device_properties2(physical_device, &mut properties);
+    }
+    Ok(Some(drm_identity_from_properties(&drm)))
+}
+
+fn drm_identity_from_properties(
+    properties: &vk::PhysicalDeviceDrmPropertiesEXT<'_>,
+) -> VulkanDrmIdentity {
+    VulkanDrmIdentity {
+        primary: drm_key(
+            properties.has_primary,
+            properties.primary_major,
+            properties.primary_minor,
+        ),
+        render: drm_key(
+            properties.has_render,
+            properties.render_major,
+            properties.render_minor,
+        ),
+    }
+}
+
+fn drm_key(has_node: vk::Bool32, major: i64, minor: i64) -> Option<DrmDeviceKey> {
+    if has_node == vk::FALSE {
+        return None;
+    }
+    Some(DrmDeviceKey {
+        major: u32::try_from(major).ok()?,
+        minor: u32::try_from(minor).ok()?,
+    })
+}
+
+fn drm_identity_matches(identity: VulkanDrmIdentity, requested: DrmDeviceSelection) -> bool {
+    let mut matched = false;
+    if let Some(primary) = identity.primary {
+        if primary != requested.primary {
+            return false;
+        }
+        matched = true;
+    }
+    if let (Some(render), Some(requested_render)) = (identity.render, requested.render) {
+        if render != requested_render {
+            return false;
+        }
+        matched = true;
+    }
+    matched
+}
+
+fn format_drm_selection(selection: DrmDeviceSelection) -> String {
+    selection.render.map_or_else(
+        || format!("primary {}", selection.primary),
+        |render| format!("primary {}, render {render}", selection.primary),
+    )
 }
 
 fn pick_graphics_queue_family(instance: &ash::Instance, pd: vk::PhysicalDevice) -> Option<u32> {
@@ -585,4 +807,174 @@ unsafe extern "system" fn vk_debug_callback(
     }
     // INFO/VERBOSE intentionally suppressed — too noisy.
     vk::FALSE
+}
+
+#[cfg(test)]
+mod tests {
+    use ash::vk::Handle as _;
+
+    use super::*;
+
+    fn key(minor: u32) -> DrmDeviceKey {
+        DrmDeviceKey { major: 226, minor }
+    }
+
+    fn identity(primary: Option<u32>, render: Option<u32>) -> VulkanDrmIdentity {
+        VulkanDrmIdentity {
+            primary: primary.map(key),
+            render: render.map(key),
+        }
+    }
+
+    fn candidate(
+        handle: u64,
+        score: u32,
+        drm_identity: Option<VulkanDrmIdentity>,
+    ) -> PhysicalDeviceCandidate {
+        PhysicalDeviceCandidate {
+            physical_device: vk::PhysicalDevice::from_raw(handle),
+            graphics_queue_family: Some(0),
+            score,
+            drm_identity,
+        }
+    }
+
+    #[test]
+    fn drm_properties_preserve_primary_and_render_keys() {
+        let properties = vk::PhysicalDeviceDrmPropertiesEXT {
+            has_primary: vk::TRUE,
+            has_render: vk::TRUE,
+            primary_major: 226,
+            primary_minor: 1,
+            render_major: 226,
+            render_minor: 129,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            drm_identity_from_properties(&properties),
+            identity(Some(1), Some(129))
+        );
+    }
+
+    #[test]
+    fn drm_properties_reject_negative_node_numbers() {
+        let properties = vk::PhysicalDeviceDrmPropertiesEXT {
+            has_primary: vk::TRUE,
+            has_render: vk::FALSE,
+            primary_major: -1,
+            primary_minor: 0,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            drm_identity_from_properties(&properties),
+            identity(None, None)
+        );
+    }
+
+    #[test]
+    fn drm_selection_overrides_generic_device_score() {
+        let candidates = [
+            candidate(1, 3, Some(identity(Some(0), Some(128)))),
+            candidate(2, 2, Some(identity(Some(1), Some(129)))),
+        ];
+
+        let selected = select_physical_device_candidate(
+            &candidates,
+            Some(DrmDeviceSelection {
+                primary: key(1),
+                render: Some(key(129)),
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(selected.physical_device.as_raw(), 2);
+    }
+
+    #[test]
+    fn drm_selection_accepts_render_only_vulkan_identity() {
+        let candidates = [candidate(7, 1, Some(identity(None, Some(129))))];
+
+        let selected = select_physical_device_candidate(
+            &candidates,
+            Some(DrmDeviceSelection {
+                primary: key(1),
+                render: Some(key(129)),
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(selected.physical_device.as_raw(), 7);
+    }
+
+    #[test]
+    fn drm_selection_rejects_conflicting_render_node() {
+        let candidates = [candidate(1, 3, Some(identity(Some(1), Some(130))))];
+
+        let error = select_physical_device_candidate(
+            &candidates,
+            Some(DrmDeviceSelection {
+                primary: key(1),
+                render: Some(key(129)),
+            }),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, VkInitError::NoMatchingDrmDevice(_)));
+    }
+
+    #[test]
+    fn drm_selection_rejects_duplicate_vulkan_claims() {
+        let candidates = [
+            candidate(1, 3, Some(identity(Some(1), Some(129)))),
+            candidate(2, 2, Some(identity(Some(1), Some(129)))),
+        ];
+
+        let error = select_physical_device_candidate(
+            &candidates,
+            Some(DrmDeviceSelection {
+                primary: key(1),
+                render: Some(key(129)),
+            }),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, VkInitError::AmbiguousDrmDevice(_)));
+    }
+
+    #[test]
+    fn drm_selection_does_not_fallback_when_any_identity_is_available() {
+        let candidates = [
+            candidate(1, 3, Some(identity(Some(0), Some(128)))),
+            candidate(2, 2, None),
+        ];
+
+        let error = select_physical_device_candidate(
+            &candidates,
+            Some(DrmDeviceSelection {
+                primary: key(1),
+                render: Some(key(129)),
+            }),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, VkInitError::NoMatchingDrmDevice(_)));
+    }
+
+    #[test]
+    fn drm_selection_falls_back_only_when_no_identity_is_available() {
+        let candidates = [candidate(1, 1, None), candidate(2, 3, None)];
+
+        let selected = select_physical_device_candidate(
+            &candidates,
+            Some(DrmDeviceSelection {
+                primary: key(1),
+                render: Some(key(129)),
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(selected.physical_device.as_raw(), 2);
+    }
 }

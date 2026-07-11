@@ -21,8 +21,8 @@ use ::drm::control::{Device as _, Mode as DrmMode, connector, crtc, plane, prope
 ///
 /// This is the `st_rdev` major/minor of a DRM device node, not a
 /// volatile card number. Vulkan's `VK_EXT_physical_device_drm` exposes
-/// the same shape, making this the right future join key for PRIME
-/// provider matching.
+/// the same shape, so PRIME setup uses it to join KMS primary/render
+/// nodes to Vulkan physical devices.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct DrmDeviceKey {
     pub(crate) major: u32,

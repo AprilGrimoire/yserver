@@ -17288,7 +17288,8 @@ impl Backend for KmsBackendV2 {
         let path = self
             .platform
             .primary_device()
-            .and_then(|device| device.render_node_path.as_deref())
+            .and_then(|device| device.render_node.as_ref())
+            .map(crate::kms::render_node::OpenedRenderNode::path)
             .ok_or_else(|| {
                 io::Error::other("DRI3 unavailable — render node was not resolved at backend init")
             })?;
@@ -17302,7 +17303,7 @@ impl Backend for KmsBackendV2 {
         if self
             .platform
             .primary_device()
-            .is_none_or(|device| device.render_node_fd.is_none())
+            .is_none_or(|device| device.render_node.is_none())
             || self.platform.vk.is_none()
         {
             return Dri3Caps::unsupported();
@@ -25537,12 +25538,12 @@ mod tests {
 
     #[test]
     fn dri3_open_errs_when_render_node_unavailable() {
-        // for_tests sets render_node_path: None on PlatformBackend,
+        // for_tests sets render_node: None on PlatformBackend,
         // so dri3_open must Err out (the SCM_RIGHTS dispatch path
         // then maps it to BadAlloc).
         let mut b = KmsBackendV2::for_tests();
         let res = b.dri3_open(0x1234);
-        assert!(res.is_err(), "expected Err when render_node_path is None");
+        assert!(res.is_err(), "expected Err when render_node is None");
     }
 
     #[test]
@@ -25592,8 +25593,8 @@ mod tests {
             }
         };
         let caps = b.dri3_capabilities();
-        // for_tests_with_vk still has render_node_fd: None
-        // (no real DRM device). The guard checks render_node_fd
+        // for_tests_with_vk still has render_node: None
+        // (no real DRM device). The guard checks render_node
         // first → caps come back unsupported even with Vk.
         // Verify that branch is what reports unsupported, then
         // bypass it for the version + syncobj assertion by
@@ -25601,23 +25602,23 @@ mod tests {
         assert_eq!(
             caps.version,
             (0, 0),
-            "without render_node_fd, even with Vk, dri3 is gated unsupported",
+            "without render_node, even with Vk, dri3 is gated unsupported",
         );
         // Now stuff in a synthetic render-node fd so the guard
         // passes; use /dev/null which is openable + safely
         // droppable. The cap accessor doesn't actually use the
         // fd, just checks Some-ness.
         let mut b = b;
+        let render_node_fd = std::fs::OpenOptions::new()
+            .read(true)
+            .open("/dev/null")
+            .expect("open /dev/null")
+            .into();
+        let render_node = crate::kms::render_node::OpenedRenderNode::for_tests(render_node_fd);
         b.platform
             .primary_device_mut()
             .expect("test fixture has a DRM device")
-            .render_node_fd = Some(
-            std::fs::OpenOptions::new()
-                .read(true)
-                .open("/dev/null")
-                .expect("open /dev/null")
-                .into(),
-        );
+            .render_node = Some(render_node);
         let caps = b.dri3_capabilities();
         assert!(caps.fence_fd);
         assert_eq!(

@@ -249,6 +249,23 @@ Cross-cutting bugs and followups that don't fit a stage live in
   yserver --lib`, `cargo test --workspace --all-targets`, `cargo
   clippy --all-targets -- -D warnings`, and `cargo +nightly fmt --all
   -- --check`. Live multi-GPU hardware smoke remains pending.
+- **2026-07-11 PRIME DRM/Vulkan device identity mapping**: every opened
+  KMS device now retains both its primary-node and sibling render-node
+  major/minor identity. Vulkan startup enumerates
+  `VK_EXT_physical_device_drm` properties for every physical device,
+  selects the rendering device that matches the primary KMS device
+  instead of relying on the old discrete/integrated preference, and
+  records the matching `VkPhysicalDevice` handle on each KMS device for
+  later provider routing. Conflicting primary/render identities and
+  duplicate physical-device claims are rejected rather than guessed.
+  If no Vulkan physical device exposes the extension at all, startup
+  retains the generic preference as a portability fallback; secondary
+  DRM devices with no advertised match remain explicitly unmapped and
+  are logged. Per-provider logical Vulkan devices and cross-device image
+  transfer remain future PRIME work. Validation: focused DRM/Vulkan
+  selector tests, `cargo test --workspace --all-targets --locked`,
+  `cargo clippy --all-targets -- -D warnings`, and `cargo +nightly fmt
+  --all -- --check`. Live multi-GPU hardware smoke remains pending.
 - **2026-06-08 COW architectural reset**: the active Cinnamon blocker
   is now treated as a structural COW/model bug, not another
   scene-assembly edge case. Replacement design doc:

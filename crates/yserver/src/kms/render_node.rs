@@ -5,9 +5,11 @@
 
 use std::{
     io,
-    os::fd::{AsFd, OwnedFd},
-    path::{Path, PathBuf},
+    os::fd::{AsFd, AsRawFd, OwnedFd, RawFd},
+    path::Path,
 };
+
+use crate::platform::drm::{DrmDeviceKey, DrmNode};
 
 #[cfg(target_os = "linux")]
 use crate::platform::{
@@ -15,7 +17,45 @@ use crate::platform::{
     drm_linux::LinuxDrmPlatform,
 };
 
-pub(crate) fn open_for_card<F: AsFd>(card_fd: F) -> io::Result<(OwnedFd, PathBuf)> {
+/// An opened render node and the stable platform identity of that exact node.
+///
+/// Keeping these values in one type makes it impossible for callers to retain
+/// a path/key without the corresponding live fd, or vice versa.
+pub(crate) struct OpenedRenderNode {
+    fd: OwnedFd,
+    node: DrmNode,
+}
+
+impl OpenedRenderNode {
+    #[must_use]
+    pub(crate) fn raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+
+    #[must_use]
+    pub(crate) fn path(&self) -> &Path {
+        &self.node.path
+    }
+
+    #[must_use]
+    pub(crate) fn key(&self) -> DrmDeviceKey {
+        self.node.key
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests(fd: OwnedFd) -> Self {
+        Self {
+            fd,
+            node: DrmNode {
+                path: "/dev/null".into(),
+                key: DrmDeviceKey { major: 0, minor: 0 },
+                kind: crate::platform::drm::DrmNodeKind::Render,
+            },
+        }
+    }
+}
+
+pub(crate) fn open_for_card<F: AsFd>(card_fd: F) -> io::Result<OpenedRenderNode> {
     #[cfg(target_os = "linux")]
     {
         let platform = LinuxDrmPlatform;
@@ -27,7 +67,7 @@ pub(crate) fn open_for_card<F: AsFd>(card_fd: F) -> io::Result<(OwnedFd, PathBuf
             ))
         })?;
         let fd = platform.open_node(&render)?;
-        Ok((fd, render.path))
+        Ok(OpenedRenderNode { fd, node: render })
     }
 
     #[cfg(not(target_os = "linux"))]
