@@ -294,8 +294,30 @@ Cross-cutting bugs and followups that don't fit a stage live in
   `PRIME_FD_TO_HANDLE`/`addfb2` result. No probe exports or imports a dma-buf,
   and successful metadata probing is not treated as proof that a later import
   ioctl will succeed. Local same-device scanout retains its established
-  modifier and legacy-linear fallbacks. RANDR provider capabilities remain zero
-  and no provider relationship is activated.
+  modifier and legacy-linear fallbacks. That groundwork left RANDR provider
+  capabilities at zero and activated no provider relationship; the following
+  layer makes the route client-configurable.
+- **2026-07-11 PRIME Output Source hardware path**: the first opened KMS
+  device, which owns yserver's current Vulkan renderer, now advertises RANDR
+  `SourceOutput`; each secondary KMS device advertises `SinkOutput`.
+  `SetProviderOutputSource` attaches or detaches a secondary provider and
+  `GetProviderInfo` reports the relationship from both sides with Xorg's
+  source/sink association capabilities. Secondary-device CRTCs cannot be
+  enabled until their provider is attached to the render provider. Once
+  attached, enabling an output allocates its device-qualified scanout pool
+  through the existing tri-state dma-buf probe: conclusive incompatibility
+  fails before allocation, while incomplete metadata reaches the real Vulkan
+  export plus KMS PRIME import/addfb attempt. Detaching a provider with active
+  outputs is rejected so an established route cannot silently outlive its
+  RANDR policy. This is deliberately the first hardware-testable PRIME level:
+  one Vulkan render provider can source multiple secondary display providers,
+  but arbitrary render-provider selection, render offload, per-provider Vulkan
+  logical devices, provider properties, and automatic output migration
+  remain unimplemented. Validation: focused RANDR wire/fanout and KMS policy
+  tests, `cargo test --workspace --all-targets --locked`, CI-style `cargo
+  clippy --all-targets -- -D warnings`, and a release build. The current task
+  sandbox exposes the host's NVIDIA and AMD PCI devices but not `/dev/dri` or
+  seat control, so the live cross-GPU modeset remains the next manual gate.
 - **2026-06-08 COW architectural reset**: the active Cinnamon blocker
   is now treated as a structural COW/model bug, not another
   scene-assembly edge case. Replacement design doc:

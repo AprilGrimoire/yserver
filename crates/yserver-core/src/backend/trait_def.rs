@@ -389,6 +389,23 @@ pub trait Backend {
         Ok(())
     }
 
+    /// Attach or detach a RANDR output-sink provider to an output-source
+    /// provider. `source_provider = None` detaches the sink. Backends own the
+    /// relationship because they must enforce it when allocating scanout for
+    /// the sink's CRTCs; implementations also refresh `state.randr` so a
+    /// subsequent `GetProviderInfo` observes the association immediately.
+    fn set_provider_output_source(
+        &mut self,
+        _state: &mut ServerState,
+        _provider: u32,
+        _source_provider: Option<u32>,
+    ) -> io::Result<bool> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "provider output-source relationships are unsupported",
+        ))
+    }
+
     /// Apply a client-driven CRTC configuration to `output_id` / `connector`.
     /// `mode = None` disables the output (frees its scanout, removes it
     /// from the active set, registry → Off, connector stays known).

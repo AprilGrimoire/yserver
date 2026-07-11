@@ -118,6 +118,10 @@ pub enum RecordedCall {
         cursor_host_xid: u32,
     },
     SetDpmsPower(u8),
+    SetProviderOutputSource {
+        provider: u32,
+        source_provider: Option<u32>,
+    },
     /// GLX-TFP Task 3.4: `acquire_glx_pixmap_export(host_xid)` called.
     AcquireGlxPixmapExport(u32),
     /// GLX-TFP Task 3.4: `release_glx_pixmap_export(host_xid)` called.
@@ -356,6 +360,19 @@ impl Backend for RecordingBackend {
     fn on_page_flip_ready(&mut self, _state: &mut crate::server::ServerState) {
         self.page_flip_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn set_provider_output_source(
+        &mut self,
+        _state: &mut crate::server::ServerState,
+        provider: u32,
+        source_provider: Option<u32>,
+    ) -> io::Result<bool> {
+        self.record(RecordedCall::SetProviderOutputSource {
+            provider,
+            source_provider,
+        });
+        Ok(true)
     }
 
     fn before_block(&mut self) {

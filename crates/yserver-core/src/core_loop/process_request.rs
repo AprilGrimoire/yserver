@@ -2877,15 +2877,35 @@ fn handle_randr_request(
                 );
             }
             let _ = req.config_timestamp;
-            return emit_x11_error_with_minor(
+            let changed = match backend.set_provider_output_source(
                 state,
-                client_id,
-                sequence,
-                x11::error::BAD_IMPLEMENTATION,
                 req.provider,
-                u16::from(x11randr::RR_SET_PROVIDER_OUTPUT_SOURCE),
-                RANDR_MAJOR_OPCODE,
-            );
+                (req.source_provider != 0).then_some(req.source_provider),
+            ) {
+                Ok(changed) => changed,
+                Err(err) => {
+                    log::warn!(
+                        "client {} #{} RANDR::SetProviderOutputSource provider={} source={} failed: {err}",
+                        client_id.0,
+                        sequence.0,
+                        req.provider,
+                        req.source_provider,
+                    );
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_MATCH,
+                        req.provider,
+                        u16::from(x11randr::RR_SET_PROVIDER_OUTPUT_SOURCE),
+                        RANDR_MAJOR_OPCODE,
+                    );
+                }
+            };
+            if changed {
+                super::run::emit_randr_provider_change_notification(state, req.provider);
+            }
+            return Ok(RequestOutcome::Handled);
         }
         x11randr::RR_SET_PROVIDER_OFFLOAD_SINK => {
             let Some(req) = x11randr::parse_set_provider_offload_sink_request(body) else {
@@ -26599,6 +26619,33 @@ mod tests {
         }]);
     }
 
+    fn seed_output_source_provider_randr_state(state: &mut ServerState) {
+        use crate::randr::RandrProvider;
+        use yserver_protocol::x11::randr::{
+            PROVIDER_CAPABILITY_SINK_OUTPUT, PROVIDER_CAPABILITY_SOURCE_OUTPUT,
+        };
+
+        seed_single_output_randr_state(state);
+        state.randr.set_providers(vec![
+            RandrProvider {
+                provider_id: 10,
+                name: "render-card".to_string(),
+                capabilities: PROVIDER_CAPABILITY_SOURCE_OUTPUT,
+                crtcs: vec![2],
+                outputs: vec![1],
+                associations: Vec::new(),
+            },
+            RandrProvider {
+                provider_id: 11,
+                name: "display-card".to_string(),
+                capabilities: PROVIDER_CAPABILITY_SINK_OUTPUT,
+                crtcs: Vec::new(),
+                outputs: Vec::new(),
+                associations: Vec::new(),
+            },
+        ]);
+    }
+
     #[test]
     fn randr_provider_queries_report_topology() {
         use yserver_protocol::x11::randr as x11randr;
@@ -26708,6 +26755,92 @@ mod tests {
             assert_eq!(bytes[1], x11::error::BAD_VALUE);
             assert_eq!(&bytes[4..8], &10u32.to_le_bytes());
         }
+    }
+
+    #[test]
+    fn randr_set_provider_output_source_reaches_backend() {
+        use yserver_protocol::x11::randr as x11randr;
+
+        let mut state = ServerState::new();
+        seed_output_source_provider_randr_state(&mut state);
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+
+        for (sequence, source_provider) in [(1, 10u32), (2, 0)] {
+            let mut relationship = Vec::new();
+            relationship.extend_from_slice(&11u32.to_le_bytes());
+            relationship.extend_from_slice(&source_provider.to_le_bytes());
+            relationship.extend_from_slice(&state.randr.config_timestamp.to_le_bytes());
+            handle_randr_request(
+                &mut state,
+                &mut backend,
+                ClientId(1),
+                SequenceNumber(sequence),
+                RequestHeader {
+                    opcode: 128,
+                    data: x11randr::RR_SET_PROVIDER_OUTPUT_SOURCE,
+                    length_units: 4,
+                },
+                &relationship,
+            )
+            .expect("set provider output source");
+            assert!(
+                read_all_available(&mut peer).is_empty(),
+                "successful void requests do not emit a reply"
+            );
+        }
+
+        assert_eq!(
+            backend.calls(),
+            vec![
+                RecordedCall::SetProviderOutputSource {
+                    provider: 11,
+                    source_provider: Some(10),
+                },
+                RecordedCall::SetProviderOutputSource {
+                    provider: 11,
+                    source_provider: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn randr_set_provider_output_source_notifies_subscribers() {
+        use yserver_protocol::x11::randr as x11randr;
+
+        let mut state = ServerState::new();
+        seed_output_source_provider_randr_state(&mut state);
+        let mut peer = install_client(&mut state, 1);
+        state
+            .randr_select_masks
+            .insert((1, ROOT_WINDOW), x11randr::NOTIFY_MASK_PROVIDER_CHANGE);
+        let mut backend = RecordingBackend::new();
+        let mut relationship = Vec::new();
+        relationship.extend_from_slice(&11u32.to_le_bytes());
+        relationship.extend_from_slice(&10u32.to_le_bytes());
+        relationship.extend_from_slice(&state.randr.config_timestamp.to_le_bytes());
+
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 128,
+                data: x11randr::RR_SET_PROVIDER_OUTPUT_SOURCE,
+                length_units: 4,
+            },
+            &relationship,
+        )
+        .expect("set provider output source");
+
+        let event = read_all_available(&mut peer);
+        assert_eq!(event.len(), 32);
+        assert_eq!(event[0], 90, "RANDR Notify event");
+        assert_eq!(event[1], x11randr::NOTIFY_PROVIDER_CHANGE);
+        assert_eq!(&event[8..12], &ROOT_WINDOW.0.to_le_bytes());
+        assert_eq!(&event[12..16], &11u32.to_le_bytes());
     }
 
     fn randr_unimplemented_reply_bearing(minor: u8) -> Vec<u8> {

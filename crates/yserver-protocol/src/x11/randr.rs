@@ -84,11 +84,13 @@ pub const RR_FREE_LEASE: u8 = 46;
 pub const NOTIFY_MASK_SCREEN_CHANGE: u16 = 1 << 0;
 pub const NOTIFY_MASK_CRTC_CHANGE: u16 = 1 << 1;
 pub const NOTIFY_MASK_OUTPUT_CHANGE: u16 = 1 << 2;
+pub const NOTIFY_MASK_PROVIDER_CHANGE: u16 = 1 << 4;
 
 pub const EVENT_SCREEN_CHANGE_NOTIFY: u8 = 0;
 pub const EVENT_NOTIFY: u8 = 1;
 pub const NOTIFY_CRTC_CHANGE: u8 = 0;
 pub const NOTIFY_OUTPUT_CHANGE: u8 = 1;
+pub const NOTIFY_PROVIDER_CHANGE: u8 = 3;
 pub const ROTATION_ROTATE_0: u16 = 1;
 pub const SET_CONFIG_SUCCESS: u8 = 0;
 pub const SET_CONFIG_FAILED: u8 = 3;
@@ -1176,6 +1178,13 @@ pub struct OutputChangeNotify {
     pub mode: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderChangeNotify {
+    pub timestamp: u32,
+    pub request_window: u32,
+    pub provider: u32,
+}
+
 #[must_use]
 pub fn encode_screen_change_notify_event(
     byte_order: ClientByteOrder,
@@ -1245,6 +1254,24 @@ pub fn encode_output_change_notify_event(
     put(byte_order, &mut buf, ROTATION_ROTATE_0);
     buf.push(CONNECTION_CONNECTED);
     buf.push(SUBPIXEL_UNKNOWN as u8);
+    buf.try_into().expect("32-byte event")
+}
+
+#[must_use]
+pub fn encode_provider_change_notify_event(
+    byte_order: ClientByteOrder,
+    first_event: u8,
+    sequence: SequenceNumber,
+    event: ProviderChangeNotify,
+) -> [u8; 32] {
+    let mut buf: Vec<u8> = Vec::with_capacity(32);
+    buf.push(first_event + EVENT_NOTIFY);
+    buf.push(NOTIFY_PROVIDER_CHANGE);
+    put(byte_order, &mut buf, sequence.0);
+    put(byte_order, &mut buf, event.timestamp);
+    put(byte_order, &mut buf, event.request_window);
+    put(byte_order, &mut buf, event.provider);
+    buf.extend_from_slice(&[0u8; 16]);
     buf.try_into().expect("32-byte event")
 }
 
@@ -1772,5 +1799,27 @@ mod tests {
         assert_eq!(&event[16..20], &1u32.to_le_bytes());
         assert_eq!(event[30], CONNECTION_CONNECTED);
         assert_eq!(event[31], 0);
+    }
+
+    #[test]
+    fn provider_change_notify_event_shape() {
+        let event = encode_provider_change_notify_event(
+            ClientByteOrder::LittleEndian,
+            89,
+            SequenceNumber(14),
+            ProviderChangeNotify {
+                timestamp: 400,
+                request_window: 0x100,
+                provider: 11,
+            },
+        );
+
+        assert_eq!(event[0], 90);
+        assert_eq!(event[1], NOTIFY_PROVIDER_CHANGE);
+        assert_eq!(&event[2..4], &14u16.to_le_bytes());
+        assert_eq!(&event[4..8], &400u32.to_le_bytes());
+        assert_eq!(&event[8..12], &0x100u32.to_le_bytes());
+        assert_eq!(&event[12..16], &11u32.to_le_bytes());
+        assert!(event[16..].iter().all(|byte| *byte == 0));
     }
 }

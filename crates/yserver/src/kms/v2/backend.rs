@@ -295,6 +295,15 @@ impl RandrIdAllocator {
         id
     }
 
+    pub(crate) fn provider_key_for_id(
+        &self,
+        provider_id: u32,
+    ) -> Option<crate::platform::drm::DrmDeviceKey> {
+        self.providers
+            .iter()
+            .find_map(|(key, id)| (*id == provider_id).then_some(*key))
+    }
+
     pub(crate) fn ids_for(&mut self, output_key: &OutputKey) -> ConnectorIds {
         if let Some(entry) = self.connectors.get(output_key) {
             return entry.ids;
@@ -659,6 +668,13 @@ pub struct KmsBackendV2 {
     /// open, then clears the window — preserving the idle-sleep once settled.
     libinput_hotplug_retry_until: Option<std::time::Instant>,
     randr_id_alloc: RandrIdAllocator,
+    /// Active PRIME Output Source policy, keyed by sink DRM device. Each
+    /// value is the rendering/source DRM device whose dma-bufs the sink may
+    /// scan out. The current implementation permits only the platform's first
+    /// (Vulkan-rendering) device as a source and keeps secondary devices as
+    /// sinks; the real dma-buf import remains authoritative at output enable.
+    provider_output_sources:
+        HashMap<crate::platform::drm::DrmDeviceKey, crate::platform::drm::DrmDeviceKey>,
     /// Per-output-id identity for RANDR output properties: `(EDID blob,
     /// ConnectorType name)`. Rebuilt by `randr_outputs_and_modes` each
     /// time RANDR state is (re)projected; read by the `EDID`/`EDID_DATA`
@@ -1290,6 +1306,7 @@ impl KmsBackendV2 {
             hotkey: crate::input::hotkey::HotkeyDetector::new(),
             libinput_hotplug_retry_until: None,
             randr_id_alloc: RandrIdAllocator::default(),
+            provider_output_sources: HashMap::new(),
             output_identity_by_id: std::collections::HashMap::new(),
             output_key_by_id: std::collections::HashMap::new(),
             crtc_key_by_id: std::collections::HashMap::new(),
@@ -1472,6 +1489,7 @@ impl KmsBackendV2 {
             hotkey: crate::input::hotkey::HotkeyDetector::new(),
             libinput_hotplug_retry_until: None,
             randr_id_alloc: RandrIdAllocator::default(),
+            provider_output_sources: HashMap::new(),
             output_identity_by_id: std::collections::HashMap::new(),
             output_key_by_id: std::collections::HashMap::new(),
             crtc_key_by_id: std::collections::HashMap::new(),
@@ -2309,6 +2327,7 @@ impl KmsBackendV2 {
             hotkey: crate::input::hotkey::HotkeyDetector::new(),
             libinput_hotplug_retry_until: None,
             randr_id_alloc: RandrIdAllocator::default(),
+            provider_output_sources: HashMap::new(),
             output_identity_by_id: std::collections::HashMap::new(),
             output_key_by_id: std::collections::HashMap::new(),
             crtc_key_by_id: std::collections::HashMap::new(),
@@ -3303,19 +3322,45 @@ impl KmsBackendV2 {
         self.randr_outputs_and_modes().0
     }
 
-    /// Project every opened DRM device into a stable RANDR provider.
+    fn primary_render_device_key(&self) -> Option<crate::platform::drm::DrmDeviceKey> {
+        self.platform.primary_device().map(|device| device.key)
+    }
+
+    fn provider_output_source_allows(
+        &self,
+        scanout_device_key: crate::platform::drm::DrmDeviceKey,
+    ) -> bool {
+        let Some(render_device_key) = self.primary_render_device_key() else {
+            return false;
+        };
+        scanout_device_key == render_device_key
+            || self.provider_output_sources.get(&scanout_device_key) == Some(&render_device_key)
+    }
+
+    /// Project every opened DRM device and each active PRIME Output Source
+    /// relationship into stable RANDR providers.
     ///
-    /// Provider capabilities intentionally remain zero until a later PRIME
-    /// layer can execute output-source or render-offload transport. The
-    /// provider still owns and reports all connector/CRTC XIDs allocated for
-    /// its device, including currently disconnected connectors.
+    /// The first device is the sole Vulkan rendering provider in this phase;
+    /// secondary devices are output sinks. Render-offload capabilities remain
+    /// absent until per-provider Vulkan rendering exists.
     #[must_use]
     pub fn randr_providers(&mut self) -> Vec<yserver_core::randr::RandrProvider> {
-        use yserver_core::randr::RandrProvider;
+        use yserver_core::randr::{RandrProvider, RandrProviderAssociation};
+        use yserver_protocol::x11::randr::{
+            PROVIDER_CAPABILITY_SINK_OUTPUT, PROVIDER_CAPABILITY_SOURCE_OUTPUT,
+        };
+
+        let primary_key = self.primary_render_device_key();
+        let provider_ids: HashMap<_, _> = self
+            .platform
+            .devices
+            .iter()
+            .map(|device| (device.key, self.randr_id_alloc.provider_id_for(device.key)))
+            .collect();
 
         let mut providers = Vec::with_capacity(self.platform.devices.len());
         for device in &self.platform.devices {
-            let provider_id = self.randr_id_alloc.provider_id_for(device.key);
+            let provider_id = provider_ids[&device.key];
             let mut crtcs = Vec::new();
             let mut outputs = Vec::new();
             for (key, entry) in self.randr_id_alloc.entries() {
@@ -3332,13 +3377,38 @@ impl KmsBackendV2 {
                 .and_then(std::ffi::OsStr::to_str)
                 .unwrap_or_else(|| device.device.path())
                 .to_string();
+            let capabilities = if Some(device.key) == primary_key {
+                PROVIDER_CAPABILITY_SOURCE_OUTPUT
+            } else {
+                PROVIDER_CAPABILITY_SINK_OUTPUT
+            };
+            let mut associations = Vec::new();
+            if let Some(source_key) = self.provider_output_sources.get(&device.key)
+                && let Some(source_id) = provider_ids.get(source_key)
+            {
+                associations.push(RandrProviderAssociation {
+                    provider_id: *source_id,
+                    capability: PROVIDER_CAPABILITY_SOURCE_OUTPUT,
+                });
+            }
+            for (sink_key, source_key) in &self.provider_output_sources {
+                if *source_key == device.key
+                    && let Some(sink_id) = provider_ids.get(sink_key)
+                {
+                    associations.push(RandrProviderAssociation {
+                        provider_id: *sink_id,
+                        capability: PROVIDER_CAPABILITY_SINK_OUTPUT,
+                    });
+                }
+            }
+            associations.sort_by_key(|association| association.provider_id);
             providers.push(RandrProvider {
                 provider_id,
                 name,
-                capabilities: 0,
+                capabilities,
                 crtcs,
                 outputs,
-                associations: Vec::new(),
+                associations,
             });
         }
         providers.sort_by_key(|provider| provider.provider_id);
@@ -11842,6 +11912,81 @@ impl Backend for KmsBackendV2 {
         Ok(())
     }
 
+    fn set_provider_output_source(
+        &mut self,
+        state: &mut ServerState,
+        provider: u32,
+        source_provider: Option<u32>,
+    ) -> io::Result<bool> {
+        let sink_key = self
+            .randr_id_alloc
+            .provider_key_for_id(provider)
+            .ok_or_else(|| io::Error::other(format!("unknown RANDR provider id {provider}")))?;
+        let primary_key = self
+            .primary_render_device_key()
+            .ok_or_else(|| io::Error::other("no DRM device backs the Vulkan renderer"))?;
+
+        let source_key = source_provider
+            .map(|source_id| {
+                self.randr_id_alloc
+                    .provider_key_for_id(source_id)
+                    .ok_or_else(|| {
+                        io::Error::other(format!("unknown RANDR provider id {source_id}"))
+                    })
+            })
+            .transpose()?;
+        if sink_key == primary_key {
+            return Err(io::Error::other(
+                "the current Vulkan render provider cannot be an output sink",
+            ));
+        }
+        if let Some(source_key) = source_key
+            && source_key != primary_key
+        {
+            return Err(io::Error::other(
+                "only the current Vulkan render provider can source outputs",
+            ));
+        }
+
+        let changed = match source_key {
+            Some(source_key) => {
+                self.provider_output_sources.insert(sink_key, source_key) != Some(source_key)
+            }
+            None => {
+                if !self.provider_output_sources.contains_key(&sink_key) {
+                    false
+                } else {
+                    let active_connectors: Vec<_> = self
+                        .platform
+                        .outputs
+                        .iter()
+                        .filter(|output| output.key.device_key == sink_key)
+                        .map(|output| output.key.connector_name.as_str())
+                        .collect();
+                    if !active_connectors.is_empty() {
+                        return Err(io::Error::other(format!(
+                            "cannot detach output sink {provider} while its outputs are active: {}",
+                            active_connectors.join(", ")
+                        )));
+                    }
+                    self.provider_output_sources.remove(&sink_key);
+                    true
+                }
+            }
+        };
+
+        if changed {
+            let source = source_provider.map_or_else(
+                || "detached".to_string(),
+                |source| format!("source provider {source}"),
+            );
+            log::info!("PRIME Output Source: sink provider {provider} ({sink_key}) -> {source}");
+            let set_time = state.timestamp_now();
+            self.rebuild_randr_state(state, Some(set_time), false);
+        }
+        Ok(changed)
+    }
+
     fn apply_crtc_config(
         &mut self,
         output_id: u32,
@@ -11856,6 +12001,19 @@ impl Backend for KmsBackendV2 {
             .cloned()
             .ok_or_else(|| io::Error::other(format!("unknown RANDR output id {output_id}")))?;
         debug_assert_eq!(output_key.connector_name, connector);
+        if mode.is_some() && !self.provider_output_source_allows(output_key.device_key) {
+            let sink_provider = self
+                .randr_id_alloc
+                .providers
+                .get(&output_key.device_key)
+                .copied();
+            return Err(io::Error::other(format!(
+                "output {connector} belongs to secondary DRM device {}; attach sink provider {} \
+                 with RANDR SetProviderOutputSource before enabling it",
+                output_key.device_key,
+                sink_provider.map_or_else(|| "<unknown>".to_string(), |id| id.to_string()),
+            )));
+        }
         // ── Idempotency guard (CRITICAL) ──────────────────────────────────
         //
         // MATE / mate-settings-daemon re-assert the SAME SetCrtcConfig many
@@ -18934,7 +19092,7 @@ mod tests {
         backend::OutputKey,
         cpu_types::{Rectangle16, Repeat},
         v2::{
-            platform::{ConnectorSnapshot, CrtcKey, PlatformBackend},
+            platform::{ConnectorSnapshot, CrtcKey, KmsDevice, PlatformBackend},
             store::Storage,
         },
     };
@@ -18947,6 +19105,18 @@ mod tests {
 
     fn test_output_key(minor: u32, name: &str) -> OutputKey {
         OutputKey::new(test_device_key(minor), name.to_string())
+    }
+
+    fn add_secondary_test_device(backend: &mut KmsBackendV2) -> crate::platform::drm::DrmDeviceKey {
+        let key = test_device_key(1);
+        let device = std::rc::Rc::clone(&backend.platform.devices[0].device);
+        backend.platform.devices.push(KmsDevice {
+            key,
+            device,
+            render_node: None,
+            vulkan_physical_device: None,
+        });
+        key
     }
 
     fn test_advertised_mode(
@@ -19526,10 +19696,123 @@ mod tests {
 
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].name, "null");
-        assert_eq!(providers[0].capabilities, 0);
+        assert_eq!(
+            providers[0].capabilities,
+            yserver_protocol::x11::randr::PROVIDER_CAPABILITY_SOURCE_OUTPUT
+        );
         assert_eq!(providers[0].outputs, vec![outputs[0].output_id]);
         assert_eq!(providers[0].crtcs, vec![outputs[0].crtc_id]);
         assert!(providers[0].associations.is_empty());
+    }
+
+    #[test]
+    fn randr_provider_projection_exposes_output_source_relationship() {
+        use yserver_protocol::x11::randr::{
+            PROVIDER_CAPABILITY_SINK_OUTPUT, PROVIDER_CAPABILITY_SOURCE_OUTPUT,
+        };
+
+        let mut backend = KmsBackendV2::for_tests();
+        let source_key = backend.platform.devices[0].key;
+        let sink_key = add_secondary_test_device(&mut backend);
+        backend.provider_output_sources.insert(sink_key, source_key);
+
+        let providers = backend.randr_providers();
+        let source = providers
+            .iter()
+            .find(|provider| provider.capabilities == PROVIDER_CAPABILITY_SOURCE_OUTPUT)
+            .expect("source provider");
+        let sink = providers
+            .iter()
+            .find(|provider| provider.capabilities == PROVIDER_CAPABILITY_SINK_OUTPUT)
+            .expect("sink provider");
+
+        assert_eq!(
+            source.associations,
+            vec![yserver_core::randr::RandrProviderAssociation {
+                provider_id: sink.provider_id,
+                capability: PROVIDER_CAPABILITY_SINK_OUTPUT,
+            }]
+        );
+        assert_eq!(
+            sink.associations,
+            vec![yserver_core::randr::RandrProviderAssociation {
+                provider_id: source.provider_id,
+                capability: PROVIDER_CAPABILITY_SOURCE_OUTPUT,
+            }]
+        );
+    }
+
+    #[test]
+    fn provider_output_source_authorizes_secondary_scanout_until_detached() {
+        use yserver_protocol::x11::randr::{
+            PROVIDER_CAPABILITY_SINK_OUTPUT, PROVIDER_CAPABILITY_SOURCE_OUTPUT,
+        };
+
+        let mut backend = KmsBackendV2::for_tests();
+        let source_key = backend.platform.devices[0].key;
+        let sink_key = add_secondary_test_device(&mut backend);
+        let providers = backend.randr_providers();
+        let source_id = providers
+            .iter()
+            .find(|provider| provider.capabilities == PROVIDER_CAPABILITY_SOURCE_OUTPUT)
+            .expect("source provider")
+            .provider_id;
+        let sink_id = providers
+            .iter()
+            .find(|provider| provider.capabilities == PROVIDER_CAPABILITY_SINK_OUTPUT)
+            .expect("sink provider")
+            .provider_id;
+        let mut state = ServerState::new();
+
+        assert!(backend.provider_output_source_allows(source_key));
+        assert!(!backend.provider_output_source_allows(sink_key));
+        assert!(
+            backend
+                .set_provider_output_source(&mut state, sink_id, Some(source_id))
+                .expect("attach output source")
+        );
+        assert!(backend.provider_output_source_allows(sink_key));
+
+        let original_output_key = backend.platform.outputs[0].key.clone();
+        backend.platform.outputs[0].key = OutputKey::new(sink_key, "sink-test".to_string());
+        let err = backend
+            .set_provider_output_source(&mut state, sink_id, None)
+            .expect_err("an active sink cannot be detached");
+        assert!(err.to_string().contains("sink-test"));
+        assert!(backend.provider_output_source_allows(sink_key));
+
+        backend.platform.outputs[0].key = original_output_key;
+        assert!(
+            backend
+                .set_provider_output_source(&mut state, sink_id, None)
+                .expect("detach output source")
+        );
+        assert!(!backend.provider_output_source_allows(sink_key));
+    }
+
+    #[test]
+    fn apply_crtc_config_rejects_unattached_secondary_output() {
+        let mut backend = KmsBackendV2::for_tests();
+        let sink_key = add_secondary_test_device(&mut backend);
+        let output_key = OutputKey::new(sink_key, "DP-2".to_string());
+        let ids = backend.randr_id_alloc.ids_for(&output_key);
+        backend.output_key_by_id.insert(ids.output_id, output_key);
+
+        let err = backend
+            .apply_crtc_config(
+                ids.output_id,
+                "DP-2",
+                Some(yserver_core::backend::ModeSpec {
+                    width: 1920,
+                    height: 1080,
+                    vrefresh: 60,
+                }),
+                800,
+                0,
+            )
+            .expect_err("secondary scanout must require an output-source relationship");
+
+        assert!(err.to_string().contains("SetProviderOutputSource"));
     }
 
     #[test]

@@ -1110,6 +1110,40 @@ pub fn emit_randr_change_notifications(state: &mut ServerState, changed: &[(u32,
     }
 }
 
+/// Fan out RANDR `ProviderChangeNotify` after a provider relationship changes.
+pub fn emit_randr_provider_change_notification(state: &mut ServerState, provider: u32) {
+    use std::sync::atomic::Ordering;
+    use yserver_protocol::x11::{SequenceNumber, randr as x11randr};
+
+    const RANDR_FIRST_EVENT: u8 = 89;
+
+    let subscribers: Vec<(u32, yserver_protocol::x11::ResourceId, u16)> = state
+        .randr_select_masks
+        .iter()
+        .map(|((owner, window), mask)| (*owner, *window, *mask))
+        .collect();
+    for (owner, request_window, mask) in subscribers {
+        if mask & x11randr::NOTIFY_MASK_PROVIDER_CHANGE == 0 {
+            continue;
+        }
+        let Some(client) = state.clients.get_mut(&owner) else {
+            continue;
+        };
+        let sequence = SequenceNumber(client.last_sequence.load(Ordering::Relaxed));
+        let event = x11randr::encode_provider_change_notify_event(
+            client.byte_order,
+            RANDR_FIRST_EVENT,
+            sequence,
+            x11randr::ProviderChangeNotify {
+                timestamp: state.randr.timestamp,
+                request_window: request_window.0,
+                provider,
+            },
+        );
+        let _ = client_io::write_or_buffer(client, &event);
+    }
+}
+
 /// I2: re-arm `WRITABLE` interest on each client's writer fd to track
 /// `outbound` state. Called once per outer poll iteration so per-event
 /// processing doesn't have to thread the registry through every
