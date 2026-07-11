@@ -921,8 +921,7 @@ impl PlatformBackend {
                 vulkan_devices_by_drm
                     .get(&layout.scanout_route.render_device_key)
                     .copied()
-                    .flatten()
-                    == Some(vk.physical_device),
+                    .flatten(),
                 w,
                 h,
                 3,
@@ -2832,7 +2831,7 @@ impl PlatformBackend {
                     Arc::clone(&vk),
                     Rc::clone(&device.device),
                     scanout_route,
-                    render_physical_device == Some(vk.physical_device),
+                    render_physical_device,
                     u32::from(w),
                     u32::from(h),
                     3,

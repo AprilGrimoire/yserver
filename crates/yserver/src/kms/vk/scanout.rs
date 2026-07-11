@@ -300,31 +300,64 @@ pub(crate) enum LinearScanoutSupport {
     LegacyAddfb,
 }
 
+/// Why metadata proves that a dma-buf route cannot work through yserver's
+/// current Vulkan-first allocator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DmabufScanoutIncompatibility {
+    /// The selected Vulkan logical device cannot export DMA_BUF memory.
+    VulkanExternalMemoryFdUnavailable,
+    /// Vulkan positively mapped the route's render DRM device to another
+    /// physical device, so this context cannot own the advertised source.
+    RenderDeviceMismatch,
+    /// The sink DRM driver positively reported no PRIME import capability.
+    KmsPrimeImportUnsupported,
+}
+
+/// Metadata that was unavailable or insufficient to prove compatibility.
+/// These conditions must not suppress the authoritative runtime import.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DmabufScanoutUncertainty {
+    /// Vulkan exposed no DRM identity for the route's render device.
+    RenderDeviceIdentityUnavailable,
+    /// Querying the sink's `DRM_CAP_PRIME` capability failed.
+    KmsPrimeImportCapabilityUnavailable,
+    /// Advertised Vulkan/KMS formats did not establish a shared modifier or
+    /// linear path; drivers may still accept the historical fallback.
+    NoAdvertisedSharedLayout,
+}
+
+/// Tri-state conclusion of the metadata-only compatibility probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DmabufScanoutVerdict {
+    /// All required metadata was present and described a usable route.
+    Compatible,
+    /// Metadata conclusively rules out the current allocation path.
+    Incompatible(DmabufScanoutIncompatibility),
+    /// Metadata was incomplete; allocation must still be attempted.
+    Unknown(Vec<DmabufScanoutUncertainty>),
+}
+
+impl DmabufScanoutVerdict {
+    /// Only conclusive incompatibility suppresses the runtime import attempt.
+    fn blocks_attempt(&self) -> bool {
+        matches!(self, Self::Incompatible(_))
+    }
+}
+
 /// Necessary metadata capabilities for one Vulkan-to-KMS dma-buf route.
 ///
-/// `kms_prime_import` comes from `DRM_CAP_PRIME`; `modifiers` is the ordered
-/// intersection of KMS plane modifiers and Vulkan single-plane exportable
-/// modifiers; `linear` records the separate `VK_IMAGE_TILING_LINEAR`
-/// fallback. `render_device_matches_vulkan` records whether Vulkan's DRM
-/// identity verifies the source endpoint. None of these checks exports a
-/// dma-buf or invokes `PRIME_FD_TO_HANDLE`.
+/// `modifiers` is the ordered intersection of KMS plane modifiers and Vulkan
+/// single-plane exportable modifiers. `linear` records the separate
+/// `VK_IMAGE_TILING_LINEAR` fallback. `verdict` combines device identity,
+/// external-memory, PRIME-import, and layout evidence without reducing
+/// unavailable metadata to `false`. No probe exports a dma-buf or invokes
+/// `PRIME_FD_TO_HANDLE`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DmabufScanoutCompatibility {
     pub(crate) route: ScanoutRoute,
-    pub(crate) render_device_matches_vulkan: bool,
-    pub(crate) kms_prime_import: bool,
     pub(crate) modifiers: Vec<u64>,
     pub(crate) linear: LinearScanoutSupport,
-}
-
-impl DmabufScanoutCompatibility {
-    /// Whether metadata establishes at least one cross-device path worth
-    /// attempting. Runtime import and framebuffer registration can still fail.
-    pub(crate) fn supports_cross_device_attempt(&self) -> bool {
-        self.render_device_matches_vulkan
-            && self.kms_prime_import
-            && (!self.modifiers.is_empty() || self.linear != LinearScanoutSupport::None)
-    }
+    pub(crate) verdict: DmabufScanoutVerdict,
 }
 
 impl ScanoutBo {
@@ -700,7 +733,7 @@ impl ScanoutBoPool {
         vk: Arc<VkContext>,
         drm: Rc<crate::drm::Device>,
         route: ScanoutRoute,
-        render_device_matches_vulkan: bool,
+        render_physical_device: Option<vk::PhysicalDevice>,
         width: u32,
         height: u32,
         count: usize,
@@ -710,23 +743,24 @@ impl ScanoutBoPool {
             &vk,
             &drm,
             route,
-            render_device_matches_vulkan,
+            render_physical_device,
             scanout_modifiers,
         );
-        if route.is_cross_device() && !compatibility.supports_cross_device_attempt() {
+        if route.is_cross_device() && compatibility.verdict.blocks_attempt() {
+            let DmabufScanoutVerdict::Incompatible(reason) = &compatibility.verdict else {
+                unreachable!("only an incompatible verdict blocks allocation")
+            };
             return Err(io::Error::other(format!(
-                "dma-buf route {} -> {} has no metadata-compatible scanout path \
-                 (render_device_matches_vulkan={}, kms_prime_import={}, modifiers={}, linear={:?})",
+                "dma-buf route {} -> {} is incompatible: {reason:?} \
+                 (modifiers={}, linear={:?})",
                 route.render_device_key,
                 route.kms_device_key,
-                compatibility.render_device_matches_vulkan,
-                compatibility.kms_prime_import,
                 format_modifiers(&compatibility.modifiers),
                 compatibility.linear,
             )));
         }
 
-        let plans = allocation_plans_for_route(&vk, &compatibility);
+        let plans = allocation_plans_for_route(vk.image_drm_format_modifier, &compatibility);
         let mut bos = Vec::with_capacity(count);
         for _ in 0..count {
             bos.push(ScanoutBo::allocate(
@@ -769,11 +803,11 @@ impl ScanoutAllocationPlan {
 }
 
 fn scanout_allocation_plans(
-    vk: &VkContext,
+    image_drm_format_modifier: bool,
     modifier_candidates: &[u64],
 ) -> Vec<ScanoutAllocationPlan> {
     let mut plans = Vec::new();
-    if vk.image_drm_format_modifier {
+    if image_drm_format_modifier {
         plans.extend(
             modifier_candidates
                 .iter()
@@ -787,15 +821,22 @@ fn scanout_allocation_plans(
 }
 
 fn allocation_plans_for_route(
-    vk: &VkContext,
+    image_drm_format_modifier: bool,
     compatibility: &DmabufScanoutCompatibility,
 ) -> Vec<ScanoutAllocationPlan> {
     if !compatibility.route.is_cross_device() {
-        return scanout_allocation_plans(vk, &compatibility.modifiers);
+        return scanout_allocation_plans(image_drm_format_modifier, &compatibility.modifiers);
+    }
+
+    if matches!(&compatibility.verdict, DmabufScanoutVerdict::Unknown(_)) {
+        // Preserve the pre-probe behavior when metadata is incomplete: try
+        // every advertised modifier followed by both linear registrations and
+        // let PRIME_FD_TO_HANDLE/addfb2 provide the authoritative answer.
+        return scanout_allocation_plans(image_drm_format_modifier, &compatibility.modifiers);
     }
 
     let mut plans = Vec::new();
-    if vk.image_drm_format_modifier {
+    if image_drm_format_modifier {
         plans.extend(
             compatibility
                 .modifiers
@@ -818,6 +859,20 @@ fn allocation_plans_for_route(
 
 const DRM_PRIME_CAP_IMPORT: u64 = 1 << 0;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenderDeviceMatch {
+    Match,
+    Mismatch,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrimeImportSupport {
+    Supported,
+    Unsupported,
+    Unknown,
+}
+
 /// Probe the advertised dma-buf path from one Vulkan renderer to one KMS
 /// device without allocating, exporting, or importing a buffer.
 ///
@@ -830,53 +885,62 @@ pub(crate) fn probe_dmabuf_scanout_compatibility(
     vk: &VkContext,
     drm: &crate::drm::Device,
     route: ScanoutRoute,
-    render_device_matches_vulkan: bool,
+    render_physical_device: Option<vk::PhysicalDevice>,
     kms_scanout_modifiers: &[u64],
 ) -> DmabufScanoutCompatibility {
-    let kms_prime_import = match drm.get_driver_capability(DriverCapability::Prime) {
-        Ok(capabilities) => capabilities & DRM_PRIME_CAP_IMPORT != 0,
+    let render_device_match = match render_physical_device {
+        Some(physical_device) if physical_device == vk.physical_device => RenderDeviceMatch::Match,
+        Some(_) => RenderDeviceMatch::Mismatch,
+        None => RenderDeviceMatch::Unknown,
+    };
+    let prime_import = match drm.get_driver_capability(DriverCapability::Prime) {
+        Ok(capabilities) if capabilities & DRM_PRIME_CAP_IMPORT != 0 => {
+            PrimeImportSupport::Supported
+        }
+        Ok(_) => PrimeImportSupport::Unsupported,
         Err(err) => {
             log::warn!(
                 "dma-buf probe {} -> {}: DRM_CAP_PRIME query failed: {err}",
                 route.render_device_key,
                 route.kms_device_key,
             );
-            false
+            PrimeImportSupport::Unknown
         }
     };
 
-    let modifiers = if vk.external_memory_fd.is_some() {
+    let external_memory_fd_available = vk.external_memory_fd.is_some();
+    let modifiers = if external_memory_fd_available {
         scanout_modifier_candidates(vk, kms_scanout_modifiers)
     } else {
         Vec::new()
     };
-    let linear_exportable = vk.external_memory_fd.is_some() && scanout_linear_is_exportable(vk);
+    let linear_exportable = external_memory_fd_available && scanout_linear_is_exportable(vk);
     let compatibility = classify_dmabuf_scanout_compatibility(
         route,
-        render_device_matches_vulkan,
-        kms_prime_import,
+        external_memory_fd_available,
+        render_device_match,
+        prime_import,
         modifiers,
         linear_exportable,
         kms_scanout_modifiers,
     );
 
     log::info!(
-        "dma-buf probe {} -> {}: render_device_matches_vulkan={} kms_prime_import={} modifiers={} linear={:?} compatible={}",
+        "dma-buf probe {} -> {}: modifiers={} linear={:?} verdict={:?}",
         route.render_device_key,
         route.kms_device_key,
-        compatibility.render_device_matches_vulkan,
-        compatibility.kms_prime_import,
         format_modifiers(&compatibility.modifiers),
         compatibility.linear,
-        compatibility.supports_cross_device_attempt(),
+        compatibility.verdict,
     );
     compatibility
 }
 
 fn classify_dmabuf_scanout_compatibility(
     route: ScanoutRoute,
-    render_device_matches_vulkan: bool,
-    kms_prime_import: bool,
+    external_memory_fd_available: bool,
+    render_device_match: RenderDeviceMatch,
+    prime_import: PrimeImportSupport,
     modifiers: Vec<u64>,
     linear_exportable: bool,
     kms_scanout_modifiers: &[u64],
@@ -890,12 +954,36 @@ fn classify_dmabuf_scanout_compatibility(
     } else {
         LinearScanoutSupport::None
     };
+    let verdict = if !external_memory_fd_available {
+        DmabufScanoutVerdict::Incompatible(
+            DmabufScanoutIncompatibility::VulkanExternalMemoryFdUnavailable,
+        )
+    } else if render_device_match == RenderDeviceMatch::Mismatch {
+        DmabufScanoutVerdict::Incompatible(DmabufScanoutIncompatibility::RenderDeviceMismatch)
+    } else if prime_import == PrimeImportSupport::Unsupported {
+        DmabufScanoutVerdict::Incompatible(DmabufScanoutIncompatibility::KmsPrimeImportUnsupported)
+    } else {
+        let mut uncertainty = Vec::new();
+        if render_device_match == RenderDeviceMatch::Unknown {
+            uncertainty.push(DmabufScanoutUncertainty::RenderDeviceIdentityUnavailable);
+        }
+        if prime_import == PrimeImportSupport::Unknown {
+            uncertainty.push(DmabufScanoutUncertainty::KmsPrimeImportCapabilityUnavailable);
+        }
+        if modifiers.is_empty() && linear == LinearScanoutSupport::None {
+            uncertainty.push(DmabufScanoutUncertainty::NoAdvertisedSharedLayout);
+        }
+        if uncertainty.is_empty() {
+            DmabufScanoutVerdict::Compatible
+        } else {
+            DmabufScanoutVerdict::Unknown(uncertainty)
+        }
+    };
     DmabufScanoutCompatibility {
         route,
-        render_device_matches_vulkan,
-        kms_prime_import,
         modifiers,
         linear,
+        verdict,
     }
 }
 
@@ -1632,13 +1720,15 @@ mod tests {
         let compatibility = classify_dmabuf_scanout_compatibility(
             test_route(true),
             true,
-            true,
+            RenderDeviceMatch::Match,
+            PrimeImportSupport::Supported,
             vec![TILED_A],
             false,
             &[TILED_A],
         );
         assert!(compatibility.route.is_cross_device());
-        assert!(compatibility.supports_cross_device_attempt());
+        assert_eq!(compatibility.verdict, DmabufScanoutVerdict::Compatible);
+        assert!(!compatibility.verdict.blocks_attempt());
         assert_eq!(compatibility.modifiers, vec![TILED_A]);
         assert_eq!(compatibility.linear, LinearScanoutSupport::None);
     }
@@ -1648,12 +1738,13 @@ mod tests {
         let compatibility = classify_dmabuf_scanout_compatibility(
             test_route(true),
             true,
-            true,
+            RenderDeviceMatch::Match,
+            PrimeImportSupport::Supported,
             Vec::new(),
             true,
             &[LINEAR],
         );
-        assert!(compatibility.supports_cross_device_attempt());
+        assert_eq!(compatibility.verdict, DmabufScanoutVerdict::Compatible);
         assert_eq!(compatibility.linear, LinearScanoutSupport::ExplicitModifier);
     }
 
@@ -1662,12 +1753,13 @@ mod tests {
         let compatibility = classify_dmabuf_scanout_compatibility(
             test_route(true),
             true,
-            true,
+            RenderDeviceMatch::Match,
+            PrimeImportSupport::Supported,
             Vec::new(),
             true,
             &[],
         );
-        assert!(compatibility.supports_cross_device_attempt());
+        assert_eq!(compatibility.verdict, DmabufScanoutVerdict::Compatible);
         assert_eq!(compatibility.linear, LinearScanoutSupport::LegacyAddfb);
     }
 
@@ -1676,39 +1768,123 @@ mod tests {
         let compatibility = classify_dmabuf_scanout_compatibility(
             test_route(true),
             true,
-            false,
+            RenderDeviceMatch::Match,
+            PrimeImportSupport::Unsupported,
             vec![TILED_A],
             true,
             &[TILED_A, LINEAR],
         );
-        assert!(!compatibility.supports_cross_device_attempt());
+        assert_eq!(
+            compatibility.verdict,
+            DmabufScanoutVerdict::Incompatible(
+                DmabufScanoutIncompatibility::KmsPrimeImportUnsupported
+            )
+        );
+        assert!(compatibility.verdict.blocks_attempt());
     }
 
     #[test]
-    fn compatibility_requires_verified_vulkan_render_device() {
+    fn compatibility_keeps_missing_vulkan_identity_unknown_and_attemptable() {
         let compatibility = classify_dmabuf_scanout_compatibility(
             test_route(true),
-            false,
             true,
+            RenderDeviceMatch::Unknown,
+            PrimeImportSupport::Supported,
             vec![TILED_A],
             true,
             &[TILED_A, LINEAR],
         );
-        assert!(!compatibility.supports_cross_device_attempt());
+        assert_eq!(
+            compatibility.verdict,
+            DmabufScanoutVerdict::Unknown(vec![
+                DmabufScanoutUncertainty::RenderDeviceIdentityUnavailable
+            ])
+        );
+        assert!(!compatibility.verdict.blocks_attempt());
     }
 
     #[test]
-    fn compatibility_rejects_no_shared_modifier_or_linear_path() {
+    fn compatibility_rejects_verified_vulkan_device_mismatch() {
         let compatibility = classify_dmabuf_scanout_compatibility(
             test_route(true),
             true,
+            RenderDeviceMatch::Mismatch,
+            PrimeImportSupport::Supported,
+            vec![TILED_A],
             true,
+            &[TILED_A, LINEAR],
+        );
+        assert_eq!(
+            compatibility.verdict,
+            DmabufScanoutVerdict::Incompatible(DmabufScanoutIncompatibility::RenderDeviceMismatch)
+        );
+    }
+
+    #[test]
+    fn compatibility_keeps_missing_layout_metadata_unknown_and_attemptable() {
+        let compatibility = classify_dmabuf_scanout_compatibility(
+            test_route(true),
+            true,
+            RenderDeviceMatch::Match,
+            PrimeImportSupport::Supported,
             Vec::new(),
             true,
             &[TILED_A],
         );
-        assert!(!compatibility.supports_cross_device_attempt());
+        assert_eq!(
+            compatibility.verdict,
+            DmabufScanoutVerdict::Unknown(vec![DmabufScanoutUncertainty::NoAdvertisedSharedLayout])
+        );
+        assert!(!compatibility.verdict.blocks_attempt());
         assert_eq!(compatibility.linear, LinearScanoutSupport::None);
+        assert_eq!(
+            allocation_plans_for_route(true, &compatibility),
+            vec![
+                ScanoutAllocationPlan::ExplicitLinear,
+                ScanoutAllocationPlan::LegacyLinear,
+            ],
+            "unknown metadata must retain the real fallback attempts"
+        );
+    }
+
+    #[test]
+    fn compatibility_keeps_prime_query_failure_unknown_and_attemptable() {
+        let compatibility = classify_dmabuf_scanout_compatibility(
+            test_route(true),
+            true,
+            RenderDeviceMatch::Match,
+            PrimeImportSupport::Unknown,
+            vec![TILED_A],
+            true,
+            &[TILED_A],
+        );
+        assert_eq!(
+            compatibility.verdict,
+            DmabufScanoutVerdict::Unknown(vec![
+                DmabufScanoutUncertainty::KmsPrimeImportCapabilityUnavailable
+            ])
+        );
+        assert!(!compatibility.verdict.blocks_attempt());
+    }
+
+    #[test]
+    fn compatibility_rejects_missing_vulkan_external_memory_fd() {
+        let compatibility = classify_dmabuf_scanout_compatibility(
+            test_route(true),
+            false,
+            RenderDeviceMatch::Unknown,
+            PrimeImportSupport::Unknown,
+            Vec::new(),
+            false,
+            &[],
+        );
+        assert_eq!(
+            compatibility.verdict,
+            DmabufScanoutVerdict::Incompatible(
+                DmabufScanoutIncompatibility::VulkanExternalMemoryFdUnavailable
+            )
+        );
+        assert!(compatibility.verdict.blocks_attempt());
     }
 
     #[test]

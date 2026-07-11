@@ -2063,7 +2063,7 @@ impl KmsBackendV2 {
                         .device,
                 ),
                 layout.scanout_route,
-                false,
+                None,
                 u32::from(layout.width),
                 u32::from(layout.height),
                 3,

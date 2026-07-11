@@ -286,13 +286,16 @@ Cross-cutting bugs and followups that don't fit a stage live in
   pool retains the same route. Before a cross-device pool can allocate, yserver
   performs a metadata-only compatibility probe over the sink's
   `DRM_CAP_PRIME` import bit, its primary-plane `IN_FORMATS` modifiers, and the
-  renderer's verified Vulkan/DRM identity and single-plane dma-buf export
-  properties. A route is attempted only when the devices share an explicit
-  modifier or a supported linear path;
-  no probe exports or imports a dma-buf, and successful metadata probing is not
-  treated as proof that a later import ioctl will succeed. Local same-device
-  scanout retains its established modifier and legacy-linear fallbacks. RANDR
-  provider capabilities remain zero and no provider relationship is activated.
+  renderer's Vulkan/DRM identity and single-plane dma-buf export properties.
+  Probe conclusions are tri-state: `Compatible` constrains allocation to the
+  advertised paths, `Incompatible` is reserved for conclusive blockers, and
+  `Unknown` preserves the historical broad allocation attempt so missing or
+  incomplete driver metadata cannot suppress the authoritative
+  `PRIME_FD_TO_HANDLE`/`addfb2` result. No probe exports or imports a dma-buf,
+  and successful metadata probing is not treated as proof that a later import
+  ioctl will succeed. Local same-device scanout retains its established
+  modifier and legacy-linear fallbacks. RANDR provider capabilities remain zero
+  and no provider relationship is activated.
 - **2026-06-08 COW architectural reset**: the active Cinnamon blocker
   is now treated as a structural COW/model bug, not another
   scene-assembly edge case. Replacement design doc:
