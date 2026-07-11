@@ -280,6 +280,19 @@ Cross-cutting bugs and followups that don't fit a stage live in
   source/sink transport remain future work. Validation: focused protocol,
   core-dispatch, model, and KMS-projection tests plus the full workspace suite
   and CI-style clippy.
+- **2026-07-11 device-qualified scanout routes and dma-buf probing**:
+  every active output now records both the DRM device backing the Vulkan
+  renderer and the DRM/KMS device presenting the buffer; each live scanout BO
+  pool retains the same route. Before a cross-device pool can allocate, yserver
+  performs a metadata-only compatibility probe over the sink's
+  `DRM_CAP_PRIME` import bit, its primary-plane `IN_FORMATS` modifiers, and the
+  renderer's verified Vulkan/DRM identity and single-plane dma-buf export
+  properties. A route is attempted only when the devices share an explicit
+  modifier or a supported linear path;
+  no probe exports or imports a dma-buf, and successful metadata probing is not
+  treated as proof that a later import ioctl will succeed. Local same-device
+  scanout retains its established modifier and legacy-linear fallbacks. RANDR
+  provider capabilities remain zero and no provider relationship is activated.
 - **2026-06-08 COW architectural reset**: the active Cinnamon blocker
   is now treated as a structural COW/model bug, not another
   scene-assembly edge case. Replacement design doc:

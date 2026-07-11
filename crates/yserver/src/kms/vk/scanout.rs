@@ -37,11 +37,13 @@ use std::{
 
 use ash::vk;
 use drm::{
+    Device as _, DriverCapability,
     buffer::{DrmFourcc, DrmModifier, Handle as DrmBufferHandle, PlanarBuffer as DrmPlanarBuffer},
     control::{Device as DrmControlDevice, FbCmd2Flags, framebuffer},
 };
 
 use super::device::VkContext;
+use crate::kms::backend::ScanoutRoute;
 
 /// Per-bo phase. The lifecycle is roughly
 /// `Free → Recording → Submitted → Pending → OnScreen → Retiring → Free`.
@@ -277,6 +279,52 @@ pub struct ScanoutBoPool {
     pub bos: Vec<ScanoutBo>,
     pub width: u32,
     pub height: u32,
+    /// Device-qualified ownership of the images and DRM framebuffers in
+    /// `bos`. Every BO in a pool uses the same pair of endpoints.
+    pub(crate) route: ScanoutRoute,
+    /// Metadata-only result captured before any BO in this pool was
+    /// exported. This is a necessary-capability check, not proof that a
+    /// future PRIME import ioctl will succeed on every allocation.
+    pub(crate) compatibility: DmabufScanoutCompatibility,
+}
+
+/// How a Vulkan linear image may be registered on the KMS endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LinearScanoutSupport {
+    /// The metadata probe found no shared linear path.
+    None,
+    /// KMS advertised `DRM_FORMAT_MOD_LINEAR` in the plane's `IN_FORMATS`.
+    ExplicitModifier,
+    /// KMS exposed no `IN_FORMATS`; only the traditional untagged `addfb2`
+    /// linear path can be attempted.
+    LegacyAddfb,
+}
+
+/// Necessary metadata capabilities for one Vulkan-to-KMS dma-buf route.
+///
+/// `kms_prime_import` comes from `DRM_CAP_PRIME`; `modifiers` is the ordered
+/// intersection of KMS plane modifiers and Vulkan single-plane exportable
+/// modifiers; `linear` records the separate `VK_IMAGE_TILING_LINEAR`
+/// fallback. `render_device_matches_vulkan` records whether Vulkan's DRM
+/// identity verifies the source endpoint. None of these checks exports a
+/// dma-buf or invokes `PRIME_FD_TO_HANDLE`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DmabufScanoutCompatibility {
+    pub(crate) route: ScanoutRoute,
+    pub(crate) render_device_matches_vulkan: bool,
+    pub(crate) kms_prime_import: bool,
+    pub(crate) modifiers: Vec<u64>,
+    pub(crate) linear: LinearScanoutSupport,
+}
+
+impl DmabufScanoutCompatibility {
+    /// Whether metadata establishes at least one cross-device path worth
+    /// attempting. Runtime import and framebuffer registration can still fail.
+    pub(crate) fn supports_cross_device_attempt(&self) -> bool {
+        self.render_device_matches_vulkan
+            && self.kms_prime_import
+            && (!self.modifiers.is_empty() || self.linear != LinearScanoutSupport::None)
+    }
 }
 
 impl ScanoutBo {
@@ -284,18 +332,16 @@ impl ScanoutBo {
     /// exportable memory + DRM framebuffer registration.
     /// All steps must succeed; partial allocations are unwound on
     /// error so the returned `Err` leaves no resources leaked.
-    pub fn allocate(
+    fn allocate(
         vk: Arc<VkContext>,
         drm: Rc<crate::drm::Device>,
         width: u32,
         height: u32,
-        scanout_modifiers: &[u64],
+        plans: &[ScanoutAllocationPlan],
     ) -> io::Result<Self> {
-        let modifier_candidates = scanout_modifier_candidates(&vk, scanout_modifiers);
-        let plans = scanout_allocation_plans(&vk, &modifier_candidates);
         let mut errors = Vec::new();
 
-        for plan in plans {
+        for &plan in plans {
             match Self::allocate_with_plan(vk.clone(), Rc::clone(&drm), width, height, plan) {
                 Ok(bo) => {
                     log::info!(
@@ -650,14 +696,37 @@ impl ScanoutBoPool {
     /// uses 3 bos per pool (design §2). On failure the partial pool
     /// is dropped (each successfully-allocated bo destroys its own
     /// resources via `ScanoutBo::Drop`).
-    pub fn allocate(
+    pub(crate) fn allocate(
         vk: Arc<VkContext>,
         drm: Rc<crate::drm::Device>,
+        route: ScanoutRoute,
+        render_device_matches_vulkan: bool,
         width: u32,
         height: u32,
         count: usize,
         scanout_modifiers: &[u64],
     ) -> io::Result<Self> {
+        let compatibility = probe_dmabuf_scanout_compatibility(
+            &vk,
+            &drm,
+            route,
+            render_device_matches_vulkan,
+            scanout_modifiers,
+        );
+        if route.is_cross_device() && !compatibility.supports_cross_device_attempt() {
+            return Err(io::Error::other(format!(
+                "dma-buf route {} -> {} has no metadata-compatible scanout path \
+                 (render_device_matches_vulkan={}, kms_prime_import={}, modifiers={}, linear={:?})",
+                route.render_device_key,
+                route.kms_device_key,
+                compatibility.render_device_matches_vulkan,
+                compatibility.kms_prime_import,
+                format_modifiers(&compatibility.modifiers),
+                compatibility.linear,
+            )));
+        }
+
+        let plans = allocation_plans_for_route(&vk, &compatibility);
         let mut bos = Vec::with_capacity(count);
         for _ in 0..count {
             bos.push(ScanoutBo::allocate(
@@ -665,10 +734,16 @@ impl ScanoutBoPool {
                 Rc::clone(&drm),
                 width,
                 height,
-                scanout_modifiers,
+                &plans,
             )?);
         }
-        Ok(Self { bos, width, height })
+        Ok(Self {
+            bos,
+            width,
+            height,
+            route,
+            compatibility,
+        })
     }
 }
 
@@ -709,6 +784,152 @@ fn scanout_allocation_plans(
     plans.push(ScanoutAllocationPlan::ExplicitLinear);
     plans.push(ScanoutAllocationPlan::LegacyLinear);
     plans
+}
+
+fn allocation_plans_for_route(
+    vk: &VkContext,
+    compatibility: &DmabufScanoutCompatibility,
+) -> Vec<ScanoutAllocationPlan> {
+    if !compatibility.route.is_cross_device() {
+        return scanout_allocation_plans(vk, &compatibility.modifiers);
+    }
+
+    let mut plans = Vec::new();
+    if vk.image_drm_format_modifier {
+        plans.extend(
+            compatibility
+                .modifiers
+                .iter()
+                .copied()
+                .map(ScanoutAllocationPlan::DrmModifier),
+        );
+    }
+    match compatibility.linear {
+        LinearScanoutSupport::None => {}
+        LinearScanoutSupport::ExplicitModifier => {
+            plans.push(ScanoutAllocationPlan::ExplicitLinear);
+        }
+        LinearScanoutSupport::LegacyAddfb => {
+            plans.push(ScanoutAllocationPlan::LegacyLinear);
+        }
+    }
+    plans
+}
+
+const DRM_PRIME_CAP_IMPORT: u64 = 1 << 0;
+
+/// Probe the advertised dma-buf path from one Vulkan renderer to one KMS
+/// device without allocating, exporting, or importing a buffer.
+///
+/// The result combines Vulkan external-memory image properties, the KMS
+/// primary plane's `IN_FORMATS` list, and the sink DRM fd's
+/// `DRM_CAP_PRIME` import bit. It deliberately remains a necessary-condition
+/// probe: only a later real allocation can prove that the two drivers accept
+/// a particular dma-buf instance and pitch.
+pub(crate) fn probe_dmabuf_scanout_compatibility(
+    vk: &VkContext,
+    drm: &crate::drm::Device,
+    route: ScanoutRoute,
+    render_device_matches_vulkan: bool,
+    kms_scanout_modifiers: &[u64],
+) -> DmabufScanoutCompatibility {
+    let kms_prime_import = match drm.get_driver_capability(DriverCapability::Prime) {
+        Ok(capabilities) => capabilities & DRM_PRIME_CAP_IMPORT != 0,
+        Err(err) => {
+            log::warn!(
+                "dma-buf probe {} -> {}: DRM_CAP_PRIME query failed: {err}",
+                route.render_device_key,
+                route.kms_device_key,
+            );
+            false
+        }
+    };
+
+    let modifiers = if vk.external_memory_fd.is_some() {
+        scanout_modifier_candidates(vk, kms_scanout_modifiers)
+    } else {
+        Vec::new()
+    };
+    let linear_exportable = vk.external_memory_fd.is_some() && scanout_linear_is_exportable(vk);
+    let compatibility = classify_dmabuf_scanout_compatibility(
+        route,
+        render_device_matches_vulkan,
+        kms_prime_import,
+        modifiers,
+        linear_exportable,
+        kms_scanout_modifiers,
+    );
+
+    log::info!(
+        "dma-buf probe {} -> {}: render_device_matches_vulkan={} kms_prime_import={} modifiers={} linear={:?} compatible={}",
+        route.render_device_key,
+        route.kms_device_key,
+        compatibility.render_device_matches_vulkan,
+        compatibility.kms_prime_import,
+        format_modifiers(&compatibility.modifiers),
+        compatibility.linear,
+        compatibility.supports_cross_device_attempt(),
+    );
+    compatibility
+}
+
+fn classify_dmabuf_scanout_compatibility(
+    route: ScanoutRoute,
+    render_device_matches_vulkan: bool,
+    kms_prime_import: bool,
+    modifiers: Vec<u64>,
+    linear_exportable: bool,
+    kms_scanout_modifiers: &[u64],
+) -> DmabufScanoutCompatibility {
+    let linear = if !linear_exportable {
+        LinearScanoutSupport::None
+    } else if kms_scanout_modifiers.is_empty() {
+        LinearScanoutSupport::LegacyAddfb
+    } else if kms_scanout_modifiers.contains(&super::dri3::DRM_FORMAT_MOD_LINEAR) {
+        LinearScanoutSupport::ExplicitModifier
+    } else {
+        LinearScanoutSupport::None
+    };
+    DmabufScanoutCompatibility {
+        route,
+        render_device_matches_vulkan,
+        kms_prime_import,
+        modifiers,
+        linear,
+    }
+}
+
+fn scanout_linear_is_exportable(vk: &VkContext) -> bool {
+    let mut external_info = vk::PhysicalDeviceExternalImageFormatInfo::default()
+        .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+    let format_info = vk::PhysicalDeviceImageFormatInfo2::default()
+        .format(vk::Format::B8G8R8A8_UNORM)
+        .ty(vk::ImageType::TYPE_2D)
+        .tiling(vk::ImageTiling::LINEAR)
+        .usage(scanout_image_usage())
+        .push_next(&mut external_info);
+
+    let mut external_props = vk::ExternalImageFormatProperties::default();
+    let mut props = vk::ImageFormatProperties2::default().push_next(&mut external_props);
+    if unsafe {
+        vk.instance.get_physical_device_image_format_properties2(
+            vk.physical_device,
+            &format_info,
+            &mut props,
+        )
+    }
+    .is_err()
+    {
+        return false;
+    }
+
+    let memory = external_props.external_memory_properties;
+    memory
+        .external_memory_features
+        .contains(vk::ExternalMemoryFeatureFlags::EXPORTABLE)
+        && memory
+            .compatible_handle_types
+            .contains(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
 }
 
 /// Whether scanout BO allocation should try `LINEAR` before the tiled
@@ -802,6 +1023,7 @@ fn order_scanout_modifier_candidates(
     if prefer_linear
         && kms_scanout_modifiers.contains(&super::dri3::DRM_FORMAT_MOD_LINEAR)
         && vulkan_supported.contains(&super::dri3::DRM_FORMAT_MOD_LINEAR)
+        && is_exportable(super::dri3::DRM_FORMAT_MOD_LINEAR)
     {
         candidates.push(super::dri3::DRM_FORMAT_MOD_LINEAR);
     }
@@ -823,6 +1045,7 @@ fn order_scanout_modifier_candidates(
     if !prefer_linear
         && kms_scanout_modifiers.contains(&super::dri3::DRM_FORMAT_MOD_LINEAR)
         && vulkan_supported.contains(&super::dri3::DRM_FORMAT_MOD_LINEAR)
+        && is_exportable(super::dri3::DRM_FORMAT_MOD_LINEAR)
         && !candidates.contains(&super::dri3::DRM_FORMAT_MOD_LINEAR)
     {
         candidates.push(super::dri3::DRM_FORMAT_MOD_LINEAR);
@@ -1380,6 +1603,112 @@ mod tests {
     fn modifier_order_empty_when_no_intersection() {
         let candidates = order_scanout_modifier_candidates(&[TILED_A], &[TILED_B], false, |_| true);
         assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn modifier_order_rejects_non_exportable_linear() {
+        let candidates = order_scanout_modifier_candidates(&[LINEAR], &[LINEAR], false, |_| false);
+        assert!(candidates.is_empty());
+    }
+
+    fn test_route(cross_device: bool) -> ScanoutRoute {
+        let render_device_key = crate::platform::drm::DrmDeviceKey {
+            major: 226,
+            minor: 0,
+        };
+        let kms_device_key = if cross_device {
+            crate::platform::drm::DrmDeviceKey {
+                major: 226,
+                minor: 1,
+            }
+        } else {
+            render_device_key
+        };
+        ScanoutRoute::new(render_device_key, kms_device_key)
+    }
+
+    #[test]
+    fn compatibility_accepts_shared_modifier_with_prime_import() {
+        let compatibility = classify_dmabuf_scanout_compatibility(
+            test_route(true),
+            true,
+            true,
+            vec![TILED_A],
+            false,
+            &[TILED_A],
+        );
+        assert!(compatibility.route.is_cross_device());
+        assert!(compatibility.supports_cross_device_attempt());
+        assert_eq!(compatibility.modifiers, vec![TILED_A]);
+        assert_eq!(compatibility.linear, LinearScanoutSupport::None);
+    }
+
+    #[test]
+    fn compatibility_accepts_explicit_linear_path() {
+        let compatibility = classify_dmabuf_scanout_compatibility(
+            test_route(true),
+            true,
+            true,
+            Vec::new(),
+            true,
+            &[LINEAR],
+        );
+        assert!(compatibility.supports_cross_device_attempt());
+        assert_eq!(compatibility.linear, LinearScanoutSupport::ExplicitModifier);
+    }
+
+    #[test]
+    fn compatibility_records_legacy_linear_when_in_formats_is_absent() {
+        let compatibility = classify_dmabuf_scanout_compatibility(
+            test_route(true),
+            true,
+            true,
+            Vec::new(),
+            true,
+            &[],
+        );
+        assert!(compatibility.supports_cross_device_attempt());
+        assert_eq!(compatibility.linear, LinearScanoutSupport::LegacyAddfb);
+    }
+
+    #[test]
+    fn compatibility_requires_sink_prime_import() {
+        let compatibility = classify_dmabuf_scanout_compatibility(
+            test_route(true),
+            true,
+            false,
+            vec![TILED_A],
+            true,
+            &[TILED_A, LINEAR],
+        );
+        assert!(!compatibility.supports_cross_device_attempt());
+    }
+
+    #[test]
+    fn compatibility_requires_verified_vulkan_render_device() {
+        let compatibility = classify_dmabuf_scanout_compatibility(
+            test_route(true),
+            false,
+            true,
+            vec![TILED_A],
+            true,
+            &[TILED_A, LINEAR],
+        );
+        assert!(!compatibility.supports_cross_device_attempt());
+    }
+
+    #[test]
+    fn compatibility_rejects_no_shared_modifier_or_linear_path() {
+        let compatibility = classify_dmabuf_scanout_compatibility(
+            test_route(true),
+            true,
+            true,
+            Vec::new(),
+            true,
+            &[TILED_A],
+        );
+        assert!(!compatibility.supports_cross_device_attempt());
+        assert_eq!(compatibility.linear, LinearScanoutSupport::None);
     }
 
     #[test]

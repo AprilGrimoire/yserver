@@ -447,12 +447,49 @@ impl OutputKey {
     }
 }
 
+/// Device endpoints used to produce and display one scanout buffer.
+///
+/// Both identities use the DRM primary-node key for the GPU. The render
+/// endpoint identifies the Vulkan device that allocates and writes the
+/// dma-buf; the KMS endpoint identifies the DRM device that imports that
+/// dma-buf and presents it on a CRTC. They are equal for ordinary local
+/// scanout and differ for a PRIME output-source route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ScanoutRoute {
+    pub(crate) render_device_key: crate::platform::drm::DrmDeviceKey,
+    pub(crate) kms_device_key: crate::platform::drm::DrmDeviceKey,
+}
+
+impl ScanoutRoute {
+    pub(crate) fn new(
+        render_device_key: crate::platform::drm::DrmDeviceKey,
+        kms_device_key: crate::platform::drm::DrmDeviceKey,
+    ) -> Self {
+        Self {
+            render_device_key,
+            kms_device_key,
+        }
+    }
+
+    pub(crate) fn local(device_key: crate::platform::drm::DrmDeviceKey) -> Self {
+        Self::new(device_key, device_key)
+    }
+
+    pub(crate) fn is_cross_device(self) -> bool {
+        self.render_device_key != self.kms_device_key
+    }
+}
+
 /// A single DRM output and its dedicated swapchain, positioned in the
 /// virtual screen. v2's `PlatformBackend` owns one of these per
 /// discovered output; `fb_w` / `fb_h` describe the virtual-screen
 /// extent.
 pub(crate) struct ActiveOutput {
     pub key: OutputKey,
+    /// The render and KMS devices participating in this output's scanout.
+    /// Kept even when runtime BO allocation fails so topology and later
+    /// compatibility decisions do not have to infer either endpoint.
+    pub scanout_route: ScanoutRoute,
     pub output: crate::platform::drm::Output,
     /// Kept alive for the lifetime of the output to retain initial-
     /// scanout buffer ownership; v2 has its own per-output
@@ -467,17 +504,18 @@ pub(crate) struct ActiveOutput {
 
 impl ActiveOutput {
     pub(crate) fn new(
-        device_key: crate::platform::drm::DrmDeviceKey,
+        scanout_route: ScanoutRoute,
         output: crate::platform::drm::Output,
         swapchain: crate::drm::Swapchain,
         x: i32,
         y: i32,
     ) -> Self {
-        let key = OutputKey::new(device_key, output.connector_name.clone());
+        let key = OutputKey::new(scanout_route.kms_device_key, output.connector_name.clone());
         let width = output.picked.width;
         let height = output.picked.height;
         Self {
             key,
+            scanout_route,
             output,
             swapchain,
             x,
@@ -610,7 +648,13 @@ fn activate_initial_scanout_outputs(
             break;
         }
         let swapchain = drm::Swapchain::with_initial_scanout(buffers, 0);
-        layouts.push(ActiveOutput::new(device_key, output, swapchain, *next_x, 0));
+        layouts.push(ActiveOutput::new(
+            ScanoutRoute::local(device_key),
+            output,
+            swapchain,
+            *next_x,
+            0,
+        ));
         *next_x = (*next_x).saturating_add(i32::from(w));
     }
     if let Some(err) = bring_up_err {

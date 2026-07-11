@@ -50,7 +50,7 @@ use crate::{
     drm,
     kms::{
         backend::{
-            ActiveOutput, OutputKey, PlatformInit, PlatformInitFd,
+            ActiveOutput, OutputKey, PlatformInit, PlatformInitFd, ScanoutRoute,
             platform_init as core_platform_init,
             platform_init_with_fds as core_platform_init_with_fds,
         },
@@ -906,14 +906,23 @@ impl PlatformBackend {
         for (i, layout) in layouts.iter().enumerate() {
             let w = u32::from(layout.width);
             let h = u32::from(layout.height);
-            let Some(primary_drm) = primary_drm.as_ref() else {
+            let Some(kms_device) = devices
+                .iter()
+                .find(|device| device.key == layout.scanout_route.kms_device_key)
+            else {
                 return Err(io::Error::other(
-                    "v2 PlatformBackend: active output exists without a KMS device",
+                    "v2 PlatformBackend: active output route has no KMS device",
                 ));
             };
             match ScanoutBoPool::allocate(
                 Arc::clone(&vk),
-                Rc::clone(primary_drm),
+                Rc::clone(&kms_device.device),
+                layout.scanout_route,
+                vulkan_devices_by_drm
+                    .get(&layout.scanout_route.render_device_key)
+                    .copied()
+                    .flatten()
+                    == Some(vk.physical_device),
                 w,
                 h,
                 3,
@@ -1080,7 +1089,7 @@ impl PlatformBackend {
                 vulkan_physical_device: None,
             }],
             outputs: vec![ActiveOutput::new(
-                device_key,
+                ScanoutRoute::local(device_key),
                 crate::platform::drm::Output {
                     connector: ::drm::control::from_u32(1).unwrap(),
                     connector_name: "test".to_string(),
@@ -2707,6 +2716,11 @@ impl PlatformBackend {
     ) -> io::Result<()> {
         let connector = output.connector_name.clone();
         debug_assert_eq!(connector, output_key.connector_name);
+        let (render_device_key, render_physical_device) = self
+            .primary_device()
+            .map(|device| (device.key, device.vulkan_physical_device))
+            .ok_or_else(|| io::Error::other("no DRM device backs the Vulkan renderer"))?;
+        let scanout_route = ScanoutRoute::new(render_device_key, output_key.device_key);
         let device = self
             .device_for_output(output_key)
             .ok_or_else(|| io::Error::other(format!("no DRM device for output {output_key:?}")))?;
@@ -2803,7 +2817,11 @@ impl PlatformBackend {
         // whether its resolution matches.
         let existing_idx = self.outputs.iter().position(|l| l.key == *output_key);
         let needs_pool_realloc = match existing_idx {
-            Some(idx) => self.outputs[idx].width != w || self.outputs[idx].height != h,
+            Some(idx) => {
+                self.outputs[idx].width != w
+                    || self.outputs[idx].height != h
+                    || self.outputs[idx].scanout_route != scanout_route
+            }
             None => true,
         };
 
@@ -2813,6 +2831,8 @@ impl PlatformBackend {
                 match ScanoutBoPool::allocate(
                     Arc::clone(&vk),
                     Rc::clone(&device.device),
+                    scanout_route,
+                    render_physical_device == Some(vk.physical_device),
                     u32::from(w),
                     u32::from(h),
                     3,
@@ -2896,6 +2916,7 @@ impl PlatformBackend {
         if let Some(idx) = existing_idx {
             // Update in-place.
             self.outputs[idx].output = output;
+            self.outputs[idx].scanout_route = scanout_route;
             self.outputs[idx].x = x;
             self.outputs[idx].y = y;
             self.outputs[idx].width = w;
@@ -2916,7 +2937,7 @@ impl PlatformBackend {
         } else {
             // New output — push to end.
             self.outputs.push(ActiveOutput::new(
-                output_key.device_key,
+                scanout_route,
                 output,
                 drm::Swapchain::empty_for_tests(),
                 x,

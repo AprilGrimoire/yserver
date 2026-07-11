@@ -2062,6 +2062,8 @@ impl KmsBackendV2 {
                         .expect("live-scene fixture has a DRM device")
                         .device,
                 ),
+                layout.scanout_route,
+                false,
                 u32::from(layout.width),
                 u32::from(layout.height),
                 3,
