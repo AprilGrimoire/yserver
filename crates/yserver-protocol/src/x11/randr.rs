@@ -94,6 +94,12 @@ pub const SET_CONFIG_SUCCESS: u8 = 0;
 pub const SET_CONFIG_FAILED: u8 = 3;
 pub const SUBPIXEL_UNKNOWN: u16 = 0;
 pub const CONNECTION_CONNECTED: u8 = 0;
+pub const PROVIDER_CAPABILITY_SOURCE_OUTPUT: u32 = 1 << 0;
+pub const PROVIDER_CAPABILITY_SINK_OUTPUT: u32 = 1 << 1;
+pub const PROVIDER_CAPABILITY_SOURCE_OFFLOAD: u32 = 1 << 2;
+pub const PROVIDER_CAPABILITY_SINK_OFFLOAD: u32 = 1 << 3;
+/// RANDR extension-relative error number (`BadProvider`).
+pub const ERROR_BAD_PROVIDER: u8 = 3;
 
 // ── Local wire helpers (mirrors of wire.rs helpers, private to this module) ──
 
@@ -254,6 +260,26 @@ pub struct SetOutputPrimaryRequest {
     pub output: u32,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct ProviderInfoRequest {
+    pub provider: u32,
+    pub config_timestamp: u32,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct SetProviderOffloadSinkRequest {
+    pub provider: u32,
+    pub sink_provider: u32,
+    pub config_timestamp: u32,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct SetProviderOutputSourceRequest {
+    pub provider: u32,
+    pub source_provider: u32,
+    pub config_timestamp: u32,
+}
+
 // ── Request parsers ───────────────────────────────────────────────────────────
 
 pub fn parse_query_version(body: &[u8]) -> Option<QueryVersionRequest> {
@@ -410,6 +436,42 @@ pub fn parse_set_output_primary_request(body: &[u8]) -> Option<SetOutputPrimaryR
     Some(SetOutputPrimaryRequest {
         window: read_u32_le(body),
         output: read_u32_le(&body[4..]),
+    })
+}
+
+pub fn parse_provider_info_request(body: &[u8]) -> Option<ProviderInfoRequest> {
+    if body.len() < 8 {
+        return None;
+    }
+    Some(ProviderInfoRequest {
+        provider: read_u32_le(body),
+        config_timestamp: read_u32_le(&body[4..]),
+    })
+}
+
+pub fn parse_set_provider_offload_sink_request(
+    body: &[u8],
+) -> Option<SetProviderOffloadSinkRequest> {
+    if body.len() < 12 {
+        return None;
+    }
+    Some(SetProviderOffloadSinkRequest {
+        provider: read_u32_le(body),
+        sink_provider: read_u32_le(&body[4..]),
+        config_timestamp: read_u32_le(&body[8..]),
+    })
+}
+
+pub fn parse_set_provider_output_source_request(
+    body: &[u8],
+) -> Option<SetProviderOutputSourceRequest> {
+    if body.len() < 12 {
+        return None;
+    }
+    Some(SetProviderOutputSourceRequest {
+        provider: read_u32_le(body),
+        source_provider: read_u32_le(&body[4..]),
+        config_timestamp: read_u32_le(&body[8..]),
     })
 }
 
@@ -895,16 +957,80 @@ pub fn encode_get_output_primary_reply(
     out
 }
 
-/// Encodes a `GetProviders` reply (32 bytes) with zero providers.
+/// Encodes a `GetProviders` reply followed by the provider XID array.
 pub fn encode_get_providers_reply(
     byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     timestamp: u32,
+    providers: &[u32],
 ) -> Vec<u8> {
-    let mut out = fixed_reply(byte_order, sequence, 0, 0);
+    #[allow(clippy::cast_possible_truncation)]
+    let mut out = fixed_reply(byte_order, sequence, 0, providers.len() as u32);
     put(byte_order, &mut out, timestamp); // bytes 8-11
-    out.extend_from_slice(&[0u8; 20]); // nProviders=0 + pad
+    #[allow(clippy::cast_possible_truncation)]
+    put(byte_order, &mut out, providers.len() as u16);
+    out.extend_from_slice(&[0u8; 18]);
     debug_assert_eq!(out.len(), 32);
+    for &provider in providers {
+        put(byte_order, &mut out, provider);
+    }
+    out
+}
+
+pub struct ProviderInfoReply<'a> {
+    pub status: u8,
+    pub timestamp: u32,
+    pub capabilities: u32,
+    pub crtcs: &'a [u32],
+    pub outputs: &'a [u32],
+    pub associated_providers: &'a [u32],
+    pub associated_capabilities: &'a [u32],
+    pub name: &'a [u8],
+}
+
+/// Encodes a RANDR 1.4 `GetProviderInfo` reply.
+pub fn encode_get_provider_info_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    info: &ProviderInfoReply<'_>,
+) -> Vec<u8> {
+    debug_assert_eq!(
+        info.associated_providers.len(),
+        info.associated_capabilities.len()
+    );
+    let name_padded = pad4(info.name.len());
+    let extra_bytes = (info.crtcs.len()
+        + info.outputs.len()
+        + info.associated_providers.len()
+        + info.associated_capabilities.len())
+        * 4
+        + name_padded;
+    #[allow(clippy::cast_possible_truncation)]
+    let mut out = fixed_reply(byte_order, sequence, info.status, (extra_bytes / 4) as u32);
+    put(byte_order, &mut out, info.timestamp);
+    put(byte_order, &mut out, info.capabilities);
+    #[allow(clippy::cast_possible_truncation)]
+    put(byte_order, &mut out, info.crtcs.len() as u16);
+    #[allow(clippy::cast_possible_truncation)]
+    put(byte_order, &mut out, info.outputs.len() as u16);
+    #[allow(clippy::cast_possible_truncation)]
+    put(byte_order, &mut out, info.associated_providers.len() as u16);
+    #[allow(clippy::cast_possible_truncation)]
+    put(byte_order, &mut out, info.name.len() as u16);
+    out.extend_from_slice(&[0u8; 8]);
+    debug_assert_eq!(out.len(), 32);
+    for values in [
+        info.crtcs,
+        info.outputs,
+        info.associated_providers,
+        info.associated_capabilities,
+    ] {
+        for &value in values {
+            put(byte_order, &mut out, value);
+        }
+    }
+    out.extend_from_slice(info.name);
+    pad_vec4(&mut out);
     out
 }
 
@@ -1191,6 +1317,43 @@ mod tests {
         assert!(parse_output_request(&[0u8; 7]).is_none());
     }
 
+    #[test]
+    fn parse_provider_requests_round_trip() {
+        let mut info = Vec::new();
+        info.extend_from_slice(&0x11u32.to_le_bytes());
+        info.extend_from_slice(&0x22u32.to_le_bytes());
+        assert_eq!(
+            parse_provider_info_request(&info),
+            Some(ProviderInfoRequest {
+                provider: 0x11,
+                config_timestamp: 0x22,
+            })
+        );
+
+        let mut relationship = info.clone();
+        relationship[4..8].copy_from_slice(&0x33u32.to_le_bytes());
+        relationship.extend_from_slice(&0x44u32.to_le_bytes());
+        assert_eq!(
+            parse_set_provider_offload_sink_request(&relationship),
+            Some(SetProviderOffloadSinkRequest {
+                provider: 0x11,
+                sink_provider: 0x33,
+                config_timestamp: 0x44,
+            })
+        );
+        assert_eq!(
+            parse_set_provider_output_source_request(&relationship),
+            Some(SetProviderOutputSourceRequest {
+                provider: 0x11,
+                source_provider: 0x33,
+                config_timestamp: 0x44,
+            })
+        );
+        assert!(parse_provider_info_request(&info[..7]).is_none());
+        assert!(parse_set_provider_offload_sink_request(&relationship[..11]).is_none());
+        assert!(parse_set_provider_output_source_request(&relationship[..11]).is_none());
+    }
+
     // ── Reply size tests ──────────────────────────────────────────────────────
 
     #[test]
@@ -1322,6 +1485,55 @@ mod tests {
         assert_eq!(&buf[40..44], &3u32.to_le_bytes());
         // name at byte 44
         assert_eq!(&buf[44..51], b"ynest-0");
+    }
+
+    #[test]
+    fn encode_get_providers_reply_lists_provider_xids() {
+        let buf = encode_get_providers_reply(
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(12),
+            99,
+            &[0x10, 0x20],
+        );
+        assert_eq!(buf.len(), 40);
+        assert_eq!(&buf[4..8], &2u32.to_le_bytes());
+        assert_eq!(&buf[8..12], &99u32.to_le_bytes());
+        assert_eq!(&buf[12..14], &2u16.to_le_bytes());
+        assert_eq!(&buf[32..36], &0x10u32.to_le_bytes());
+        assert_eq!(&buf[36..40], &0x20u32.to_le_bytes());
+    }
+
+    #[test]
+    fn encode_get_provider_info_reply_layout() {
+        let buf = encode_get_provider_info_reply(
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(13),
+            &ProviderInfoReply {
+                status: SET_CONFIG_SUCCESS,
+                timestamp: 101,
+                capabilities: PROVIDER_CAPABILITY_SOURCE_OUTPUT | PROVIDER_CAPABILITY_SINK_OFFLOAD,
+                crtcs: &[0x21],
+                outputs: &[0x31, 0x32],
+                associated_providers: &[0x41],
+                associated_capabilities: &[PROVIDER_CAPABILITY_SINK_OUTPUT],
+                name: b"card1",
+            },
+        );
+        // Four CARD32 arrays entries total = 20 bytes; name pads 5 -> 8.
+        assert_eq!(buf.len(), 60);
+        assert_eq!(&buf[4..8], &7u32.to_le_bytes());
+        assert_eq!(&buf[8..12], &101u32.to_le_bytes());
+        assert_eq!(&buf[16..18], &1u16.to_le_bytes());
+        assert_eq!(&buf[18..20], &2u16.to_le_bytes());
+        assert_eq!(&buf[20..22], &1u16.to_le_bytes());
+        assert_eq!(&buf[22..24], &5u16.to_le_bytes());
+        assert_eq!(&buf[32..36], &0x21u32.to_le_bytes());
+        assert_eq!(&buf[36..40], &0x31u32.to_le_bytes());
+        assert_eq!(&buf[40..44], &0x32u32.to_le_bytes());
+        assert_eq!(&buf[44..48], &0x41u32.to_le_bytes());
+        assert_eq!(&buf[48..52], &PROVIDER_CAPABILITY_SINK_OUTPUT.to_le_bytes());
+        assert_eq!(&buf[52..57], b"card1");
+        assert!(buf[57..].iter().all(|byte| *byte == 0));
     }
 
     #[test]

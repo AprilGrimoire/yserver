@@ -34,7 +34,7 @@ use crate::{
 // would then overlap its neighbours.
 const RANDR_MAJOR_OPCODE: u8 = 128;
 const RANDR_FIRST_EVENT: u8 = 89;
-const RANDR_FIRST_ERROR: u8 = 147;
+pub(crate) const RANDR_FIRST_ERROR: u8 = 147;
 
 const RENDER_MAJOR_OPCODE: u8 = 133;
 const RENDER_FIRST_EVENT: u8 = 0;

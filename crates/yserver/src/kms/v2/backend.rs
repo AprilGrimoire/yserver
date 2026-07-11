@@ -3301,6 +3301,48 @@ impl KmsBackendV2 {
         self.randr_outputs_and_modes().0
     }
 
+    /// Project every opened DRM device into a stable RANDR provider.
+    ///
+    /// Provider capabilities intentionally remain zero until a later PRIME
+    /// layer can execute output-source or render-offload transport. The
+    /// provider still owns and reports all connector/CRTC XIDs allocated for
+    /// its device, including currently disconnected connectors.
+    #[must_use]
+    pub fn randr_providers(&mut self) -> Vec<yserver_core::randr::RandrProvider> {
+        use yserver_core::randr::RandrProvider;
+
+        let mut providers = Vec::with_capacity(self.platform.devices.len());
+        for device in &self.platform.devices {
+            let provider_id = self.randr_id_alloc.provider_id_for(device.key);
+            let mut crtcs = Vec::new();
+            let mut outputs = Vec::new();
+            for (key, entry) in self.randr_id_alloc.entries() {
+                if key.device_key != device.key {
+                    continue;
+                }
+                crtcs.push(entry.ids.crtc_id);
+                outputs.push(entry.ids.output_id);
+            }
+            crtcs.sort_unstable();
+            outputs.sort_unstable();
+            let name = std::path::Path::new(device.device.path())
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .unwrap_or_else(|| device.device.path())
+                .to_string();
+            providers.push(RandrProvider {
+                provider_id,
+                name,
+                capabilities: 0,
+                crtcs,
+                outputs,
+                associations: Vec::new(),
+            });
+        }
+        providers.sort_by_key(|provider| provider.provider_id);
+        providers
+    }
+
     /// RandR outputs plus the full deduped mode table.
     #[must_use]
     pub fn randr_outputs_and_modes(
@@ -3532,10 +3574,12 @@ impl KmsBackendV2 {
         );
         let prev_primary = state.randr.primary_output;
         let (outputs, mode_table) = self.randr_outputs_and_modes();
+        let providers = self.randr_providers();
         let new_ts = set_time.unwrap_or(prev_ts);
         let ts_now = state.timestamp_now();
         state.randr =
             yserver_core::randr::RandrState::from_outputs_with_modes(new_ts, outputs, mode_table);
+        state.randr.set_providers(providers);
         // Carry forward the client-set logical size (from_outputs reseeds
         // it to the bbox; that is only correct at boot, where prev_screen
         // already equals the bbox).
@@ -19470,6 +19514,20 @@ mod tests {
         assert_ne!(p0, p1);
         assert_ne!(p0, output.output_id);
         assert_ne!(p0, output.crtc_id);
+    }
+
+    #[test]
+    fn randr_provider_projection_owns_device_connector_ids() {
+        let mut backend = KmsBackendV2::for_tests();
+        let (outputs, _) = backend.randr_outputs_and_modes();
+        let providers = backend.randr_providers();
+
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].name, "null");
+        assert_eq!(providers[0].capabilities, 0);
+        assert_eq!(providers[0].outputs, vec![outputs[0].output_id]);
+        assert_eq!(providers[0].crtcs, vec![outputs[0].crtc_id]);
+        assert!(providers[0].associations.is_empty());
     }
 
     #[test]

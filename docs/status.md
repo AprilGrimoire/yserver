@@ -244,8 +244,8 @@ Cross-cutting bugs and followups that don't fit a stage live in
   the primary DRM device's first output initializes the cursor plane from
   the newly active CRTC set, while an initialization failure latches the
   device to software instead of retrying on every later topology change.
-  Provider wire replies and source/sink offload routing remain the next
-  PRIME layer. Validation: `cargo test -p yserver-core`, `cargo test -p
+  Provider wire replies and source/sink offload routing were left for the
+  following PRIME layer. Validation: `cargo test -p yserver-core`, `cargo test -p
   yserver --lib`, `cargo test --workspace --all-targets`, `cargo
   clippy --all-targets -- -D warnings`, and `cargo +nightly fmt --all
   -- --check`. Live multi-GPU hardware smoke remains pending.
@@ -266,6 +266,20 @@ Cross-cutting bugs and followups that don't fit a stage live in
   selector tests, `cargo test --workspace --all-targets --locked`,
   `cargo clippy --all-targets -- -D warnings`, and `cargo +nightly fmt
   --all -- --check`. Live multi-GPU hardware smoke remains pending.
+- **2026-07-11 RANDR provider topology protocol**: `RandrState` now owns
+  provider descriptors with stable provider XIDs, UTF-8 names, capability
+  masks, device-owned CRTC/output lists, and explicit association records.
+  KMS projects every opened DRM device into that model at startup and on
+  topology rebuilds. RANDR 1.4 `GetProviders` and `GetProviderInfo` now emit
+  complete variable-length replies; provider relationship requests decode and
+  validate provider IDs and capabilities in Xorg order, including the RANDR
+  `BadProvider` extension error. All providers intentionally advertise zero
+  source/sink capability bits, so relationship requests return `BadValue`
+  instead of claiming unsupported cross-GPU transport. Provider properties,
+  DRI3 provider routing, per-provider Vulkan logical devices, and actual
+  source/sink transport remain future work. Validation: focused protocol,
+  core-dispatch, model, and KMS-projection tests plus the full workspace suite
+  and CI-style clippy.
 - **2026-06-08 COW architectural reset**: the active Cinnamon blocker
   is now treated as a structural COW/model bug, not another
   scene-assembly edge case. Replacement design doc:

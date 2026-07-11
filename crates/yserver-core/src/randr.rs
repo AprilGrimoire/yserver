@@ -74,6 +74,47 @@ pub struct RandrMode {
     pub timing: Option<ModeTiming>,
 }
 
+/// One RANDR 1.4 provider exposed to clients.
+///
+/// Providers represent GPU/display devices independently of connectors. A
+/// provider owns the CRTCs and outputs allocated from that device, while
+/// `capabilities` describes which PRIME relationships the backend can
+/// actually service. Advertising no capability is valid and intentionally
+/// prevents clients from configuring transport that the backend cannot yet
+/// execute.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RandrProvider {
+    pub provider_id: u32,
+    /// UTF-8 device/driver name returned by `GetProviderInfo`.
+    pub name: String,
+    /// RANDR `ProviderCapability` bitmask.
+    pub capabilities: u32,
+    /// Device-owned CRTC XIDs.
+    pub crtcs: Vec<u32>,
+    /// Device-owned output XIDs.
+    pub outputs: Vec<u32>,
+    /// Active source/sink relationships visible from this provider.
+    pub associations: Vec<RandrProviderAssociation>,
+}
+
+/// One entry in `GetProviderInfo`'s parallel associated-provider arrays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RandrProviderAssociation {
+    pub provider_id: u32,
+    /// Capability through which the providers are associated.
+    pub capability: u32,
+}
+
+/// Failure from validating a RANDR provider source/sink relationship.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderRelationshipError {
+    /// The XID does not name a live provider (`BadProvider`).
+    UnknownProvider(u32),
+    /// The named provider lacks the capability required by this role
+    /// (`BadValue`).
+    MissingCapability(u32),
+}
+
 #[derive(Debug)]
 pub struct RandrState {
     pub timestamp: u32,
@@ -83,6 +124,8 @@ pub struct RandrState {
     pub modes: Vec<RandrMode>,
     /// Full deduped advertised mode union for `GetScreenResources`.
     pub mode_table: Vec<RandrMode>,
+    /// RANDR 1.4 GPU/provider topology. Empty on fixed nested backends.
+    pub providers: Vec<RandrProvider>,
     /// First output's `output_id` (or 0 if outputs is empty — should
     /// not happen post-init).
     pub primary_output: u32,
@@ -168,12 +211,83 @@ impl RandrState {
             outputs,
             modes,
             mode_table,
+            providers: Vec::new(),
             primary_output,
             screen_width,
             screen_height,
             width_mm,
             height_mm,
         }
+    }
+
+    /// Replace the provider projection while retaining output/screen state.
+    pub fn set_providers(&mut self, mut providers: Vec<RandrProvider>) {
+        providers.sort_by_key(|provider| provider.provider_id);
+        self.providers = providers;
+    }
+
+    /// Look up a provider by its protocol XID.
+    #[must_use]
+    pub fn provider(&self, provider_id: u32) -> Option<&RandrProvider> {
+        self.providers
+            .iter()
+            .find(|provider| provider.provider_id == provider_id)
+    }
+
+    /// Validate `SetProviderOutputSource` in Xorg's order: sink provider
+    /// existence/capability first, then optional source existence/capability.
+    pub fn validate_provider_output_source(
+        &self,
+        provider_id: u32,
+        source_provider_id: u32,
+    ) -> Result<(), ProviderRelationshipError> {
+        let provider = self
+            .provider(provider_id)
+            .ok_or(ProviderRelationshipError::UnknownProvider(provider_id))?;
+        if provider.capabilities & proto::PROVIDER_CAPABILITY_SINK_OUTPUT == 0 {
+            return Err(ProviderRelationshipError::MissingCapability(provider_id));
+        }
+        if source_provider_id == 0 {
+            return Ok(());
+        }
+        let source =
+            self.provider(source_provider_id)
+                .ok_or(ProviderRelationshipError::UnknownProvider(
+                    source_provider_id,
+                ))?;
+        if source.capabilities & proto::PROVIDER_CAPABILITY_SOURCE_OUTPUT == 0 {
+            return Err(ProviderRelationshipError::MissingCapability(
+                source_provider_id,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validate `SetProviderOffloadSink` in Xorg's order: source provider
+    /// existence/capability first, then optional sink existence/capability.
+    pub fn validate_provider_offload_sink(
+        &self,
+        provider_id: u32,
+        sink_provider_id: u32,
+    ) -> Result<(), ProviderRelationshipError> {
+        let provider = self
+            .provider(provider_id)
+            .ok_or(ProviderRelationshipError::UnknownProvider(provider_id))?;
+        if provider.capabilities & proto::PROVIDER_CAPABILITY_SOURCE_OFFLOAD == 0 {
+            return Err(ProviderRelationshipError::MissingCapability(provider_id));
+        }
+        if sink_provider_id == 0 {
+            return Ok(());
+        }
+        let sink = self
+            .provider(sink_provider_id)
+            .ok_or(ProviderRelationshipError::UnknownProvider(sink_provider_id))?;
+        if sink.capabilities & proto::PROVIDER_CAPABILITY_SINK_OFFLOAD == 0 {
+            return Err(ProviderRelationshipError::MissingCapability(
+                sink_provider_id,
+            ));
+        }
+        Ok(())
     }
 
     /// Create a `RandrState` for a nested (embedded) display of the given pixel dimensions.
@@ -529,6 +643,70 @@ pub struct CrtcInfoData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_projection_is_sorted_and_lookupable() {
+        let mut state = RandrState::nested(1, 800, 600);
+        state.set_providers(vec![
+            RandrProvider {
+                provider_id: 20,
+                name: "card1".to_string(),
+                capabilities: proto::PROVIDER_CAPABILITY_SOURCE_OUTPUT,
+                crtcs: vec![4],
+                outputs: vec![3],
+                associations: Vec::new(),
+            },
+            RandrProvider {
+                provider_id: 10,
+                name: "card0".to_string(),
+                capabilities: 0,
+                crtcs: vec![2],
+                outputs: vec![1],
+                associations: Vec::new(),
+            },
+        ]);
+
+        assert_eq!(state.providers[0].provider_id, 10);
+        assert_eq!(
+            state.provider(20).map(|provider| provider.name.as_str()),
+            Some("card1")
+        );
+        assert!(state.provider(99).is_none());
+    }
+
+    #[test]
+    fn provider_relationship_validation_matches_xorg_order() {
+        let mut state = RandrState::nested(1, 800, 600);
+        let provider = |provider_id, capabilities| RandrProvider {
+            provider_id,
+            name: format!("card{provider_id}"),
+            capabilities,
+            crtcs: Vec::new(),
+            outputs: Vec::new(),
+            associations: Vec::new(),
+        };
+        state.set_providers(vec![
+            provider(1, proto::PROVIDER_CAPABILITY_SINK_OUTPUT),
+            provider(2, proto::PROVIDER_CAPABILITY_SOURCE_OUTPUT),
+            provider(3, proto::PROVIDER_CAPABILITY_SOURCE_OFFLOAD),
+            provider(4, proto::PROVIDER_CAPABILITY_SINK_OFFLOAD),
+            provider(5, 0),
+        ]);
+
+        assert_eq!(state.validate_provider_output_source(1, 2), Ok(()));
+        assert_eq!(state.validate_provider_output_source(1, 0), Ok(()));
+        assert_eq!(state.validate_provider_offload_sink(3, 4), Ok(()));
+        assert_eq!(state.validate_provider_offload_sink(3, 0), Ok(()));
+        assert_eq!(
+            state.validate_provider_output_source(5, 99),
+            Err(ProviderRelationshipError::MissingCapability(5)),
+            "primary capability is checked before the optional peer",
+        );
+        assert_eq!(
+            state.validate_provider_offload_sink(99, 4),
+            Err(ProviderRelationshipError::UnknownProvider(99)),
+        );
+    }
 
     #[test]
     fn nested_constructor_dimensions() {
