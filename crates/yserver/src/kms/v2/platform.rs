@@ -1761,10 +1761,26 @@ impl PlatformBackend {
         fds
     }
 
+    fn drm_device_index_for_fd(&self, drm_fd: RawFd) -> Option<usize> {
+        self.devices
+            .iter()
+            .position(|device| device.device.as_fd().as_raw_fd() == drm_fd)
+    }
+
     pub(crate) fn drain_page_flip_events(
         &mut self,
+        drm_fd: RawFd,
     ) -> io::Result<(Vec<usize>, Vec<SequenceCompletion>)> {
         use ::drm::control::crtc;
+
+        let device_index = self.drm_device_index_for_fd(drm_fd).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("page-flip readiness from unknown DRM fd {drm_fd}"),
+            )
+        })?;
+        let device_key = self.devices[device_index].key;
+        let device = Rc::clone(&self.devices[device_index].device);
 
         // Capture the kernel vblank (msc=frame, ust=duration) alongside the
         // CRTC so Present pacing can complete NotifyMSC with real values.
@@ -1775,25 +1791,22 @@ impl PlatformBackend {
             std::time::Duration,
         )> = Vec::new();
         let mut sequenced: Vec<SequenceCompletion> = Vec::new();
-        for device in &self.devices {
-            let device_key = device.key;
-            crate::drm::page_flip::drain_events(
-                &device.device,
-                |c, frame, dur| {
-                    flipped.push((device_key, c, frame, dur));
-                },
-                |crtc_id_raw, time_ns, sequence| {
-                    // Raw kernel values; validation (time_ns sign, crtc_id
-                    // resolution) happens in `on_crtc_sequence_event`.
-                    sequenced.push(SequenceCompletion {
-                        device_key,
-                        crtc_id_raw,
-                        time_ns,
-                        sequence,
-                    });
-                },
-            )?;
-        }
+        crate::drm::page_flip::drain_events(
+            &device,
+            |c, frame, dur| {
+                flipped.push((device_key, c, frame, dur));
+            },
+            |crtc_id_raw, time_ns, sequence| {
+                // Raw kernel values; validation (time_ns sign, crtc_id
+                // resolution) happens in `on_crtc_sequence_event`.
+                sequenced.push(SequenceCompletion {
+                    device_key,
+                    crtc_id_raw,
+                    time_ns,
+                    sequence,
+                });
+            },
+        )?;
 
         let mut output_indices = Vec::with_capacity(flipped.len());
         for (device_key, crtc, frame, dur) in flipped {
@@ -3936,6 +3949,28 @@ mod tests {
             raw1, raw2,
             "the inner epfd is stable across poll_fds() calls"
         );
+    }
+
+    #[test]
+    fn drm_device_fd_lookup_distinguishes_same_kind_poll_sources() {
+        let mut platform = PlatformBackend::for_tests();
+        let first_fd = platform.devices[0].device.as_fd().as_raw_fd();
+        let second_device = Rc::new(drm::Device::for_tests().expect("second test DRM device"));
+        let second_fd = second_device.as_fd().as_raw_fd();
+        platform.devices.push(KmsDevice {
+            key: crate::platform::drm::DrmDeviceKey {
+                major: 226,
+                minor: 1,
+            },
+            device: second_device,
+            render_node: None,
+            vulkan_physical_device: None,
+        });
+
+        assert_ne!(first_fd, second_fd);
+        assert_eq!(platform.drm_device_index_for_fd(first_fd), Some(0));
+        assert_eq!(platform.drm_device_index_for_fd(second_fd), Some(1));
+        assert_eq!(platform.drm_device_index_for_fd(-1), None);
     }
 
     /// Mirrors `descriptor_pool_ring::tests::vk_or_skip` — needed

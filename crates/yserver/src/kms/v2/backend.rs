@@ -11272,7 +11272,7 @@ impl Backend for KmsBackendV2 {
         }
     }
 
-    fn on_page_flip_ready(&mut self, _state: &mut ServerState) {
+    fn on_page_flip_ready(&mut self, _state: &mut ServerState, drm_fd: std::os::fd::RawFd) {
         // Gate: when not Active we have no DRM master; page-flip events
         // are drained (so the fd doesn't stay readable) but no resubmit
         // or flush_submit_group runs. In Direct mode this is always false
@@ -11282,7 +11282,7 @@ impl Backend for KmsBackendV2 {
             // state) but STILL run the sequence handler so the armed-target
             // map clears — leaving a stuck entry across suspend is exactly
             // the permanent-stall failure mode this guards against.
-            if let Ok((_flips, sequences)) = self.platform.drain_page_flip_events() {
+            if let Ok((_flips, sequences)) = self.platform.drain_page_flip_events(drm_fd) {
                 for seq in sequences {
                     self.on_crtc_sequence_event(
                         seq.device_key,
@@ -11295,7 +11295,7 @@ impl Backend for KmsBackendV2 {
             log::debug!("v2 on_page_flip_ready: skipped (seat not Active)");
             return;
         }
-        let (flipped, sequences) = match self.platform.drain_page_flip_events() {
+        let (flipped, sequences) = match self.platform.drain_page_flip_events(drm_fd) {
             Ok(pair) => pair,
             Err(e) => {
                 log::warn!("v2: drain_page_flip_events failed: {e}");

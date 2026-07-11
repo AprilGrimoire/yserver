@@ -155,10 +155,17 @@ pub struct RecordingBackend {
     /// trait surface.
     xid_map: HostXidMap,
     /// E3 liveness counter — incremented every time
-    /// `on_page_flip_ready` is invoked. Tests assert back-to-back
-    /// PageFlipReady dispatches do not get suppressed by the run_core
-    /// dispatch loop.
+    /// `on_page_flip_ready` is invoked.
     pub page_flip_count: std::sync::atomic::AtomicU32,
+    /// Exact DRM fds delivered to `on_page_flip_ready`. Multi-device
+    /// core-loop tests use this to verify same-kind poll sources remain
+    /// distinguishable.
+    pub page_flip_fds: Mutex<Vec<std::os::fd::RawFd>>,
+    /// Stable test-owned fd inventory returned by `poll_fds`.
+    poll_sources: Vec<(std::os::fd::RawFd, crate::backend::BackendFdKind)>,
+    /// Optional test notification sent after a DRM fd is dispatched,
+    /// allowing a test thread to wait without timing-dependent sleeps.
+    page_flip_ready_tx: Option<crossbeam_channel::Sender<std::os::fd::RawFd>>,
     /// Counter — incremented every time `before_block` is invoked. Tests
     /// assert the core loop drives per-iteration reclamation even when no
     /// page-flip ever occurs (project_reclamation_starvation_leak).
@@ -241,6 +248,9 @@ impl RecordingBackend {
             fake_root_visual_xid: 0x0000_0021,
             xid_map: HostXidMap::new(),
             page_flip_count: std::sync::atomic::AtomicU32::new(0),
+            page_flip_fds: Mutex::new(Vec::new()),
+            poll_sources: Vec::new(),
+            page_flip_ready_tx: None,
             before_block_count: std::sync::atomic::AtomicU32::new(0),
             cow_next_release_is_final: false,
             cow_materialized: false,
@@ -263,6 +273,19 @@ impl RecordingBackend {
     #[must_use]
     pub fn with_xkb_rules_names(mut self, names: [String; 5]) -> Self {
         self.xkb_rules_names = Some(names);
+        self
+    }
+
+    /// Configure the backend-owned fds exposed to the core poller and
+    /// a notification channel for observing DRM readiness dispatch.
+    #[must_use]
+    pub fn with_poll_sources(
+        mut self,
+        sources: Vec<(std::os::fd::RawFd, crate::backend::BackendFdKind)>,
+        page_flip_ready_tx: crossbeam_channel::Sender<std::os::fd::RawFd>,
+    ) -> Self {
+        self.poll_sources = sources;
+        self.page_flip_ready_tx = Some(page_flip_ready_tx);
         self
     }
 
@@ -357,9 +380,17 @@ impl Backend for RecordingBackend {
     ) {
     }
 
-    fn on_page_flip_ready(&mut self, _state: &mut crate::server::ServerState) {
+    fn on_page_flip_ready(
+        &mut self,
+        _state: &mut crate::server::ServerState,
+        drm_fd: std::os::fd::RawFd,
+    ) {
         self.page_flip_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.page_flip_fds.lock().unwrap().push(drm_fd);
+        if let Some(tx) = self.page_flip_ready_tx.as_ref() {
+            let _ = tx.send(drm_fd);
+        }
     }
 
     fn set_provider_output_source(
@@ -437,7 +468,7 @@ impl Backend for RecordingBackend {
     }
 
     fn poll_fds(&self) -> Vec<(std::os::fd::RawFd, crate::backend::BackendFdKind)> {
-        Vec::new()
+        self.poll_sources.clone()
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

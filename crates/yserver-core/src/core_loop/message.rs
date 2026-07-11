@@ -156,9 +156,6 @@ pub enum Message {
     /// Host input event (KMS libinput producer, or host-X11 dispatch
     /// after F2).
     HostInput(HostInputEvent),
-    /// DRM completion fd is readable; backend should drain page-flip
-    /// completions and submit the next composite if needed.
-    PageFlipReady,
     /// signalfd readable.
     Shutdown,
     /// SIGUSR1 / VT release on direct-mode backends; diagnostic scanout

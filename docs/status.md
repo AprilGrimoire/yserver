@@ -324,6 +324,18 @@ Cross-cutting bugs and followups that don't fit a stage live in
   render/source card while retaining secondary KMS sink providers. Empty and
   duplicate entries fail explicitly. The singular `YSERVER_DRM_DEVICE` keeps
   its existing one-device-only behavior for compatibility.
+- **2026-07-11 unique backend-fd event routing**: the core poller now assigns a
+  distinct indexed token to every fd returned by `Backend::poll_fds`, retaining
+  both its raw fd and `BackendFdKind` for dispatch. DRM readiness passes the
+  exact fd through `Backend::on_page_flip_ready`, and the KMS backend resolves
+  it to one `KmsDevice` before calling `receive_events()`. This fixes the
+  dual-GPU startup hang where readiness on the AMD scanout fd entered the old
+  all-device drain and then blocked reading an idle NVIDIA fd. The obsolete
+  channel-only `Message::PageFlipReady` path was removed so no identity-less
+  page-flip route remains. Coverage includes token/index round trips, a live
+  two-DRM-fd core-loop routing regression, and KMS device-fd lookup. Validation:
+  `cargo test --workspace --all-targets --locked`, CI-style `cargo clippy
+  --all-targets -- -D warnings`, and `cargo +nightly fmt --all -- --check`.
 - **2026-06-08 COW architectural reset**: the active Cinnamon blocker
   is now treated as a structural COW/model bug, not another
   scene-assembly edge case. Replacement design doc:
