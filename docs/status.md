@@ -318,6 +318,12 @@ Cross-cutting bugs and followups that don't fit a stage live in
   clippy --all-targets -- -D warnings`, and a release build. The current task
   sandbox exposes the host's NVIDIA and AMD PCI devices but not `/dev/dri` or
   seat control, so the live cross-GPU modeset remains the next manual gate.
+- **2026-07-11 ordered multi-device override**: `YSERVER_DRM_DEVICES` now
+  accepts a colon-separated, primary-first list such as
+  `/dev/dri/card1:/dev/dri/card0`. This lets deployments select the Vulkan
+  render/source card while retaining secondary KMS sink providers. Empty and
+  duplicate entries fail explicitly. The singular `YSERVER_DRM_DEVICE` keeps
+  its existing one-device-only behavior for compatibility.
 - **2026-06-08 COW architectural reset**: the active Cinnamon blocker
   is now treated as a structural COW/model bug, not another
   scene-assembly edge case. Replacement design doc:

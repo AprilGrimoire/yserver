@@ -177,17 +177,63 @@ pub(crate) fn discover_outputs(_device: &crate::drm::Device) -> io::Result<Vec<O
 
 /// Resolve the KMS cards yserver should open at startup.
 ///
-/// `YSERVER_DRM_DEVICE` remains an explicit override. Otherwise this
-/// delegates enumeration and node-relationship details to the current
-/// platform implementation, then applies yserver's shared policy:
+/// `YSERVER_DRM_DEVICES` accepts a colon-separated, primary-first device
+/// list. The existing singular `YSERVER_DRM_DEVICE` remains a one-device-only
+/// override for compatibility. Without either override this delegates
+/// enumeration and node-relationship details to the current platform
+/// implementation, then applies yserver's shared policy:
 /// keep only KMS-capable primary nodes and order the returned list with
 /// the primary scanout candidate first. An empty list is a valid headless
 /// result; the KMS backend can still serve X11 clients without scanout.
 pub(crate) fn resolve_default_kms_devices() -> io::Result<Vec<PathBuf>> {
+    if let Ok(explicit) = std::env::var("YSERVER_DRM_DEVICES") {
+        let devices = parse_ordered_kms_devices(&explicit)?;
+        log::info!(
+            "yserver: using ordered DRM device override: {}",
+            devices
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        return Ok(devices);
+    }
     if let Ok(explicit) = std::env::var("YSERVER_DRM_DEVICE") {
         return Ok(vec![PathBuf::from(explicit)]);
     }
     resolve_default_kms_devices_for_system()
+}
+
+fn parse_ordered_kms_devices(spec: &str) -> io::Result<Vec<PathBuf>> {
+    if spec.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "YSERVER_DRM_DEVICES must contain at least one device path",
+        ));
+    }
+
+    let mut devices = Vec::new();
+    for (index, component) in spec.split(':').enumerate() {
+        let component = component.trim();
+        if component.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("YSERVER_DRM_DEVICES contains an empty path at position {index}"),
+            ));
+        }
+        let path = PathBuf::from(component);
+        if devices.contains(&path) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "YSERVER_DRM_DEVICES contains duplicate path {}",
+                    path.display()
+                ),
+            ));
+        }
+        devices.push(path);
+    }
+    Ok(devices)
 }
 
 #[cfg(target_os = "linux")]
@@ -428,6 +474,33 @@ mod tests {
                 PathBuf::from("/mock/primary2"),
             ]
         );
+    }
+
+    #[test]
+    fn ordered_kms_device_override_preserves_primary_first_order() {
+        assert_eq!(
+            parse_ordered_kms_devices("/dev/dri/card1:/dev/dri/card0").unwrap(),
+            vec![
+                PathBuf::from("/dev/dri/card1"),
+                PathBuf::from("/dev/dri/card0"),
+            ]
+        );
+    }
+
+    #[test]
+    fn ordered_kms_device_override_rejects_empty_and_duplicate_paths() {
+        for invalid in [
+            "",
+            ":/dev/dri/card0",
+            "/dev/dri/card0:",
+            "/dev/dri/card1::/dev/dri/card0",
+            "/dev/dri/card1:/dev/dri/card1",
+        ] {
+            assert!(
+                parse_ordered_kms_devices(invalid).is_err(),
+                "invalid override should fail: {invalid:?}"
+            );
+        }
     }
 
     #[test]
