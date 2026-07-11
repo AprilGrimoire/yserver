@@ -2711,8 +2711,7 @@ impl PlatformBackend {
     /// `ActiveOutput` in `self.outputs` and the parallel vecs.
     ///
     /// The `Output` for `connector` must be pre-discovered via
-    /// `discover_outputs`; pass the **full** `Vec<Output>` from a
-    /// fresh discovery call.  The selected `Output` is consumed.
+    /// `discover_outputs`. The selected `Output` is consumed.
     ///
     /// On any failure after pool allocation, the pool is freed and the
     /// output stays off (no partial enable), leaving `self` consistent.
@@ -2782,39 +2781,35 @@ impl PlatformBackend {
             || output.picked.height != mode_spec.height
             || output.picked.vrefresh != mode_spec.vrefresh
         {
-            // Client requested a non-picked mode.  We need to re-derive
-            // the DRM mode for it.  The cleanest safe path: re-run
-            // discover_outputs limited to this connector is expensive;
-            // instead we call get_connector inline to fetch the full
-            // DRM mode list, then match by (width, height, vrefresh).
+            // Client requested a non-picked mode. Fetch the full DRM mode
+            // list through the typed connector handle already carried by
+            // `Output`; connector display names are protocol/UI data and
+            // are not DRM object identity (e.g. Xorg `HDMI-1` versus
+            // drm-rs `HDMI-A-1`).
             use ::drm::control::Device as ControlDevice;
-            let resources = device.device.resource_handles().map_err(|e| {
-                io::Error::other(format!("enable_connector: resource_handles failed: {e}"))
-            })?;
-            let mut drm_mode_opt: Option<::drm::control::Mode> = None;
-            'outer: for &handle in resources.connectors() {
-                let info = match device.device.get_connector(handle, false) {
-                    Ok(i) => i,
-                    Err(_) => continue,
-                };
-                if format!("{info}") != connector {
-                    continue;
-                }
-                for m in info.modes() {
-                    let (w, h) = m.size();
-                    if w == mode_spec.width
-                        && h == mode_spec.height
-                        && m.vrefresh() == mode_spec.vrefresh
-                    {
-                        drm_mode_opt = Some(*m);
-                        break 'outer;
-                    }
-                }
-            }
+            let connector_info = device
+                .device
+                .get_connector(output.connector, false)
+                .map_err(|e| {
+                    io::Error::new(
+                        e.kind(),
+                        format!(
+                            "connector {connector} ({:?}): get_connector failed: {e}",
+                            output.connector
+                        ),
+                    )
+                })?;
+            let drm_mode_opt = connector_info.modes().iter().find_map(|mode| {
+                let (width, height) = mode.size();
+                (width == mode_spec.width
+                    && height == mode_spec.height
+                    && mode.vrefresh() == mode_spec.vrefresh)
+                    .then_some(*mode)
+            });
             let drm_mode = drm_mode_opt.ok_or_else(|| {
                 io::Error::other(format!(
-                    "connector {connector}: DRM mode {}×{}@{} not found via kernel",
-                    mode_spec.width, mode_spec.height, mode_spec.vrefresh
+                    "connector {connector} ({:?}): DRM mode {}×{}@{} not found via kernel",
+                    output.connector, mode_spec.width, mode_spec.height, mode_spec.vrefresh
                 ))
             })?;
             output.mode = drm_mode;

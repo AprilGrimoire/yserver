@@ -336,6 +336,14 @@ Cross-cutting bugs and followups that don't fit a stage live in
   two-DRM-fd core-loop routing regression, and KMS device-fd lookup. Validation:
   `cargo test --workspace --all-targets --locked`, CI-style `cargo clippy
   --all-targets -- -D warnings`, and `cargo +nightly fmt --all -- --check`.
+- **2026-07-11 connector-handle mode resolution**: RANDR mode changes now use
+  the discovered output's typed DRM `connector::Handle` to retrieve kernel
+  modes instead of re-enumerating connectors and comparing display names.
+  This fixes non-preferred modes on HDMI, where RANDR/Xorg exposes `HDMI-1`
+  while drm-rs formats the same connector as `HDMI-A-1`. Protocol-facing
+  names remain unchanged; DRM operations use kernel object identity.
+  Validation: focused KMS platform tests, `cargo test --workspace
+  --all-targets --locked`, CI-style clippy, and a release build.
 - **2026-06-08 COW architectural reset**: the active Cinnamon blocker
   is now treated as a structural COW/model bug, not another
   scene-assembly edge case. Replacement design doc:
