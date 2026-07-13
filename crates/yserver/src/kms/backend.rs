@@ -210,7 +210,7 @@ mod tests {
             .expect("missing DRM paths should produce a headless platform");
 
         assert!(init.devices.is_empty());
-        assert!(init.layouts.is_empty());
+        assert!(init.active_outputs.is_empty());
         assert_eq!((init.fb_w, init.fb_h), (0, 0));
     }
 
@@ -220,7 +220,7 @@ mod tests {
             .expect("an empty DRM device list should produce a headless platform");
 
         assert!(init.devices.is_empty());
-        assert!(init.layouts.is_empty());
+        assert!(init.active_outputs.is_empty());
         assert_eq!((init.fb_w, init.fb_h), (0, 0));
     }
 }
@@ -450,9 +450,9 @@ impl OutputKey {
 /// Device endpoints used to produce and display one scanout buffer.
 ///
 /// Both identities use the DRM primary-node key for the GPU. The render
-/// endpoint identifies the Vulkan device that allocates and writes the
-/// dma-buf; the KMS endpoint identifies the DRM device that imports that
-/// dma-buf and presents it on a CRTC. They are equal for ordinary local
+/// endpoint identifies the Vulkan device that writes the image; the KMS
+/// endpoint identifies the DRM device that presents it on a CRTC. Either
+/// endpoint may own the shared allocation. They are equal for ordinary local
 /// scanout and differ for a PRIME output-source route.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ScanoutRoute {
@@ -576,7 +576,7 @@ pub(crate) struct PlatformInitFd {
 /// No `PlatformInit` is retained after backend construction succeeds.
 pub(crate) struct PlatformInit {
     pub(crate) devices: Vec<PlatformInitDevice>,
-    pub(crate) layouts: Vec<ActiveOutput>,
+    pub(crate) active_outputs: Vec<ActiveOutput>,
     pub(crate) fb_w: u16,
     pub(crate) fb_h: u16,
     pub(crate) input_ctx: Option<crate::input::SendContext>,
@@ -622,7 +622,7 @@ fn activate_initial_scanout_outputs(
     ) -> io::Result<()>,
 ) -> io::Result<Vec<ActiveOutput>> {
     let outputs = crate::platform::drm::discover_outputs(device)?;
-    let mut layouts: Vec<ActiveOutput> = Vec::with_capacity(outputs.len());
+    let mut active_outputs: Vec<ActiveOutput> = Vec::with_capacity(outputs.len());
     let mut bring_up_err: Option<io::Error> = None;
     for output in outputs {
         let w = output.picked.width;
@@ -630,7 +630,7 @@ fn activate_initial_scanout_outputs(
         let mut buffers = Vec::with_capacity(2);
         let mut buffer_err: Option<io::Error> = None;
         for _ in 0..2 {
-            match drm::Buffer::new(Rc::clone(device), w, h) {
+            match drm::DumbBuffer::new(Rc::clone(device), w, h) {
                 Ok(b) => buffers.push(b),
                 Err(e) => {
                     buffer_err = Some(e);
@@ -648,7 +648,7 @@ fn activate_initial_scanout_outputs(
             break;
         }
         let swapchain = drm::Swapchain::with_initial_scanout(buffers, 0);
-        layouts.push(ActiveOutput::new(
+        active_outputs.push(ActiveOutput::new(
             ScanoutRoute::local(device_key),
             output,
             swapchain,
@@ -658,12 +658,12 @@ fn activate_initial_scanout_outputs(
         *next_x = (*next_x).saturating_add(i32::from(w));
     }
     if let Some(err) = bring_up_err {
-        for done in layouts.iter().rev() {
+        for done in active_outputs.iter().rev() {
             let _ = drm::modeset::disable_output(device, &done.output);
         }
         return Err(err);
     }
-    Ok(layouts)
+    Ok(active_outputs)
 }
 
 /// Shared DRM / outputs / libinput bring-up for the v1 and v2
@@ -692,7 +692,7 @@ pub(crate) fn platform_init(
     ) -> io::Result<()>,
 ) -> io::Result<PlatformInit> {
     let mut devices: Vec<PlatformInitDevice> = Vec::with_capacity(device_paths.len());
-    let mut layouts: Vec<ActiveOutput> = Vec::new();
+    let mut active_outputs: Vec<ActiveOutput> = Vec::new();
     let mut next_x: i32 = 0;
     let mut open_errors: Vec<String> = Vec::new();
     for device_path in device_paths {
@@ -713,7 +713,8 @@ pub(crate) fn platform_init(
         let device_key = primary_node.key;
         let render_node = render_node_for_device(&device_path_str, &device);
         if devices.is_empty() {
-            layouts = activate_initial_scanout_outputs(device_key, &device, &mut next_x, commit)?;
+            active_outputs =
+                activate_initial_scanout_outputs(device_key, &device, &mut next_x, commit)?;
         } else {
             log::info!(
                 "yserver: opened secondary KMS device {} as provider/topology data; \
@@ -739,14 +740,14 @@ pub(crate) fn platform_init(
     }
 
     // fb_w / fb_h carry the virtual-screen extent. Saturating
-    // cast: huge layouts that exceed u16 are clamped — the rest
+    // cast: huge output arrangements that exceed u16 are clamped — the rest
     // of the backend assumes u16 framebuffer dims.
-    let fb_w: u16 = layouts
+    let fb_w: u16 = active_outputs
         .iter()
         .map(|l| u16::try_from(l.x.saturating_add(i32::from(l.width))).unwrap_or(u16::MAX))
         .max()
         .unwrap_or(0);
-    let fb_h: u16 = layouts
+    let fb_h: u16 = active_outputs
         .iter()
         .map(|l| u16::try_from(l.y.saturating_add(i32::from(l.height))).unwrap_or(u16::MAX))
         .max()
@@ -762,7 +763,7 @@ pub(crate) fn platform_init(
 
     Ok(PlatformInit {
         devices,
-        layouts,
+        active_outputs,
         fb_w,
         fb_h,
         input_ctx,
@@ -795,7 +796,7 @@ pub(crate) fn platform_init_with_fds(
     ) -> io::Result<()>,
 ) -> io::Result<PlatformInit> {
     let mut devices: Vec<PlatformInitDevice> = Vec::with_capacity(device_fds.len());
-    let mut layouts: Vec<ActiveOutput> = Vec::new();
+    let mut active_outputs: Vec<ActiveOutput> = Vec::new();
     let mut next_x: i32 = 0;
     for init_fd in device_fds {
         let device_path_str = init_fd.path.to_string_lossy().into_owned();
@@ -809,7 +810,8 @@ pub(crate) fn platform_init_with_fds(
         let device_key = primary_node.key;
         let render_node = render_node_for_device(&device_path_str, &device);
         if devices.is_empty() {
-            layouts = activate_initial_scanout_outputs(device_key, &device, &mut next_x, commit)?;
+            active_outputs =
+                activate_initial_scanout_outputs(device_key, &device, &mut next_x, commit)?;
         } else {
             log::info!(
                 "yserver: opened secondary KMS device {} via seat as provider/topology data; \
@@ -824,12 +826,12 @@ pub(crate) fn platform_init_with_fds(
         });
     }
 
-    let fb_w: u16 = layouts
+    let fb_w: u16 = active_outputs
         .iter()
         .map(|l| u16::try_from(l.x.saturating_add(i32::from(l.width))).unwrap_or(u16::MAX))
         .max()
         .unwrap_or(0);
-    let fb_h: u16 = layouts
+    let fb_h: u16 = active_outputs
         .iter()
         .map(|l| u16::try_from(l.y.saturating_add(i32::from(l.height))).unwrap_or(u16::MAX))
         .max()
@@ -839,7 +841,7 @@ pub(crate) fn platform_init_with_fds(
     // Context::new_libseat (caller's responsibility). No SendContext here.
     Ok(PlatformInit {
         devices,
-        layouts,
+        active_outputs,
         fb_w,
         fb_h,
         input_ctx: None,

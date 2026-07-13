@@ -1,9 +1,9 @@
 //! Swapchain — produce/scanout state machine.
 //!
 //! Pure logic in [`SwapState`]; the buffer-owning [`Swapchain`] composes a
-//! `SwapState` with a `Vec<Buffer>` and delegates state transitions.
+//! `SwapState` with a `Vec<DumbBuffer>` and delegates state transitions.
 
-use crate::drm::Buffer;
+use crate::drm::DumbBuffer;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BufferState {
@@ -109,7 +109,7 @@ impl SwapState {
 }
 
 pub struct Swapchain {
-    buffers: Vec<Buffer>,
+    buffers: Vec<DumbBuffer>,
     state: SwapState,
 }
 
@@ -117,7 +117,7 @@ impl Swapchain {
     /// Disarm every buffer in this swapchain so its `Drop` becomes
     /// a no-op. **Only valid at final process exit.** Called from
     /// the shutdown path when atomic `disable_output` failed for
-    /// this output — see `Buffer::disarm` doc.
+    /// this output — see `DumbBuffer::disarm` doc.
     pub fn disarm(&mut self) {
         for buf in &mut self.buffers {
             buf.disarm();
@@ -135,7 +135,7 @@ impl Swapchain {
         }
     }
 
-    pub fn with_initial_scanout(buffers: Vec<Buffer>, scanout_idx: usize) -> Self {
+    pub fn with_initial_scanout(buffers: Vec<DumbBuffer>, scanout_idx: usize) -> Self {
         let n = buffers.len();
         Self {
             buffers,
@@ -143,15 +143,15 @@ impl Swapchain {
         }
     }
 
-    pub fn buffer(&self, idx: usize) -> &Buffer {
+    pub fn buffer(&self, idx: usize) -> &DumbBuffer {
         &self.buffers[idx]
     }
 
-    pub fn buffer_mut(&mut self, idx: usize) -> &mut Buffer {
+    pub fn buffer_mut(&mut self, idx: usize) -> &mut DumbBuffer {
         &mut self.buffers[idx]
     }
 
-    pub fn acquire(&mut self) -> Option<&mut Buffer> {
+    pub fn acquire(&mut self) -> Option<&mut DumbBuffer> {
         let idx = self.state.acquire()?;
         Some(&mut self.buffers[idx])
     }

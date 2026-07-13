@@ -283,41 +283,34 @@ Cross-cutting bugs and followups that don't fit a stage live in
 - **2026-07-11 device-qualified scanout routes and dma-buf probing**:
   every active output now records both the DRM device backing the Vulkan
   renderer and the DRM/KMS device presenting the buffer; each live scanout BO
-  pool retains the same route. Before a cross-device pool can allocate, yserver
-  performs a metadata-only compatibility probe over the sink's
-  `DRM_CAP_PRIME` import bit, its primary-plane `IN_FORMATS` modifiers, and the
-  renderer's Vulkan/DRM identity and single-plane dma-buf export properties.
-  Probe conclusions are tri-state: `Compatible` constrains allocation to the
-  advertised paths, `Incompatible` is reserved for conclusive blockers, and
-  `Unknown` preserves the historical broad allocation attempt so missing or
-  incomplete driver metadata cannot suppress the authoritative
-  `PRIME_FD_TO_HANDLE`/`addfb2` result. No probe exports or imports a dma-buf,
-  and successful metadata probing is not treated as proof that a later import
-  ioctl will succeed. Local same-device scanout retains its established
-  modifier and legacy-linear fallbacks. That groundwork left RANDR provider
-  capabilities at zero and activated no provider relationship; the following
-  layer makes the route client-configurable.
+  pool retains the same route. The initial tri-state metadata probe combined
+  PRIME capability bits, plane modifiers, and Vulkan external-memory
+  properties, but hardware testing confirmed that advertised metadata cannot
+  prove that an actual foreign allocation is renderable or scannable. Route
+  selection therefore no longer treats that metadata as authoritative; the
+  real-operation probes described below decide between allocation directions.
+  Local same-device scanout retains its established modifier and legacy-linear
+  fallbacks.
 - **2026-07-11 PRIME Output Source hardware path**: the first opened KMS
   device, which owns yserver's current Vulkan renderer, now advertises RANDR
   `SourceOutput`; each secondary KMS device advertises `SinkOutput`.
-  `SetProviderOutputSource` attaches or detaches a secondary provider and
-  `GetProviderInfo` reports the relationship from both sides with Xorg's
-  source/sink association capabilities. Secondary-device CRTCs cannot be
-  enabled until their provider is attached to the render provider. Once
-  attached, enabling an output allocates its device-qualified scanout pool
-  through the existing tri-state dma-buf probe: conclusive incompatibility
-  fails before allocation, while incomplete metadata reaches the real Vulkan
-  export plus KMS PRIME import/addfb attempt. Detaching a provider with active
-  outputs is rejected so an established route cannot silently outlive its
-  RANDR policy. This is deliberately the first hardware-testable PRIME level:
-  one Vulkan render provider can source multiple secondary display providers,
-  but arbitrary render-provider selection, render offload, per-provider Vulkan
-  logical devices, provider properties, and automatic output migration
-  remain unimplemented. Validation: focused RANDR wire/fanout and KMS policy
-  tests, `cargo test --workspace --all-targets --locked`, CI-style `cargo
-  clippy --all-targets -- -D warnings`, and a release build. The current task
-  sandbox exposes the host's NVIDIA and AMD PCI devices but not `/dev/dri` or
-  seat control, so the live cross-GPU modeset remains the next manual gate.
+  Startup automatically associates every secondary output provider with that
+  render provider; `SetProviderOutputSource` remains available as an explicit
+  override, and `GetProviderInfo` reports each relationship from both sides
+  with Xorg's source/sink association capabilities. Cross-device output enable
+  no longer trusts a separate compatibility verdict. It probes Output-owned
+  first and Renderer-owned second using a disposable Vulkan logical device.
+  Each candidate allocates a full three-BO pool, validates every framebuffer
+  with an atomic `TEST_ONLY` modeset, and completes a real color-attachment
+  clear on every BO. A failed or device-lost probe cannot poison the live
+  renderer. The selected direction is then allocated on the live renderer,
+  every real framebuffer is tested again, and only then is the first
+  state-changing modeset committed. This remains a copy-free path: the two
+  directions differ only in which device allocates the DMA-BUF. Local outputs
+  retain Renderer-owned allocation. Detaching a provider with active outputs
+  is rejected so an established route cannot silently outlive its RANDR
+  policy. Arbitrary render-provider selection, render offload, provider
+  properties, and automatic output layout remain unimplemented.
 - **2026-07-11 ordered multi-device override**: `YSERVER_DRM_DEVICES` now
   accepts a colon-separated, primary-first list such as
   `/dev/dri/card1:/dev/dri/card0`. This lets deployments select the Vulkan

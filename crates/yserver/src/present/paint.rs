@@ -4,7 +4,7 @@
 //! because it's about to be deleted in C.
 
 use crate::{
-    drm::Buffer,
+    drm::DumbBuffer,
     present::state::{CURSOR_SIZE, RECT_SIZE, State},
 };
 
@@ -12,7 +12,7 @@ const BACKGROUND: u32 = 0x0020_2020;
 const MAGENTA: u32 = 0x00FF_0080;
 const WHITE: u32 = 0x00FF_FFFF;
 
-pub fn paint(state: &State, buffer: &mut Buffer) {
+pub fn paint(state: &State, buffer: &mut DumbBuffer) {
     let width = u32::from(buffer.width());
     let height = u32::from(buffer.height());
     let stride_words = (buffer.stride() / 4) as usize;

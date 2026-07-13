@@ -61,7 +61,7 @@ use crate::{
         vk::{
             device::VkContext,
             ops::OpsCommandPool,
-            scanout::{BoPhase, BoState, ScanoutBoPool},
+            scanout::{BoPhase, BoState, ScanoutAllocationPlan, ScanoutBoPool, ScanoutOwnership},
         },
     },
 };
@@ -530,10 +530,6 @@ pub(crate) struct KmsDevice {
     pub(crate) key: crate::platform::drm::DrmDeviceKey,
     pub(crate) device: Rc<drm::Device>,
     pub(crate) render_node: Option<crate::kms::render_node::OpenedRenderNode>,
-    /// Physical device from `VkContext::instance` whose
-    /// `VK_EXT_physical_device_drm` identity matches this DRM device.
-    /// `None` when the Vulkan implementation does not expose a match.
-    pub(crate) vulkan_physical_device: Option<vk::PhysicalDevice>,
 }
 
 /// v2's real DRM/Vk/libinput owner. Replaces the flat field set
@@ -719,6 +715,197 @@ pub(crate) fn recompute_fb_extent_from(layouts: &[(i32, i32, u16, u16)]) -> (u16
     (fb_w, fb_h)
 }
 
+fn scanout_ownership_order(route: ScanoutRoute) -> &'static [ScanoutOwnership] {
+    if route.is_cross_device() {
+        &[ScanoutOwnership::Output, ScanoutOwnership::Renderer]
+    } else {
+        &[ScanoutOwnership::Renderer]
+    }
+}
+
+const SCANOUT_POOL_DEPTH: usize = 3;
+const PRIME_RENDER_PROBE_TIMEOUT_NS: u64 = 5_000_000_000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProbedScanoutSetup {
+    OutputOwned,
+    RendererOwned(ScanoutAllocationPlan),
+}
+
+impl ProbedScanoutSetup {
+    fn allocate_pool(
+        self,
+        vk: Arc<VkContext>,
+        scanout_device: Rc<drm::Device>,
+        route: ScanoutRoute,
+        width: u16,
+        height: u16,
+    ) -> io::Result<ScanoutBoPool> {
+        match self {
+            Self::OutputOwned => ScanoutBoPool::allocate_output_owned(
+                vk,
+                scanout_device,
+                route,
+                u32::from(width),
+                u32::from(height),
+                SCANOUT_POOL_DEPTH,
+            ),
+            Self::RendererOwned(plan) => ScanoutBoPool::allocate_renderer_owned_with_plan(
+                vk,
+                scanout_device,
+                route,
+                u32::from(width),
+                u32::from(height),
+                SCANOUT_POOL_DEPTH,
+                plan,
+            ),
+        }
+    }
+}
+
+fn allocate_scanout_pool(
+    ownership: ScanoutOwnership,
+    vk: Arc<VkContext>,
+    scanout_device: Rc<drm::Device>,
+    route: ScanoutRoute,
+    width: u16,
+    height: u16,
+    scanout_modifiers: &[u64],
+) -> io::Result<ScanoutBoPool> {
+    match ownership {
+        ScanoutOwnership::Output => ScanoutBoPool::allocate_output_owned(
+            vk,
+            scanout_device,
+            route,
+            u32::from(width),
+            u32::from(height),
+            SCANOUT_POOL_DEPTH,
+        ),
+        ScanoutOwnership::Renderer => ScanoutBoPool::allocate_renderer_owned(
+            vk,
+            scanout_device,
+            route,
+            u32::from(width),
+            u32::from(height),
+            SCANOUT_POOL_DEPTH,
+            scanout_modifiers,
+        ),
+    }
+}
+
+fn test_scanout_pool(
+    scanout_device: &drm::Device,
+    output: &crate::platform::drm::Output,
+    pool: &ScanoutBoPool,
+) -> io::Result<()> {
+    for (index, bo) in pool.bos.iter().enumerate() {
+        let framebuffer = bo.fb_handle.ok_or_else(|| {
+            io::Error::other(format!("scanout pool BO {index} has no framebuffer"))
+        })?;
+        crate::drm::modeset::test_modeset(scanout_device, output, framebuffer).map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!("scanout pool BO {index} atomic TEST_ONLY failed: {err}"),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn select_renderer_owned_plan(
+    plans: impl IntoIterator<Item = ScanoutAllocationPlan>,
+    mut validate: impl FnMut(ScanoutAllocationPlan) -> io::Result<()>,
+) -> Result<ScanoutAllocationPlan, Vec<(ScanoutAllocationPlan, io::Error)>> {
+    let mut failures = Vec::new();
+    for plan in plans {
+        match validate(plan) {
+            Ok(()) => return Ok(plan),
+            Err(err) => failures.push((plan, err)),
+        }
+    }
+    Err(failures)
+}
+
+/// Exercise one complete copy-free PRIME allocation direction without using
+/// the backend's live Vulkan logical device.
+///
+/// A successful probe returns the exact allocation setup for which every BO in
+/// a full-size pool can be used as a Vulkan color attachment and accepted by
+/// KMS in a complete atomic `TEST_ONLY` modeset. Renderer-owned probing tests
+/// each modifier/linear registration candidate end to end instead of treating
+/// `addfb2` success as proof of scanout compatibility.
+fn probe_scanout_setup(
+    renderer_device_key: crate::platform::drm::DrmDeviceKey,
+    renderer_render_node_key: Option<crate::platform::drm::DrmDeviceKey>,
+    scanout_device: Rc<drm::Device>,
+    output: &crate::platform::drm::Output,
+    route: ScanoutRoute,
+    ownership: ScanoutOwnership,
+    width: u16,
+    height: u16,
+) -> io::Result<ProbedScanoutSetup> {
+    if ownership == ScanoutOwnership::Output {
+        let probe_vk = VkContext::new_for_drm(renderer_device_key, renderer_render_node_key)
+            .map_err(|err| io::Error::other(format!("disposable Vulkan device: {err}")))?;
+        let probe_pool = ScanoutBoPool::allocate_output_owned(
+            probe_vk,
+            Rc::clone(&scanout_device),
+            route,
+            u32::from(width),
+            u32::from(height),
+            SCANOUT_POOL_DEPTH,
+        )?;
+        test_scanout_pool(&scanout_device, output, &probe_pool)?;
+        probe_pool
+            .probe_renderer_access(PRIME_RENDER_PROBE_TIMEOUT_NS)
+            .inspect_err(|err| {
+                log::error!("PRIME Output-owned rendering probe failed: {err}");
+            })?;
+        return Ok(ProbedScanoutSetup::OutputOwned);
+    }
+
+    let planning_vk = VkContext::new_for_drm(renderer_device_key, renderer_render_node_key)
+        .map_err(|err| io::Error::other(format!("disposable Vulkan device: {err}")))?;
+    let plans = ScanoutBoPool::renderer_owned_plans(&planning_vk, &output.scanout_modifiers);
+    drop(planning_vk);
+
+    let selected = select_renderer_owned_plan(plans, |plan| {
+        let probe_vk = VkContext::new_for_drm(renderer_device_key, renderer_render_node_key)
+            .map_err(|err| io::Error::other(format!("disposable Vulkan device: {err}")))?;
+        let probe_pool = ScanoutBoPool::allocate_renderer_owned_with_plan(
+            probe_vk,
+            Rc::clone(&scanout_device),
+            route,
+            u32::from(width),
+            u32::from(height),
+            SCANOUT_POOL_DEPTH,
+            plan,
+        )
+        .map_err(|err| io::Error::new(err.kind(), format!("allocation: {err}")))?;
+        test_scanout_pool(&scanout_device, output, &probe_pool)
+            .map_err(|err| io::Error::new(err.kind(), format!("TEST_ONLY: {err}")))?;
+        probe_pool
+            .probe_renderer_access(PRIME_RENDER_PROBE_TIMEOUT_NS)
+            .map_err(|err| io::Error::new(err.kind(), format!("rendering: {err}")))
+    })
+    .map_err(|failures| {
+        io::Error::other(format!(
+            "every renderer-owned candidate failed: {}",
+            failures
+                .into_iter()
+                .map(|(plan, err)| format!("{} {err}", plan.describe()))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ))
+    })?;
+
+    log::info!(
+        "PRIME Renderer-owned candidate {} succeeded",
+        selected.describe()
+    );
+    Ok(ProbedScanoutSetup::RendererOwned(selected))
+}
+
 impl PlatformBackend {
     /// Libseat-mode constructor. Accepts seat-provided card fds via
     /// [`core_platform_init_with_fds`]; all other bring-up is identical to
@@ -767,14 +954,14 @@ impl PlatformBackend {
     fn from_platform_init(platform_init: PlatformInit) -> io::Result<Self> {
         let PlatformInit {
             devices,
-            layouts,
+            active_outputs,
             fb_w,
             fb_h,
             input_ctx,
         } = platform_init;
         // Startup activates outputs only on the primary scanout device.
         // Later RANDR requests may allocate pools on secondary devices via
-        // `enable_connector`. With no KMS devices there are no layouts, so
+        // `enable_connector`. With no KMS devices there are no active outputs, so
         // scanout/cursor allocation is skipped while the Vulkan-backed X11
         // core remains available.
         let primary_device_key = devices.first().map(|device| device.key);
@@ -804,42 +991,6 @@ impl PlatformBackend {
             vk.device_type,
         );
 
-        let mut vulkan_devices_by_drm = HashMap::with_capacity(devices.len());
-        for device in &devices {
-            let render_node_key = device
-                .render_node
-                .as_ref()
-                .map(|render_node| render_node.key());
-            let physical_device = vk
-                .physical_device_for_drm(device.key, render_node_key)
-                .map_err(|e| {
-                    io::Error::other(format!(
-                        "v2 PlatformBackend: ambiguous Vulkan mapping for DRM device {}: {e}",
-                        device.key
-                    ))
-                })?;
-            match physical_device {
-                Some(physical_device) => log::info!(
-                    "v2 PlatformBackend: DRM primary {} render {:?} maps to Vulkan physical device {:?}",
-                    device.key,
-                    render_node_key,
-                    physical_device,
-                ),
-                None if vk.drm_physical_devices.is_empty() => log::warn!(
-                    "v2 PlatformBackend: Vulkan exposes no VK_EXT_physical_device_drm identities; \
-                     DRM primary {} render {:?} has no explicit Vulkan mapping",
-                    device.key,
-                    render_node_key,
-                ),
-                None => log::warn!(
-                    "v2 PlatformBackend: no Vulkan physical device matches DRM primary {} render {:?}",
-                    device.key,
-                    render_node_key,
-                ),
-            }
-            vulkan_devices_by_drm.insert(device.key, physical_device);
-        }
-
         // Refuse to drive real KMS scanout off a software rasterizer.
         // If the only Vulkan device is llvmpipe/lavapipe (CPU type) —
         // typically because the GPU's hardware Vulkan driver is missing
@@ -851,16 +1002,16 @@ impl PlatformBackend {
         // Venus (virtio-gpu) reports VIRTUAL_GPU, not CPU, so it is not
         // affected; the env override exists for any deliberate
         // software-scanout setup (e.g. lavapipe under vng).
-        if !layouts.is_empty()
+        if !active_outputs.is_empty()
             && vk.is_software_rasterizer()
             && std::env::var_os("YSERVER_ALLOW_SOFTWARE_VULKAN").is_none()
         {
-            for layout in layouts.iter().rev() {
+            for active_output in active_outputs.iter().rev() {
                 if let Some(device) = devices
                     .iter()
-                    .find(|device| device.key == layout.key.device_key)
+                    .find(|device| device.key == active_output.key.device_key)
                 {
-                    let _ = drm::modeset::disable_output(&device.device, &layout.output);
+                    let _ = drm::modeset::disable_output(&device.device, &active_output.output);
                 }
             }
             return Err(io::Error::other(format!(
@@ -874,7 +1025,7 @@ impl PlatformBackend {
                 vk.driver_id,
             )));
         }
-        if layouts.is_empty() && vk.is_software_rasterizer() {
+        if active_outputs.is_empty() && vk.is_software_rasterizer() {
             log::info!(
                 "v2 PlatformBackend: using software Vulkan for headless rendering; no KMS outputs are active"
             );
@@ -901,31 +1052,27 @@ impl PlatformBackend {
         };
 
         // One ScanoutBoPool per output, 3-BO depth (matches v1).
-        let mut scanout_pools = Vec::with_capacity(layouts.len());
-        let mut bo_generations = Vec::with_capacity(layouts.len());
-        for (i, layout) in layouts.iter().enumerate() {
-            let w = u32::from(layout.width);
-            let h = u32::from(layout.height);
+        let mut scanout_pools = Vec::with_capacity(active_outputs.len());
+        let mut bo_generations = Vec::with_capacity(active_outputs.len());
+        for (i, active_output) in active_outputs.iter().enumerate() {
+            let w = u32::from(active_output.width);
+            let h = u32::from(active_output.height);
             let Some(kms_device) = devices
                 .iter()
-                .find(|device| device.key == layout.scanout_route.kms_device_key)
+                .find(|device| device.key == active_output.scanout_route.kms_device_key)
             else {
                 return Err(io::Error::other(
                     "v2 PlatformBackend: active output route has no KMS device",
                 ));
             };
-            match ScanoutBoPool::allocate(
+            match ScanoutBoPool::allocate_renderer_owned(
                 Arc::clone(&vk),
                 Rc::clone(&kms_device.device),
-                layout.scanout_route,
-                vulkan_devices_by_drm
-                    .get(&layout.scanout_route.render_device_key)
-                    .copied()
-                    .flatten(),
+                active_output.scanout_route,
                 w,
                 h,
-                3,
-                &layout.output.scanout_modifiers,
+                SCANOUT_POOL_DEPTH,
+                &active_output.output.scanout_modifiers,
             ) {
                 Ok(pool) => {
                     let n = pool.bos.len();
@@ -944,16 +1091,16 @@ impl PlatformBackend {
                 }
             }
         }
-        let first_pageflip_logged = vec![false; layouts.len()];
+        let first_pageflip_logged = vec![false; active_outputs.len()];
 
         // Stage 5 Phase B — bring up the DRM cursor plane. Failure
         // is non-fatal; v2 falls back to the SW scene cursor path. With
         // zero active outputs there are no CRTCs to bind, so skip the
         // hardware cursor path until a later hotplug/modeset creates one.
-        let crtc_handles: Vec<::drm::control::crtc::Handle> = layouts
+        let crtc_handles: Vec<::drm::control::crtc::Handle> = active_outputs
             .iter()
-            .filter(|layout| Some(layout.key.device_key) == primary_device_key)
-            .map(|layout| layout.output.crtc)
+            .filter(|active_output| Some(active_output.key.device_key) == primary_device_key)
+            .map(|active_output| active_output.output.crtc)
             .collect();
         let (cursor_plane, hw_cursor_disabled) = if crtc_handles.is_empty() {
             log::info!("v2 PlatformBackend: no active CRTCs; hardware cursor init deferred");
@@ -1013,7 +1160,7 @@ impl PlatformBackend {
 
         log::info!(
             "v2 PlatformBackend: ready — {} outputs, fb {}x{}, {} scanout pools live",
-            layouts.len(),
+            active_outputs.len(),
             fb_w,
             fb_h,
             scanout_pools.iter().filter(|p| p.is_some()).count(),
@@ -1025,13 +1172,12 @@ impl PlatformBackend {
                 key: device.key,
                 device: device.device,
                 render_node: device.render_node,
-                vulkan_physical_device: vulkan_devices_by_drm.get(&device.key).copied().flatten(),
             })
             .collect();
 
         Ok(Self {
             devices,
-            outputs: layouts,
+            outputs: active_outputs,
             fb_w,
             fb_h,
             ust_msc: std::collections::HashMap::new(),
@@ -1085,7 +1231,6 @@ impl PlatformBackend {
                 key: device_key,
                 device,
                 render_node: None,
-                vulkan_physical_device: None,
             }],
             outputs: vec![ActiveOutput::new(
                 ScanoutRoute::local(device_key),
@@ -2727,9 +2872,17 @@ impl PlatformBackend {
     ) -> io::Result<()> {
         let connector = output.connector_name.clone();
         debug_assert_eq!(connector, output_key.connector_name);
-        let (render_device_key, render_physical_device) = self
+        let (render_device_key, render_node_key) = self
             .primary_device()
-            .map(|device| (device.key, device.vulkan_physical_device))
+            .map(|device| {
+                (
+                    device.key,
+                    device
+                        .render_node
+                        .as_ref()
+                        .map(|render_node| render_node.key()),
+                )
+            })
             .ok_or_else(|| io::Error::other("no DRM device backs the Vulkan renderer"))?;
         let scanout_route = ScanoutRoute::new(render_device_key, output_key.device_key);
         let device = self
@@ -2832,48 +2985,134 @@ impl PlatformBackend {
             None => true,
         };
 
-        // (Re)allocate the scanout pool if needed.
+        // Build and commit a complete allocation route. Cross-device outputs
+        // try local output-owned scanout first, then retry with the historical
+        // renderer-owned direction. Each direction must first survive both a
+        // full-pool rendering probe on a disposable Vulkan logical device and
+        // atomic TEST_ONLY validation. The actual pool is independently
+        // validated before its state-changing commit. `None` means the
+        // existing pool remains installed; `Some` is a committed replacement.
         let new_pool = if needs_pool_realloc {
-            if let Some(vk) = self.vk.as_ref().cloned() {
-                match ScanoutBoPool::allocate(
-                    Arc::clone(&vk),
-                    Rc::clone(&device.device),
-                    scanout_route,
-                    render_physical_device,
-                    u32::from(w),
-                    u32::from(h),
-                    3,
-                    &output.scanout_modifiers,
-                ) {
-                    Ok(pool) => Some(Some(pool)),
-                    Err(e) => {
+            let vk = self.vk.as_ref().cloned().ok_or_else(|| {
+                io::Error::other(format!(
+                    "enable_connector {connector}: allocating a scanout pool requires Vulkan"
+                ))
+            })?;
+            let mut failures = Vec::new();
+            let mut selected = None;
+            for &ownership in scanout_ownership_order(scanout_route) {
+                let probed_setup = if scanout_route.is_cross_device() {
+                    let setup = match probe_scanout_setup(
+                        render_device_key,
+                        render_node_key,
+                        Rc::clone(&device.device),
+                        &output,
+                        scanout_route,
+                        ownership,
+                        w,
+                        h,
+                    ) {
+                        Ok(setup) => setup,
+                        Err(err) => {
+                            log::warn!(
+                                "v2 enable_connector: {ownership:?}-owned probe for \
+                                 {connector} {w}x{h} failed: {err}"
+                            );
+                            failures.push(format!("{ownership:?}-owned probe: {err}"));
+                            continue;
+                        }
+                    };
+                    log::info!(
+                        "v2 enable_connector: {setup:?} probe for {connector} {w}x{h} succeeded"
+                    );
+                    Some(setup)
+                } else {
+                    None
+                };
+
+                let allocation = match probed_setup {
+                    Some(setup) => setup.allocate_pool(
+                        Arc::clone(&vk),
+                        Rc::clone(&device.device),
+                        scanout_route,
+                        w,
+                        h,
+                    ),
+                    None => allocate_scanout_pool(
+                        ownership,
+                        Arc::clone(&vk),
+                        Rc::clone(&device.device),
+                        scanout_route,
+                        w,
+                        h,
+                        &output.scanout_modifiers,
+                    ),
+                };
+                let mut pool = match allocation {
+                    Ok(pool) => pool,
+                    Err(err) => {
                         log::warn!(
-                            "v2 enable_connector: scanout pool alloc failed for {connector} ({}×{}): {e:?}",
-                            w,
-                            h
+                            "v2 enable_connector: {ownership:?}-owned allocation for \
+                             {connector} {w}x{h} failed: {err}"
                         );
-                        // Pool allocation failed — leave output off,
-                        // return error to caller.
-                        return Err(io::Error::other(format!(
-                            "enable_connector {connector}: scanout pool alloc failed: {e:?}"
-                        )));
+                        failures.push(format!("{ownership:?}-owned allocation: {err}"));
+                        continue;
+                    }
+                };
+                if scanout_route.is_cross_device()
+                    && let Err(err) = test_scanout_pool(&device.device, &output, &pool)
+                {
+                    log::warn!(
+                        "v2 enable_connector: {ownership:?}-owned real-pool TEST_ONLY for \
+                         {connector} {w}x{h} failed: {err}"
+                    );
+                    failures.push(format!("{ownership:?}-owned real-pool TEST_ONLY: {err}"));
+                    continue;
+                }
+                let Some((initial_bo, framebuffer)) = pool
+                    .bos
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, bo)| bo.fb_handle.map(|fb| (index, fb)))
+                else {
+                    failures.push(format!("{ownership:?}-owned pool has no framebuffer"));
+                    continue;
+                };
+                match crate::drm::modeset::commit_modeset(&device.device, &output, framebuffer) {
+                    Ok(()) => {
+                        pool.bos[initial_bo].state.phase = BoPhase::OnScreen;
+                        log::info!(
+                            "v2 enable_connector: selected {ownership:?}-owned scanout for \
+                             {connector} {w}x{h}"
+                        );
+                        selected = Some(pool);
+                        break;
+                    }
+                    Err(err) => {
+                        log::warn!(
+                            "v2 enable_connector: {ownership:?}-owned modeset for \
+                             {connector} {w}x{h} failed: {err}"
+                        );
+                        failures.push(format!("{ownership:?}-owned modeset: {err}"));
                     }
                 }
-            } else {
-                // Test fixture: no Vk; pool stays None.
-                Some(None)
             }
+            Some(selected.ok_or_else(|| {
+                io::Error::other(format!(
+                    "enable_connector {connector}: every scanout ownership failed: {}",
+                    failures.join("; ")
+                ))
+            })?)
         } else {
             None // keep existing pool
         };
+        let modeset_committed = new_pool.is_some();
 
-        // Build an initial fb for the modeset commit.  Pick the
-        // OnScreen BO from the existing pool (if unchanged), or the
-        // first BO in the new pool.  Fall back to a legacy dumb buffer
-        // if nothing is available.
+        // Pick the OnScreen BO from the existing pool (if unchanged), or the
+        // first BO from the replacement pool selected above.
         let fb_id = {
             let pool_ref: Option<&ScanoutBoPool> = if needs_pool_realloc {
-                new_pool.as_ref().and_then(|p| p.as_ref())
+                new_pool.as_ref()
             } else {
                 existing_idx
                     .and_then(|i| self.scanout_pools.get(i))
@@ -2890,24 +3129,16 @@ impl PlatformBackend {
         };
 
         let fb_for_commit = fb_id.ok_or_else(|| {
-            // Free the newly-allocated pool before returning error.
-            // (new_pool would be dropped by going out of scope, which
-            //  is the desired free.)
             io::Error::other(format!(
                 "enable_connector {connector}: no fb handle available for initial modeset"
             ))
-        });
+        })?;
 
-        let fb_for_commit = match fb_for_commit {
-            Ok(fb) => fb,
-            Err(e) => {
-                // new_pool dropped here (freed).
-                return Err(e);
-            }
-        };
-
-        // Commit the modeset.  On failure, pool is freed (dropped below).
-        if let Err(e) = crate::drm::modeset::commit_modeset(&device.device, &output, fb_for_commit)
+        // A newly allocated real pool was committed while selecting its
+        // ownership above. Existing pools still need the ordinary modeset.
+        if !modeset_committed
+            && let Err(e) =
+                crate::drm::modeset::commit_modeset(&device.device, &output, fb_for_commit)
         {
             log::error!(
                 "v2 enable_connector: commit_modeset for {connector} ({}×{}@{}) at ({x},{y}) failed: {e}",
@@ -2930,7 +3161,7 @@ impl PlatformBackend {
             self.outputs[idx].height = h;
             if let Some(pool) = new_pool {
                 if idx < self.scanout_pools.len() {
-                    self.scanout_pools[idx] = pool;
+                    self.scanout_pools[idx] = Some(pool);
                 }
                 if idx < self.bo_generations.len() {
                     self.bo_generations[idx] = self
@@ -2943,6 +3174,11 @@ impl PlatformBackend {
             }
         } else {
             // New output — push to end.
+            let pool = new_pool.ok_or_else(|| {
+                io::Error::other(format!(
+                    "enable_connector {connector}: new output has no replacement scanout pool"
+                ))
+            })?;
             self.outputs.push(ActiveOutput::new(
                 scanout_route,
                 output,
@@ -2950,12 +3186,8 @@ impl PlatformBackend {
                 x,
                 y,
             ));
-            let pool = new_pool.unwrap_or(None);
-            let gens = pool
-                .as_ref()
-                .map(|p| vec![BoGenerationEntry::default(); p.bos.len()])
-                .unwrap_or_default();
-            self.scanout_pools.push(pool);
+            let gens = vec![BoGenerationEntry::default(); pool.bos.len()];
+            self.scanout_pools.push(Some(pool));
             self.bo_generations.push(gens);
             self.first_pageflip_logged.push(false);
         }
@@ -3528,6 +3760,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn renderer_owned_probe_advances_after_incomplete_candidate_failure() {
+        let plans = [
+            ScanoutAllocationPlan::DrmModifier(0),
+            ScanoutAllocationPlan::ExplicitLinear,
+            ScanoutAllocationPlan::LegacyLinear,
+        ];
+        let mut attempted = Vec::new();
+
+        let selected = select_renderer_owned_plan(plans, |plan| {
+            attempted.push(plan);
+            if plan == ScanoutAllocationPlan::LegacyLinear {
+                Ok(())
+            } else {
+                Err(io::Error::other("atomic TEST_ONLY rejected"))
+            }
+        })
+        .expect("legacy fallback should be selected");
+
+        assert_eq!(selected, ScanoutAllocationPlan::LegacyLinear);
+        assert_eq!(attempted, plans);
+    }
+
+    #[test]
     fn crtc_identity_includes_the_drm_device() {
         let crtc = ::drm::control::from_u32(7).unwrap();
         let first = CrtcKey::new(
@@ -3717,6 +3972,26 @@ mod tests {
             (2560i32, 0i32, 2560u16, 1440u16),
         ];
         assert_eq!(super::recompute_fb_extent_from(layouts), (5120, 1440));
+    }
+
+    #[test]
+    fn cross_device_scanout_tries_output_ownership_before_renderer_fallback() {
+        let render = crate::platform::drm::DrmDeviceKey {
+            major: 226,
+            minor: 0,
+        };
+        let output = crate::platform::drm::DrmDeviceKey {
+            major: 226,
+            minor: 1,
+        };
+        assert_eq!(
+            scanout_ownership_order(ScanoutRoute::new(render, output)),
+            &[ScanoutOwnership::Output, ScanoutOwnership::Renderer]
+        );
+        assert_eq!(
+            scanout_ownership_order(ScanoutRoute::local(render)),
+            &[ScanoutOwnership::Renderer]
+        );
     }
 
     #[test]
@@ -3959,7 +4234,6 @@ mod tests {
             },
             device: second_device,
             render_node: None,
-            vulkan_physical_device: None,
         });
 
         assert_ne!(first_fd, second_fd);

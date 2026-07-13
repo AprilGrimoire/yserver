@@ -23,12 +23,6 @@ pub(crate) struct VulkanDrmIdentity {
 /// Non-owning mapping from a DRM identity to a physical-device handle owned by
 /// this context's Vulkan instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct VulkanDrmPhysicalDevice {
-    pub(crate) physical_device: vk::PhysicalDevice,
-    pub(crate) identity: VulkanDrmIdentity,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DrmDeviceSelection {
     primary: DrmDeviceKey,
     render: Option<DrmDeviceKey>,
@@ -48,11 +42,6 @@ pub struct VkContext {
     pub instance: ash::Instance,
     pub debug_utils_instance: ash::ext::debug_utils::Instance,
     pub physical_device: vk::PhysicalDevice,
-    /// Every physical device from this instance that reports
-    /// `VK_EXT_physical_device_drm`, paired with its primary/render nodes.
-    /// This inventory lets the platform map secondary DRM devices without
-    /// creating their logical Vulkan devices yet.
-    pub(crate) drm_physical_devices: Vec<VulkanDrmPhysicalDevice>,
     pub device: ash::Device,
     pub external_semaphore_fd: ash::khr::external_semaphore_fd::Device,
     pub external_memory_fd: Option<ash::khr::external_memory_fd::Device>,
@@ -188,7 +177,7 @@ impl VkContext {
             }
         };
 
-        let (physical_device, graphics_queue_family, drm_physical_devices) =
+        let (physical_device, graphics_queue_family) =
             match pick_physical_device(&instance, requested_drm) {
                 Ok(t) => t,
                 Err(e) => {
@@ -369,7 +358,6 @@ impl VkContext {
             instance,
             debug_utils_instance,
             physical_device,
-            drm_physical_devices,
             device,
             external_semaphore_fd,
             external_memory_fd,
@@ -398,28 +386,6 @@ impl VkContext {
     #[must_use]
     pub fn is_software_rasterizer(&self) -> bool {
         self.device_type == vk::PhysicalDeviceType::CPU
-    }
-
-    /// Resolve a platform DRM device to a Vulkan physical device from this
-    /// instance. `Ok(None)` means that no exact identity was advertised;
-    /// duplicate claims are rejected rather than choosing arbitrarily.
-    pub(crate) fn physical_device_for_drm(
-        &self,
-        primary: DrmDeviceKey,
-        render: Option<DrmDeviceKey>,
-    ) -> Result<Option<vk::PhysicalDevice>, VkInitError> {
-        let requested = DrmDeviceSelection { primary, render };
-        let mut matching = self
-            .drm_physical_devices
-            .iter()
-            .filter(|candidate| drm_identity_matches(candidate.identity, requested));
-        let first = matching.next().map(|candidate| candidate.physical_device);
-        if matching.next().is_some() {
-            return Err(VkInitError::AmbiguousDrmDevice(format_drm_selection(
-                requested,
-            )));
-        }
-        Ok(first)
     }
 }
 
@@ -606,7 +572,7 @@ struct PhysicalDeviceCandidate {
 fn pick_physical_device(
     instance: &ash::Instance,
     requested_drm: Option<DrmDeviceSelection>,
-) -> Result<(vk::PhysicalDevice, u32, Vec<VulkanDrmPhysicalDevice>), VkInitError> {
+) -> Result<(vk::PhysicalDevice, u32), VkInitError> {
     let devices = unsafe { instance.enumerate_physical_devices() }?;
 
     let candidates: Vec<PhysicalDeviceCandidate> = devices
@@ -628,23 +594,11 @@ fn pick_physical_device(
         })
         .collect::<Result<_, VkInitError>>()?;
 
-    let drm_physical_devices = candidates
-        .iter()
-        .filter_map(|candidate| {
-            candidate
-                .drm_identity
-                .map(|identity| VulkanDrmPhysicalDevice {
-                    physical_device: candidate.physical_device,
-                    identity,
-                })
-        })
-        .collect();
-
     let selected = select_physical_device_candidate(&candidates, requested_drm)?;
     let queue_family = selected
         .graphics_queue_family
         .ok_or(VkInitError::NoSuitableDevice)?;
-    Ok((selected.physical_device, queue_family, drm_physical_devices))
+    Ok((selected.physical_device, queue_family))
 }
 
 fn select_physical_device_candidate(

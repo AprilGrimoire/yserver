@@ -19,7 +19,7 @@
 //! the variant in the enum from the start means 4.2 doesn't need to
 //! retrofit a new constructor onto a sealed type.
 
-use std::sync::Arc;
+use std::{os::fd::AsRawFd as _, sync::Arc};
 
 use ash::vk;
 
@@ -288,6 +288,10 @@ impl DrawableImage {
                 vk::Result::ERROR_INITIALIZATION_FAILED,
             ));
         }
+        let external_memory_fd = vk
+            .external_memory_fd
+            .as_ref()
+            .ok_or(vk::Result::ERROR_EXTENSION_NOT_PRESENT)?;
 
         // Use the explicit-modifier path whenever the extension is
         // available — including LINEAR. VK_IMAGE_TILING_LINEAR alone
@@ -352,6 +356,42 @@ impl DrawableImage {
 
         let image = unsafe { vk.device.create_image(&image_info, None)? };
 
+        if !use_explicit_modifier {
+            let layout = unsafe {
+                vk.device.get_image_subresource_layout(
+                    image,
+                    vk::ImageSubresource {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        array_layer: 0,
+                    },
+                )
+            };
+            if plane_offsets.len() != 1
+                || !linear_import_layout_matches(
+                    layout.offset,
+                    layout.row_pitch,
+                    plane_offsets[0],
+                    plane_pitches[0],
+                )
+            {
+                unsafe { vk.device.destroy_image(image, None) };
+                return Err(vk::Result::ERROR_INVALID_EXTERNAL_HANDLE.into());
+            }
+        }
+
+        let mut fd_properties = vk::MemoryFdPropertiesKHR::default();
+        if let Err(err) = unsafe {
+            external_memory_fd.get_memory_fd_properties(
+                vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
+                dma_buf_fd.as_raw_fd(),
+                &mut fd_properties,
+            )
+        } {
+            unsafe { vk.device.destroy_image(image, None) };
+            return Err(err.into());
+        }
+
         // Per design §3.2 fd ownership rule: dup the fd before handing
         // to vkAllocateMemory so that on any vkAllocateMemory failure
         // we can close ours and let the caller's `dma_buf_fd` drop
@@ -375,7 +415,7 @@ impl DrawableImage {
         };
         let memory_type_index = pick_memory_type(
             &mem_props,
-            mem_reqs.memory_type_bits,
+            import_memory_type_bits(mem_reqs.memory_type_bits, fd_properties.memory_type_bits),
             vk::MemoryPropertyFlags::empty(),
         );
         let memory_type_index = match memory_type_index {
@@ -1411,6 +1451,19 @@ fn pick_memory_type(
     })
 }
 
+fn import_memory_type_bits(image_type_bits: u32, dma_buf_type_bits: u32) -> u32 {
+    image_type_bits & dma_buf_type_bits
+}
+
+fn linear_import_layout_matches(
+    image_offset: u64,
+    image_row_pitch: u64,
+    dma_buf_offset: u64,
+    dma_buf_pitch: u32,
+) -> bool {
+    image_offset == dma_buf_offset && image_row_pitch == u64::from(dma_buf_pitch)
+}
+
 // Compile-only check that `from_dmabuf` keeps a stable signature
 // across Phase 4.2 work. References every parameter type so an
 // upstream rename in `ash` or `std::os::fd` breaks the build before
@@ -1434,4 +1487,22 @@ fn _compile_check_from_dmabuf(
         plane_offsets,
         plane_pitches,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{import_memory_type_bits, linear_import_layout_matches};
+
+    #[test]
+    fn dma_buf_import_uses_only_image_and_fd_compatible_memory_types() {
+        assert_eq!(import_memory_type_bits(0b1101, 0b0110), 0b0100);
+        assert_eq!(import_memory_type_bits(0b1000, 0b0011), 0);
+    }
+
+    #[test]
+    fn linear_dma_buf_import_requires_the_exported_layout() {
+        assert!(linear_import_layout_matches(0, 3328, 0, 3328));
+        assert!(!linear_import_layout_matches(0, 3200, 0, 3328));
+        assert!(!linear_import_layout_matches(256, 3328, 0, 3328));
+    }
 }

@@ -668,11 +668,10 @@ pub struct KmsBackendV2 {
     /// open, then clears the window — preserving the idle-sleep once settled.
     libinput_hotplug_retry_until: Option<std::time::Instant>,
     randr_id_alloc: RandrIdAllocator,
-    /// Active PRIME Output Source policy, keyed by sink DRM device. Each
-    /// value is the rendering/source DRM device whose dma-bufs the sink may
-    /// scan out. The current implementation permits only the platform's first
-    /// (Vulkan-rendering) device as a source and keeps secondary devices as
-    /// sinks; the real dma-buf import remains authoritative at output enable.
+    /// Active PRIME Output Source relationships, keyed by output/sink DRM
+    /// device. Startup associates every secondary device with the first
+    /// Vulkan-rendering device automatically; RANDR requests may still inspect
+    /// or explicitly change those relationships.
     provider_output_sources:
         HashMap<crate::platform::drm::DrmDeviceKey, crate::platform::drm::DrmDeviceKey>,
     /// Per-output-id identity for RANDR output properties: `(EDID blob,
@@ -705,6 +704,20 @@ pub struct KmsBackendV2 {
     /// set and the GLX extension string advertises
     /// `GLX_EXT_texture_from_pixmap`.
     dmabuf_export_supported: bool,
+}
+
+fn automatic_provider_output_sources(
+    platform: &PlatformBackend,
+) -> HashMap<crate::platform::drm::DrmDeviceKey, crate::platform::drm::DrmDeviceKey> {
+    let Some(source_key) = platform.primary_device().map(|device| device.key) else {
+        return HashMap::new();
+    };
+    platform
+        .devices
+        .iter()
+        .filter(|device| device.key != source_key)
+        .map(|device| (device.key, source_key))
+        .collect()
 }
 
 /// GLX-TFP export state for one drawable. See `exported_dmabufs`.
@@ -1253,6 +1266,7 @@ impl KmsBackendV2 {
             .vk
             .as_ref()
             .is_some_and(probe_dmabuf_export_support);
+        let provider_output_sources = automatic_provider_output_sources(&platform);
         let mut b = Self {
             core,
             platform,
@@ -1306,7 +1320,7 @@ impl KmsBackendV2 {
             hotkey: crate::input::hotkey::HotkeyDetector::new(),
             libinput_hotplug_retry_until: None,
             randr_id_alloc: RandrIdAllocator::default(),
-            provider_output_sources: HashMap::new(),
+            provider_output_sources,
             output_identity_by_id: std::collections::HashMap::new(),
             output_key_by_id: std::collections::HashMap::new(),
             crtc_key_by_id: std::collections::HashMap::new(),
@@ -1435,6 +1449,7 @@ impl KmsBackendV2 {
             .vk
             .as_ref()
             .is_some_and(probe_dmabuf_export_support);
+        let provider_output_sources = automatic_provider_output_sources(&platform);
         let mut b = Self {
             core,
             platform,
@@ -1489,7 +1504,7 @@ impl KmsBackendV2 {
             hotkey: crate::input::hotkey::HotkeyDetector::new(),
             libinput_hotplug_retry_until: None,
             randr_id_alloc: RandrIdAllocator::default(),
-            provider_output_sources: HashMap::new(),
+            provider_output_sources,
             output_identity_by_id: std::collections::HashMap::new(),
             output_key_by_id: std::collections::HashMap::new(),
             crtc_key_by_id: std::collections::HashMap::new(),
@@ -2071,7 +2086,7 @@ impl KmsBackendV2 {
         let mut scanout_pools = Vec::with_capacity(base.platform.outputs.len());
         let mut bo_generations = Vec::with_capacity(base.platform.outputs.len());
         for (i, layout) in base.platform.outputs.iter().enumerate() {
-            let pool = crate::kms::vk::scanout::ScanoutBoPool::allocate(
+            let pool = crate::kms::vk::scanout::ScanoutBoPool::allocate_renderer_owned(
                 Arc::clone(&vk),
                 std::rc::Rc::clone(
                     &base
@@ -2081,7 +2096,6 @@ impl KmsBackendV2 {
                         .device,
                 ),
                 layout.scanout_route,
-                None,
                 u32::from(layout.width),
                 u32::from(layout.height),
                 3,
@@ -2275,9 +2289,11 @@ impl KmsBackendV2 {
     /// storage. Used by `for_tests_with_vk` so root allocation
     /// happens after the Vk context is attached.
     fn for_tests_seed() -> Self {
+        let platform = PlatformBackend::for_tests();
+        let provider_output_sources = automatic_provider_output_sources(&platform);
         Self {
             core: KmsCore::for_tests(),
-            platform: PlatformBackend::for_tests(),
+            platform,
             logged_gaps: RefCell::new(HashSet::new()),
             store: DrawableStore::new(),
             engine: RenderEngine::stub(),
@@ -2327,7 +2343,7 @@ impl KmsBackendV2 {
             hotkey: crate::input::hotkey::HotkeyDetector::new(),
             libinput_hotplug_retry_until: None,
             randr_id_alloc: RandrIdAllocator::default(),
-            provider_output_sources: HashMap::new(),
+            provider_output_sources,
             output_identity_by_id: std::collections::HashMap::new(),
             output_key_by_id: std::collections::HashMap::new(),
             crtc_key_by_id: std::collections::HashMap::new(),
@@ -19085,8 +19101,9 @@ fn subtract_one_rect_clip(outer: ash::vk::Rect2D, inner: ash::vk::Rect2D) -> Vec
 mod tests {
     use super::{
         ConnectorConfig, KmsBackendV2, PaintTarget, PictureRecord, RandrIdAllocator,
-        compute_copy_area_dst_rects, compute_render_composite_clip, dst_picture_clip_by_children,
-        intersect_rect_with_clip, mode_timing, resolve_picture_for_render,
+        automatic_provider_output_sources, compute_copy_area_dst_rects,
+        compute_render_composite_clip, dst_picture_clip_by_children, intersect_rect_with_clip,
+        mode_timing, resolve_picture_for_render,
     };
     use crate::kms::{
         backend::OutputKey,
@@ -19114,7 +19131,6 @@ mod tests {
             key,
             device,
             render_node: None,
-            vulkan_physical_device: None,
         });
         key
     }
@@ -19740,6 +19756,19 @@ mod tests {
                 capability: PROVIDER_CAPABILITY_SOURCE_OUTPUT,
             }]
         );
+    }
+
+    #[test]
+    fn secondary_devices_receive_automatic_output_source_relationships() {
+        let mut backend = KmsBackendV2::for_tests();
+        let source_key = backend.platform.devices[0].key;
+        let sink_key = add_secondary_test_device(&mut backend);
+
+        let relationships = automatic_provider_output_sources(&backend.platform);
+
+        assert_eq!(relationships.len(), 1);
+        assert_eq!(relationships.get(&sink_key), Some(&source_key));
+        assert!(!relationships.contains_key(&source_key));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! Per-bo state machine + Vulkan-first scanout-bo allocation
+//! Per-bo state machine + scanout-bo allocation
 //! (sub-phase 4.1.2).
 //!
 //! Spec: docs/superpowers/specs/2026-05-07-phase4-1-vulkan-compositor-design.md
@@ -7,16 +7,13 @@
 //!
 //! ## Allocation direction
 //!
-//! Vulkan-first: each [`ScanoutBo`] owns a dma-buf-exportable
-//! `VkImage`. The preferred path allocates it with an explicit DRM
-//! format modifier from the KMS primary plane / Vulkan intersection;
-//! fallback paths keep the historical `VK_IMAGE_TILING_LINEAR` image.
-//! The memory is exported as a dma-buf via `vkGetMemoryFdKHR`, the
-//! dma-buf is imported into the DRM device via `PRIME_FD_TO_HANDLE`,
-//! and the resulting GEM handle is registered as a DRM framebuffer
-//! with `add_fb2`.
+//! A pool can use either allocation direction. Renderer-owned BOs start as
+//! dma-buf-exportable Vulkan images and are imported by the KMS device.
+//! Output-owned BOs start as local DRM scanout buffers and are imported by
+//! the Vulkan renderer. Cross-device route selection tries complete pools,
+//! so the driver operations themselves decide which direction works.
 //!
-//! Why Vulkan-first instead of GBM-first:
+//! Why the renderer-owned fallback remains available:
 //! - Works on RADV gfx8/Polaris (no `VK_EXT_image_drm_format_modifier`
 //!   needed; linear images don't need a modifier handle to communicate
 //!   to KMS).
@@ -25,8 +22,9 @@
 //!   direction Mesa+Wayland use; the reverse direction
 //!   `vkGetMemoryResourcePropertiesMESA`'d on a guest GBM bo aborts
 //!   the Venus driver).
-//! - One renderer; no driver-specific skip paths inside the bo
-//!   constructor.
+//!
+//! Route selection contains no driver-specific success assumptions; concrete
+//! allocation and modeset errors decide when the fallback is used.
 
 use std::{
     io,
@@ -37,12 +35,11 @@ use std::{
 
 use ash::vk;
 use drm::{
-    Device as _, DriverCapability,
     buffer::{DrmFourcc, DrmModifier, Handle as DrmBufferHandle, PlanarBuffer as DrmPlanarBuffer},
     control::{Device as DrmControlDevice, FbCmd2Flags, framebuffer},
 };
 
-use super::device::VkContext;
+use super::{device::VkContext, target::DrawableImage};
 use crate::kms::backend::ScanoutRoute;
 
 /// Per-bo phase. The lifecycle is roughly
@@ -182,12 +179,12 @@ pub struct ModesetReleased {
     pub release_fence: Option<i32>,
 }
 
-/// One scanout buffer object: a Vulkan-allocated `VkImage` exported
-/// as a dma-buf and imported into the DRM device for KMS scanout.
+/// One scanout buffer object shared by a Vulkan renderer and a DRM scanout
+/// device. [`ScanoutBoBacking`] records which endpoint owns the allocation.
 ///
-/// All fields are populated after `allocate()` returns successfully.
-/// Drop unwinds them in the right order (DRM framebuffer → GEM handle
-/// close → VkImage → memory → semaphore → command pool).
+/// All fields are populated after allocation succeeds. Drop follows the
+/// ownership-specific order so neither endpoint releases the shared memory
+/// while the other still references it.
 #[allow(dead_code)] // most fields used by 4.1.2.5+ atomic-commit driver.
 pub struct ScanoutBo {
     pub state: BoState,
@@ -198,9 +195,9 @@ pub struct ScanoutBo {
     /// BOs share the framebuffer-registration code path but skip the
     /// allocator: they're wired in by `ScanoutBoPool::register_alien`.
     pub is_alien: bool,
-    /// Row pitch in bytes — what the driver chose for our
-    /// `TILING_LINEAR` image. Passed to KMS as `pitch[0]` and to the
-    /// blit copy as the destination row stride.
+    /// Row pitch in bytes. Renderer-owned images obtain it from Vulkan;
+    /// output-owned images use the local DRM allocation's stride. Passed to
+    /// KMS registration where needed and to staging uploads.
     pub pitch: u32,
     pub vk_image: vk::Image,
     pub vk_memory: vk::DeviceMemory,
@@ -219,9 +216,9 @@ pub struct ScanoutBo {
     /// DRM framebuffer registered against this bo's GEM handle.
     /// `Option` so Drop can take it.
     pub fb_handle: Option<framebuffer::Handle>,
-    /// GEM handle from `PRIME_FD_TO_HANDLE`. Closed via `GEM_CLOSE`
-    /// in Drop. `Option` so Drop can take it.
-    pub gem_handle: Option<DrmBufferHandle>,
+    /// Allocation ownership. `None` only while `Drop` is consuming the
+    /// complete backing for ordered teardown.
+    backing: Option<ScanoutBoBacking>,
     /// Per-bo transfer resources: command pool + a single command
     /// buffer recycled across frames, a host-mapped staging buffer
     /// sized for the bo (XRGB8888 → 4 bytes × width × height), and
@@ -253,6 +250,18 @@ pub struct ScanoutBo {
     disarmed: bool,
 }
 
+enum ScanoutBoBacking {
+    /// Vulkan allocated and exported the image. KMS imported it into a local
+    /// GEM handle and registered `ScanoutBo::fb_handle`.
+    RendererOwned { gem_handle: DrmBufferHandle },
+    /// KMS allocated the local scanout buffer. `image` is Vulkan's imported
+    /// view of the same DMA-BUF; `buffer` owns the DRM framebuffer and dumb BO.
+    OutputOwned {
+        buffer: crate::drm::DumbBuffer,
+        image: DrawableImage,
+    },
+}
+
 /// Per-bo transfer-side resources (command pool/buffer + staging
 /// buffer).
 #[allow(dead_code)] // exercised by 4.1.2.5 atomic-commit driver.
@@ -282,90 +291,70 @@ pub struct ScanoutBoPool {
     /// Device-qualified ownership of the images and DRM framebuffers in
     /// `bos`. Every BO in a pool uses the same pair of endpoints.
     pub(crate) route: ScanoutRoute,
-    /// Metadata-only result captured before any BO in this pool was
-    /// exported. This is a necessary-capability check, not proof that a
-    /// future PRIME import ioctl will succeed on every allocation.
-    pub(crate) compatibility: DmabufScanoutCompatibility,
+    pub(crate) ownership: ScanoutOwnership,
 }
 
-/// How a Vulkan linear image may be registered on the KMS endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LinearScanoutSupport {
-    /// The metadata probe found no shared linear path.
-    None,
-    /// KMS advertised `DRM_FORMAT_MOD_LINEAR` in the plane's `IN_FORMATS`.
-    ExplicitModifier,
-    /// KMS exposed no `IN_FORMATS`; only the traditional untagged `addfb2`
-    /// linear path can be attempted.
-    LegacyAddfb,
+pub(crate) enum ScanoutOwnership {
+    Renderer,
+    Output,
 }
 
-/// Why metadata proves that a dma-buf route cannot work through yserver's
-/// current Vulkan-first allocator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DmabufScanoutIncompatibility {
-    /// The selected Vulkan logical device cannot export DMA_BUF memory.
-    VulkanExternalMemoryFdUnavailable,
-    /// Vulkan positively mapped the route's render DRM device to another
-    /// physical device, so this context cannot own the advertised source.
-    RenderDeviceMismatch,
-    /// The sink DRM driver positively reported no PRIME import capability.
-    KmsPrimeImportUnsupported,
+/// Fence owned by one renderer-access probe submission.
+///
+/// Successful probes destroy the fence after observing it signaled. On every
+/// error path, `Drop` first idles the disposable logical device so the fence,
+/// command buffer, and referenced BO can be destroyed without racing work that
+/// Vulkan may have accepted before reporting the failure.
+struct ProbeFence<'a> {
+    device: &'a ash::Device,
+    fence: vk::Fence,
 }
 
-/// Metadata that was unavailable or insufficient to prove compatibility.
-/// These conditions must not suppress the authoritative runtime import.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DmabufScanoutUncertainty {
-    /// Vulkan exposed no DRM identity for the route's render device.
-    RenderDeviceIdentityUnavailable,
-    /// Querying the sink's `DRM_CAP_PRIME` capability failed.
-    KmsPrimeImportCapabilityUnavailable,
-    /// Advertised Vulkan/KMS formats did not establish a shared modifier or
-    /// linear path; drivers may still accept the historical fallback.
-    NoAdvertisedSharedLayout,
-}
+impl<'a> ProbeFence<'a> {
+    fn new(device: &'a ash::Device, fence: vk::Fence) -> Self {
+        Self { device, fence }
+    }
 
-/// Tri-state conclusion of the metadata-only compatibility probe.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum DmabufScanoutVerdict {
-    /// All required metadata was present and described a usable route.
-    Compatible,
-    /// Metadata conclusively rules out the current allocation path.
-    Incompatible(DmabufScanoutIncompatibility),
-    /// Metadata was incomplete; allocation must still be attempted.
-    Unknown(Vec<DmabufScanoutUncertainty>),
-}
+    fn handle(&self) -> vk::Fence {
+        self.fence
+    }
 
-impl DmabufScanoutVerdict {
-    /// Only conclusive incompatibility suppresses the runtime import attempt.
-    fn blocks_attempt(&self) -> bool {
-        matches!(self, Self::Incompatible(_))
+    fn destroy_signaled(mut self) {
+        unsafe { self.device.destroy_fence(self.fence, None) };
+        self.fence = vk::Fence::null();
     }
 }
 
-/// Necessary metadata capabilities for one Vulkan-to-KMS dma-buf route.
-///
-/// `modifiers` is the ordered intersection of KMS plane modifiers and Vulkan
-/// single-plane exportable modifiers. `linear` records the separate
-/// `VK_IMAGE_TILING_LINEAR` fallback. `verdict` combines device identity,
-/// external-memory, PRIME-import, and layout evidence without reducing
-/// unavailable metadata to `false`. No probe exports a dma-buf or invokes
-/// `PRIME_FD_TO_HANDLE`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DmabufScanoutCompatibility {
-    pub(crate) route: ScanoutRoute,
-    pub(crate) modifiers: Vec<u64>,
-    pub(crate) linear: LinearScanoutSupport,
-    pub(crate) verdict: DmabufScanoutVerdict,
+impl Drop for ProbeFence<'_> {
+    fn drop(&mut self) {
+        if self.fence == vk::Fence::null() {
+            return;
+        }
+
+        let wait = unsafe { self.device.device_wait_idle() };
+        if !probe_teardown_wait_completed(wait) {
+            log::error!(
+                "renderer-access probe teardown: vkDeviceWaitIdle failed with {wait:?}; \
+                 destroying disposable probe resources"
+            );
+        }
+        unsafe { self.device.destroy_fence(self.fence, None) };
+    }
+}
+
+/// `VK_ERROR_DEVICE_LOST` has the same resource-in-use semantics as success,
+/// so both results permit orderly teardown of the probe's child objects.
+fn probe_teardown_wait_completed(wait: Result<(), vk::Result>) -> bool {
+    matches!(wait, Ok(()) | Err(vk::Result::ERROR_DEVICE_LOST))
 }
 
 impl ScanoutBo {
-    /// Allocate one Vulkan-first scanout bo: VkImage + dma-buf-
-    /// exportable memory + DRM framebuffer registration.
+    /// Allocate one renderer-owned scanout BO: VkImage + dma-buf-exportable
+    /// memory + DRM framebuffer registration.
     /// All steps must succeed; partial allocations are unwound on
     /// error so the returned `Err` leaves no resources leaked.
-    fn allocate(
+    fn allocate_renderer_owned(
         vk: Arc<VkContext>,
         drm: Rc<crate::drm::Device>,
         width: u32,
@@ -375,7 +364,13 @@ impl ScanoutBo {
         let mut errors = Vec::new();
 
         for &plan in plans {
-            match Self::allocate_with_plan(vk.clone(), Rc::clone(&drm), width, height, plan) {
+            match Self::allocate_renderer_owned_with_plan(
+                Arc::clone(&vk),
+                Rc::clone(&drm),
+                width,
+                height,
+                plan,
+            ) {
                 Ok(bo) => {
                     log::info!(
                         "scanout bo: {} succeeded ({}x{}, pitch {})",
@@ -398,7 +393,7 @@ impl ScanoutBo {
         )))
     }
 
-    fn allocate_with_plan(
+    fn allocate_renderer_owned_with_plan(
         vk: Arc<VkContext>,
         drm: Rc<crate::drm::Device>,
         width: u32,
@@ -521,12 +516,192 @@ impl ScanoutBo {
             vk_image_view,
             vk_semaphore,
             fb_handle: Some(fb_handle),
-            gem_handle: Some(gem_handle),
+            backing: Some(ScanoutBoBacking::RendererOwned { gem_handle }),
             vk_transfer,
             drm,
             vk,
             disarmed: false,
         })
+    }
+
+    /// Allocate one output-owned scanout BO and import that exact allocation
+    /// into the Vulkan renderer. All rendering and KMS presentation continues
+    /// to use the ordinary `ScanoutBo` fields after construction.
+    fn allocate_output_owned(
+        vk: Arc<VkContext>,
+        drm: Rc<crate::drm::Device>,
+        width: u32,
+        height: u32,
+    ) -> io::Result<Self> {
+        let buffer_width = u16::try_from(width)
+            .map_err(|_| io::Error::other(format!("scanout width {width} exceeds u16")))?;
+        let buffer_height = u16::try_from(height)
+            .map_err(|_| io::Error::other(format!("scanout height {height} exceeds u16")))?;
+        let buffer = crate::drm::DumbBuffer::new(Rc::clone(&drm), buffer_width, buffer_height)
+            .map_err(|err| io::Error::new(err.kind(), format!("output BO allocation: {err}")))?;
+        let dma_buf = drm
+            .buffer_to_prime_fd(buffer.handle(), ::drm::CLOEXEC | ::drm::RDWR)
+            .map_err(|err| {
+                io::Error::new(err.kind(), format!("output BO DMA-BUF export: {err}"))
+            })?;
+        let image = DrawableImage::from_dmabuf(
+            Arc::clone(&vk),
+            dma_buf,
+            width,
+            height,
+            vk::Format::B8G8R8A8_UNORM,
+            super::dri3::DRM_FORMAT_MOD_LINEAR,
+            &[0],
+            &[buffer.stride()],
+        )
+        .map_err(|err| io::Error::other(format!("output BO Vulkan import: {err}")))?;
+
+        let vk_semaphore = create_export_semaphore(&vk)
+            .map_err(|err| io::Error::other(format!("vk semaphore: {err}")))?;
+        let vk_transfer = match allocate_transfer_resources(&vk, width, height) {
+            Ok(resources) => resources,
+            Err(err) => {
+                unsafe { vk.device.destroy_semaphore(vk_semaphore, None) };
+                return Err(io::Error::other(format!("vk transfer: {err}")));
+            }
+        };
+
+        Ok(Self {
+            state: BoState::default(),
+            width,
+            height,
+            is_alien: false,
+            pitch: buffer.stride(),
+            vk_image: image.vk_image,
+            vk_memory: image.backing_memory(),
+            vk_image_view: image.vk_image_view,
+            vk_semaphore,
+            fb_handle: Some(buffer.fb_id()),
+            backing: Some(ScanoutBoBacking::OutputOwned { buffer, image }),
+            vk_transfer,
+            drm,
+            vk,
+            disarmed: false,
+        })
+    }
+
+    /// Submit the same color-attachment clear and final image-layout
+    /// transition used at the start of an ordinary compositor frame.
+    ///
+    /// Route probes call this only on a disposable Vulkan logical device. A
+    /// failed foreign-memory submission can therefore lose that device without
+    /// poisoning the backend's live renderer.
+    fn probe_renderer_access(&self, timeout_ns: u64) -> io::Result<()> {
+        let device = &self.vk.device;
+        let command_buffer = self.vk_transfer.command_buffer;
+
+        unsafe {
+            device
+                .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
+                .map_err(|err| io::Error::other(format!("reset command buffer: {err:?}")))?;
+            let begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            crate::vk_count!(begin_command_buffer);
+            device
+                .begin_command_buffer(command_buffer, &begin)
+                .map_err(|err| io::Error::other(format!("begin command buffer: {err:?}")))?;
+
+            let to_color = [vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
+                .src_access_mask(vk::AccessFlags2::empty())
+                .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .image(self.vk_image)
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1),
+                )];
+            let dependency = vk::DependencyInfo::default().image_memory_barriers(&to_color);
+            crate::vk_count!(cmd_pipeline_barrier2);
+            device.cmd_pipeline_barrier2(command_buffer, &dependency);
+
+            let color_attachment = [vk::RenderingAttachmentInfo::default()
+                .image_view(self.vk_image_view)
+                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .clear_value(vk::ClearValue {
+                    color: vk::ClearColorValue {
+                        float32: [0.0, 0.0, 0.0, 1.0],
+                    },
+                })];
+            let rendering = vk::RenderingInfo::default()
+                .render_area(vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: self.width,
+                        height: self.height,
+                    },
+                })
+                .layer_count(1)
+                .color_attachments(&color_attachment);
+            crate::vk_count!(cmd_begin_rendering);
+            device.cmd_begin_rendering(command_buffer, &rendering);
+            crate::vk_count!(cmd_end_rendering);
+            device.cmd_end_rendering(command_buffer);
+
+            let to_scanout = [vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                .dst_access_mask(vk::AccessFlags2::empty())
+                .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .image(self.vk_image)
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1),
+                )];
+            let dependency = vk::DependencyInfo::default().image_memory_barriers(&to_scanout);
+            crate::vk_count!(cmd_pipeline_barrier2);
+            device.cmd_pipeline_barrier2(command_buffer, &dependency);
+
+            crate::vk_count!(end_command_buffer);
+            device
+                .end_command_buffer(command_buffer)
+                .map_err(|err| io::Error::other(format!("end command buffer: {err:?}")))?;
+
+            let fence = device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+                .map_err(|err| io::Error::other(format!("create probe fence: {err:?}")))?;
+            let fence = ProbeFence::new(device, fence);
+            let command_buffers =
+                [vk::CommandBufferSubmitInfo::default().command_buffer(command_buffer)];
+            let submits = [vk::SubmitInfo2::default().command_buffer_infos(&command_buffers)];
+            crate::vk_count!(queue_submit2);
+            crate::vk_count!(submit_other);
+            if let Err(err) = device.queue_submit2(self.vk.graphics_queue, &submits, fence.handle())
+            {
+                return Err(io::Error::other(format!(
+                    "probe queue submission failed: {err:?}"
+                )));
+            }
+
+            match device.wait_for_fences(&[fence.handle()], true, timeout_ns) {
+                Ok(()) => {
+                    fence.destroy_signaled();
+                    Ok(())
+                }
+                Err(vk::Result::TIMEOUT) => Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "probe rendering did not complete before the timeout",
+                )),
+                Err(err) => Err(io::Error::other(format!(
+                    "probe rendering fence wait failed: {err:?}"
+                ))),
+            }
+        }
     }
 
     /// Export a SYNC_FD payload from this bo's signal semaphore. Call
@@ -553,6 +728,10 @@ impl ScanoutBo {
 
 impl Drop for ScanoutBo {
     fn drop(&mut self) {
+        let backing = self
+            .backing
+            .take()
+            .expect("ScanoutBo backing must exist until drop");
         if self.disarmed {
             // Disarmed by shutdown-failed-disable path; let DRM-fd
             // close (process exit) reap GEM/FB and VkDevice teardown
@@ -566,6 +745,10 @@ impl Drop for ScanoutBo {
                 "ScanoutBo disarmed (atomic disable_output failed); \
                  leaking FB/GEM/Vk to be reaped by DRM-fd close"
             );
+            if let ScanoutBoBacking::OutputOwned { mut buffer, image } = backing {
+                buffer.disarm();
+                std::mem::forget(image);
+            }
             return;
         }
         // Defensive fence-fd cleanup. If the bo was Submitted /
@@ -583,20 +766,6 @@ impl Drop for ScanoutBo {
         }
         if let Some(fd) = released.release_fence {
             drop(unsafe { OwnedFd::from_raw_fd(fd) });
-        }
-
-        // DRM-side teardown next: framebuffer references the GEM
-        // handle; both must be released before we free the underlying
-        // memory the dma-buf was exported from.
-        if let Some(fb) = self.fb_handle.take()
-            && let Err(e) = self.drm.destroy_framebuffer(fb)
-        {
-            log::warn!("drm destroy_framebuffer failed: {e}");
-        }
-        if let Some(h) = self.gem_handle.take()
-            && let Err(e) = self.drm.close_buffer(h)
-        {
-            log::warn!("drm close_buffer (gem) failed: {e}");
         }
 
         unsafe {
@@ -619,18 +788,43 @@ impl Drop for ScanoutBo {
                 self.vk.device.free_memory(t.staging_memory, None);
                 self.vk.device.destroy_command_pool(t.command_pool, None);
             }
+        }
 
-            // Image view before image, image before memory, then
-            // semaphore.
-            if self.vk_image_view != vk::ImageView::null() {
-                self.vk.device.destroy_image_view(self.vk_image_view, None);
+        let output_buffer = match backing {
+            ScanoutBoBacking::RendererOwned { gem_handle } => {
+                // The framebuffer references an imported GEM handle. Release
+                // both before freeing the exported Vulkan memory.
+                if let Some(fb) = self.fb_handle.take()
+                    && let Err(e) = self.drm.destroy_framebuffer(fb)
+                {
+                    log::warn!("drm destroy_framebuffer failed: {e}");
+                }
+                if let Err(e) = self.drm.close_buffer(gem_handle) {
+                    log::warn!("drm close_buffer (gem) failed: {e}");
+                }
+                unsafe {
+                    if self.vk_image_view != vk::ImageView::null() {
+                        self.vk.device.destroy_image_view(self.vk_image_view, None);
+                    }
+                    self.vk.device.destroy_image(self.vk_image, None);
+                    self.vk.device.free_memory(self.vk_memory, None);
+                }
+                None
             }
-            self.vk.device.destroy_image(self.vk_image, None);
-            self.vk.device.free_memory(self.vk_memory, None);
-            if self.vk_semaphore != vk::Semaphore::null() {
+            ScanoutBoBacking::OutputOwned { buffer, image } => {
+                // DumbBuffer owns the framebuffer and destroys it after the
+                // Vulkan import and shared semaphore have been released.
+                self.fb_handle.take();
+                drop(image);
+                Some(buffer)
+            }
+        };
+        if self.vk_semaphore != vk::Semaphore::null() {
+            unsafe {
                 self.vk.device.destroy_semaphore(self.vk_semaphore, None);
             }
         }
+        drop(output_buffer);
     }
 }
 
@@ -643,6 +837,24 @@ pub struct AlienBoHandle {
 }
 
 impl ScanoutBoPool {
+    /// Verify that every allocation can be used as an actual Vulkan color
+    /// attachment, not merely imported or exported successfully.
+    ///
+    /// On error, the per-submission fence guard idles the disposable logical
+    /// device and destroys its fence before this method returns. The caller
+    /// can therefore drop the complete pool normally.
+    pub(crate) fn probe_renderer_access(&self, timeout_ns: u64) -> io::Result<()> {
+        for (index, bo) in self.bos.iter().enumerate() {
+            bo.probe_renderer_access(timeout_ns).map_err(|err| {
+                io::Error::new(
+                    err.kind(),
+                    format!("BO {index} renderer-access probe failed: {err}"),
+                )
+            })?;
+        }
+        Ok(())
+    }
+
     /// Register a client-imported `DrawableImage` as an alien BO in
     /// the pool. The DrawableImage's underlying `VkDeviceMemory` is
     /// already allocated; we run the same `add_fb2` framebuffer
@@ -725,45 +937,22 @@ impl ScanoutBoPool {
         self.bos.iter().any(|b| b.state.phase == BoPhase::Pending)
     }
 
-    /// Allocate `count` Vulkan-first bos for one output. Phase 4.1.2
-    /// uses 3 bos per pool (design §2). On failure the partial pool
-    /// is dropped (each successfully-allocated bo destroys its own
-    /// resources via `ScanoutBo::Drop`).
-    pub(crate) fn allocate(
+    /// Allocate `count` renderer-owned BOs for one output. Every actual
+    /// Vulkan export, DRM import, and framebuffer registration is attempted;
+    /// advertised capability metadata never suppresses the route.
+    pub(crate) fn allocate_renderer_owned(
         vk: Arc<VkContext>,
         drm: Rc<crate::drm::Device>,
         route: ScanoutRoute,
-        render_physical_device: Option<vk::PhysicalDevice>,
         width: u32,
         height: u32,
         count: usize,
         scanout_modifiers: &[u64],
     ) -> io::Result<Self> {
-        let compatibility = probe_dmabuf_scanout_compatibility(
-            &vk,
-            &drm,
-            route,
-            render_physical_device,
-            scanout_modifiers,
-        );
-        if route.is_cross_device() && compatibility.verdict.blocks_attempt() {
-            let DmabufScanoutVerdict::Incompatible(reason) = &compatibility.verdict else {
-                unreachable!("only an incompatible verdict blocks allocation")
-            };
-            return Err(io::Error::other(format!(
-                "dma-buf route {} -> {} is incompatible: {reason:?} \
-                 (modifiers={}, linear={:?})",
-                route.render_device_key,
-                route.kms_device_key,
-                format_modifiers(&compatibility.modifiers),
-                compatibility.linear,
-            )));
-        }
-
-        let plans = allocation_plans_for_route(vk.image_drm_format_modifier, &compatibility);
+        let plans = Self::renderer_owned_plans(&vk, scanout_modifiers);
         let mut bos = Vec::with_capacity(count);
         for _ in 0..count {
-            bos.push(ScanoutBo::allocate(
+            bos.push(ScanoutBo::allocate_renderer_owned(
                 Arc::clone(&vk),
                 Rc::clone(&drm),
                 width,
@@ -776,13 +965,91 @@ impl ScanoutBoPool {
             width,
             height,
             route,
-            compatibility,
+            ownership: ScanoutOwnership::Renderer,
+        })
+    }
+
+    /// Ordered renderer-owned allocation candidates for one KMS plane.
+    ///
+    /// Cross-device probing must validate an entire pool for one candidate at
+    /// a time. An `addfb2` success alone is not enough: a driver may accept
+    /// framebuffer registration and reject the same framebuffer during the
+    /// later atomic modeset check.
+    pub(crate) fn renderer_owned_plans(
+        vk: &VkContext,
+        scanout_modifiers: &[u64],
+    ) -> Vec<ScanoutAllocationPlan> {
+        let modifiers = if vk.image_drm_format_modifier {
+            scanout_modifier_candidates(vk, scanout_modifiers)
+        } else {
+            Vec::new()
+        };
+        scanout_allocation_plans(vk.image_drm_format_modifier, &modifiers)
+    }
+
+    /// Allocate every BO in a pool with one exact renderer-owned candidate.
+    /// The caller uses this after a disposable probe has validated the same
+    /// candidate through rendering and a complete atomic modeset.
+    pub(crate) fn allocate_renderer_owned_with_plan(
+        vk: Arc<VkContext>,
+        drm: Rc<crate::drm::Device>,
+        route: ScanoutRoute,
+        width: u32,
+        height: u32,
+        count: usize,
+        plan: ScanoutAllocationPlan,
+    ) -> io::Result<Self> {
+        let mut bos = Vec::with_capacity(count);
+        for _ in 0..count {
+            bos.push(ScanoutBo::allocate_renderer_owned_with_plan(
+                Arc::clone(&vk),
+                Rc::clone(&drm),
+                width,
+                height,
+                plan,
+            )?);
+        }
+        Ok(Self {
+            bos,
+            width,
+            height,
+            route,
+            ownership: ScanoutOwnership::Renderer,
+        })
+    }
+
+    /// Allocate `count` output-owned BOs and import each one into Vulkan as a
+    /// render target. The returned pool is immediately usable by the ordinary
+    /// compositor and page-flip paths.
+    pub(crate) fn allocate_output_owned(
+        vk: Arc<VkContext>,
+        drm: Rc<crate::drm::Device>,
+        route: ScanoutRoute,
+        width: u32,
+        height: u32,
+        count: usize,
+    ) -> io::Result<Self> {
+        let mut bos = Vec::with_capacity(count);
+        for _ in 0..count {
+            bos.push(ScanoutBo::allocate_output_owned(
+                Arc::clone(&vk),
+                Rc::clone(&drm),
+                width,
+                height,
+            )?);
+        }
+        Ok(Self {
+            bos,
+            width,
+            height,
+            route,
+            ownership: ScanoutOwnership::Output,
         })
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ScanoutAllocationPlan {
+pub(crate) enum ScanoutAllocationPlan {
     /// A single DRM modifier from the KMS/Vulkan intersection.
     DrmModifier(u64),
     /// Linear VkImage, but register the DRM framebuffer with an
@@ -793,7 +1060,7 @@ enum ScanoutAllocationPlan {
 }
 
 impl ScanoutAllocationPlan {
-    fn describe(self) -> String {
+    pub(crate) fn describe(self) -> String {
         match self {
             Self::DrmModifier(modifier) => format!("modifier=0x{modifier:x}"),
             Self::ExplicitLinear => "explicit-linear".to_string(),
@@ -818,206 +1085,6 @@ fn scanout_allocation_plans(
     plans.push(ScanoutAllocationPlan::ExplicitLinear);
     plans.push(ScanoutAllocationPlan::LegacyLinear);
     plans
-}
-
-fn allocation_plans_for_route(
-    image_drm_format_modifier: bool,
-    compatibility: &DmabufScanoutCompatibility,
-) -> Vec<ScanoutAllocationPlan> {
-    if !compatibility.route.is_cross_device() {
-        return scanout_allocation_plans(image_drm_format_modifier, &compatibility.modifiers);
-    }
-
-    if matches!(&compatibility.verdict, DmabufScanoutVerdict::Unknown(_)) {
-        // Preserve the pre-probe behavior when metadata is incomplete: try
-        // every advertised modifier followed by both linear registrations and
-        // let PRIME_FD_TO_HANDLE/addfb2 provide the authoritative answer.
-        return scanout_allocation_plans(image_drm_format_modifier, &compatibility.modifiers);
-    }
-
-    let mut plans = Vec::new();
-    if image_drm_format_modifier {
-        plans.extend(
-            compatibility
-                .modifiers
-                .iter()
-                .copied()
-                .map(ScanoutAllocationPlan::DrmModifier),
-        );
-    }
-    match compatibility.linear {
-        LinearScanoutSupport::None => {}
-        LinearScanoutSupport::ExplicitModifier => {
-            plans.push(ScanoutAllocationPlan::ExplicitLinear);
-        }
-        LinearScanoutSupport::LegacyAddfb => {
-            plans.push(ScanoutAllocationPlan::LegacyLinear);
-        }
-    }
-    plans
-}
-
-const DRM_PRIME_CAP_IMPORT: u64 = 1 << 0;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RenderDeviceMatch {
-    Match,
-    Mismatch,
-    Unknown,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PrimeImportSupport {
-    Supported,
-    Unsupported,
-    Unknown,
-}
-
-/// Probe the advertised dma-buf path from one Vulkan renderer to one KMS
-/// device without allocating, exporting, or importing a buffer.
-///
-/// The result combines Vulkan external-memory image properties, the KMS
-/// primary plane's `IN_FORMATS` list, and the sink DRM fd's
-/// `DRM_CAP_PRIME` import bit. It deliberately remains a necessary-condition
-/// probe: only a later real allocation can prove that the two drivers accept
-/// a particular dma-buf instance and pitch.
-pub(crate) fn probe_dmabuf_scanout_compatibility(
-    vk: &VkContext,
-    drm: &crate::drm::Device,
-    route: ScanoutRoute,
-    render_physical_device: Option<vk::PhysicalDevice>,
-    kms_scanout_modifiers: &[u64],
-) -> DmabufScanoutCompatibility {
-    let render_device_match = match render_physical_device {
-        Some(physical_device) if physical_device == vk.physical_device => RenderDeviceMatch::Match,
-        Some(_) => RenderDeviceMatch::Mismatch,
-        None => RenderDeviceMatch::Unknown,
-    };
-    let prime_import = match drm.get_driver_capability(DriverCapability::Prime) {
-        Ok(capabilities) if capabilities & DRM_PRIME_CAP_IMPORT != 0 => {
-            PrimeImportSupport::Supported
-        }
-        Ok(_) => PrimeImportSupport::Unsupported,
-        Err(err) => {
-            log::warn!(
-                "dma-buf probe {} -> {}: DRM_CAP_PRIME query failed: {err}",
-                route.render_device_key,
-                route.kms_device_key,
-            );
-            PrimeImportSupport::Unknown
-        }
-    };
-
-    let external_memory_fd_available = vk.external_memory_fd.is_some();
-    let modifiers = if external_memory_fd_available {
-        scanout_modifier_candidates(vk, kms_scanout_modifiers)
-    } else {
-        Vec::new()
-    };
-    let linear_exportable = external_memory_fd_available && scanout_linear_is_exportable(vk);
-    let compatibility = classify_dmabuf_scanout_compatibility(
-        route,
-        external_memory_fd_available,
-        render_device_match,
-        prime_import,
-        modifiers,
-        linear_exportable,
-        kms_scanout_modifiers,
-    );
-
-    log::info!(
-        "dma-buf probe {} -> {}: modifiers={} linear={:?} verdict={:?}",
-        route.render_device_key,
-        route.kms_device_key,
-        format_modifiers(&compatibility.modifiers),
-        compatibility.linear,
-        compatibility.verdict,
-    );
-    compatibility
-}
-
-fn classify_dmabuf_scanout_compatibility(
-    route: ScanoutRoute,
-    external_memory_fd_available: bool,
-    render_device_match: RenderDeviceMatch,
-    prime_import: PrimeImportSupport,
-    modifiers: Vec<u64>,
-    linear_exportable: bool,
-    kms_scanout_modifiers: &[u64],
-) -> DmabufScanoutCompatibility {
-    let linear = if !linear_exportable {
-        LinearScanoutSupport::None
-    } else if kms_scanout_modifiers.is_empty() {
-        LinearScanoutSupport::LegacyAddfb
-    } else if kms_scanout_modifiers.contains(&super::dri3::DRM_FORMAT_MOD_LINEAR) {
-        LinearScanoutSupport::ExplicitModifier
-    } else {
-        LinearScanoutSupport::None
-    };
-    let verdict = if !external_memory_fd_available {
-        DmabufScanoutVerdict::Incompatible(
-            DmabufScanoutIncompatibility::VulkanExternalMemoryFdUnavailable,
-        )
-    } else if render_device_match == RenderDeviceMatch::Mismatch {
-        DmabufScanoutVerdict::Incompatible(DmabufScanoutIncompatibility::RenderDeviceMismatch)
-    } else if prime_import == PrimeImportSupport::Unsupported {
-        DmabufScanoutVerdict::Incompatible(DmabufScanoutIncompatibility::KmsPrimeImportUnsupported)
-    } else {
-        let mut uncertainty = Vec::new();
-        if render_device_match == RenderDeviceMatch::Unknown {
-            uncertainty.push(DmabufScanoutUncertainty::RenderDeviceIdentityUnavailable);
-        }
-        if prime_import == PrimeImportSupport::Unknown {
-            uncertainty.push(DmabufScanoutUncertainty::KmsPrimeImportCapabilityUnavailable);
-        }
-        if modifiers.is_empty() && linear == LinearScanoutSupport::None {
-            uncertainty.push(DmabufScanoutUncertainty::NoAdvertisedSharedLayout);
-        }
-        if uncertainty.is_empty() {
-            DmabufScanoutVerdict::Compatible
-        } else {
-            DmabufScanoutVerdict::Unknown(uncertainty)
-        }
-    };
-    DmabufScanoutCompatibility {
-        route,
-        modifiers,
-        linear,
-        verdict,
-    }
-}
-
-fn scanout_linear_is_exportable(vk: &VkContext) -> bool {
-    let mut external_info = vk::PhysicalDeviceExternalImageFormatInfo::default()
-        .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-    let format_info = vk::PhysicalDeviceImageFormatInfo2::default()
-        .format(vk::Format::B8G8R8A8_UNORM)
-        .ty(vk::ImageType::TYPE_2D)
-        .tiling(vk::ImageTiling::LINEAR)
-        .usage(scanout_image_usage())
-        .push_next(&mut external_info);
-
-    let mut external_props = vk::ExternalImageFormatProperties::default();
-    let mut props = vk::ImageFormatProperties2::default().push_next(&mut external_props);
-    if unsafe {
-        vk.instance.get_physical_device_image_format_properties2(
-            vk.physical_device,
-            &format_info,
-            &mut props,
-        )
-    }
-    .is_err()
-    {
-        return false;
-    }
-
-    let memory = external_props.external_memory_properties;
-    memory
-        .external_memory_features
-        .contains(vk::ExternalMemoryFeatureFlags::EXPORTABLE)
-        && memory
-            .compatible_handle_types
-            .contains(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
 }
 
 /// Whether scanout BO allocation should try `LINEAR` before the tiled
@@ -1636,6 +1703,21 @@ mod tests {
     const TILED_B: u64 = 0x0200_0000_0000_000a;
 
     #[test]
+    fn probe_teardown_accepts_success_and_device_loss() {
+        assert!(probe_teardown_wait_completed(Ok(())));
+        assert!(probe_teardown_wait_completed(Err(
+            vk::Result::ERROR_DEVICE_LOST
+        )));
+    }
+
+    #[test]
+    fn probe_teardown_reports_other_wait_failures() {
+        assert!(!probe_teardown_wait_completed(Err(
+            vk::Result::ERROR_OUT_OF_HOST_MEMORY
+        )));
+    }
+
+    #[test]
     fn modifier_order_prefers_tiled_over_linear() {
         // KMS advertises linear first, then a tiled modifier; both are
         // Vulkan-supported and exportable. Tiled must win — issue #48.
@@ -1697,194 +1779,6 @@ mod tests {
     fn modifier_order_rejects_non_exportable_linear() {
         let candidates = order_scanout_modifier_candidates(&[LINEAR], &[LINEAR], false, |_| false);
         assert!(candidates.is_empty());
-    }
-
-    fn test_route(cross_device: bool) -> ScanoutRoute {
-        let render_device_key = crate::platform::drm::DrmDeviceKey {
-            major: 226,
-            minor: 0,
-        };
-        let kms_device_key = if cross_device {
-            crate::platform::drm::DrmDeviceKey {
-                major: 226,
-                minor: 1,
-            }
-        } else {
-            render_device_key
-        };
-        ScanoutRoute::new(render_device_key, kms_device_key)
-    }
-
-    #[test]
-    fn compatibility_accepts_shared_modifier_with_prime_import() {
-        let compatibility = classify_dmabuf_scanout_compatibility(
-            test_route(true),
-            true,
-            RenderDeviceMatch::Match,
-            PrimeImportSupport::Supported,
-            vec![TILED_A],
-            false,
-            &[TILED_A],
-        );
-        assert!(compatibility.route.is_cross_device());
-        assert_eq!(compatibility.verdict, DmabufScanoutVerdict::Compatible);
-        assert!(!compatibility.verdict.blocks_attempt());
-        assert_eq!(compatibility.modifiers, vec![TILED_A]);
-        assert_eq!(compatibility.linear, LinearScanoutSupport::None);
-    }
-
-    #[test]
-    fn compatibility_accepts_explicit_linear_path() {
-        let compatibility = classify_dmabuf_scanout_compatibility(
-            test_route(true),
-            true,
-            RenderDeviceMatch::Match,
-            PrimeImportSupport::Supported,
-            Vec::new(),
-            true,
-            &[LINEAR],
-        );
-        assert_eq!(compatibility.verdict, DmabufScanoutVerdict::Compatible);
-        assert_eq!(compatibility.linear, LinearScanoutSupport::ExplicitModifier);
-    }
-
-    #[test]
-    fn compatibility_records_legacy_linear_when_in_formats_is_absent() {
-        let compatibility = classify_dmabuf_scanout_compatibility(
-            test_route(true),
-            true,
-            RenderDeviceMatch::Match,
-            PrimeImportSupport::Supported,
-            Vec::new(),
-            true,
-            &[],
-        );
-        assert_eq!(compatibility.verdict, DmabufScanoutVerdict::Compatible);
-        assert_eq!(compatibility.linear, LinearScanoutSupport::LegacyAddfb);
-    }
-
-    #[test]
-    fn compatibility_requires_sink_prime_import() {
-        let compatibility = classify_dmabuf_scanout_compatibility(
-            test_route(true),
-            true,
-            RenderDeviceMatch::Match,
-            PrimeImportSupport::Unsupported,
-            vec![TILED_A],
-            true,
-            &[TILED_A, LINEAR],
-        );
-        assert_eq!(
-            compatibility.verdict,
-            DmabufScanoutVerdict::Incompatible(
-                DmabufScanoutIncompatibility::KmsPrimeImportUnsupported
-            )
-        );
-        assert!(compatibility.verdict.blocks_attempt());
-    }
-
-    #[test]
-    fn compatibility_keeps_missing_vulkan_identity_unknown_and_attemptable() {
-        let compatibility = classify_dmabuf_scanout_compatibility(
-            test_route(true),
-            true,
-            RenderDeviceMatch::Unknown,
-            PrimeImportSupport::Supported,
-            vec![TILED_A],
-            true,
-            &[TILED_A, LINEAR],
-        );
-        assert_eq!(
-            compatibility.verdict,
-            DmabufScanoutVerdict::Unknown(vec![
-                DmabufScanoutUncertainty::RenderDeviceIdentityUnavailable
-            ])
-        );
-        assert!(!compatibility.verdict.blocks_attempt());
-    }
-
-    #[test]
-    fn compatibility_rejects_verified_vulkan_device_mismatch() {
-        let compatibility = classify_dmabuf_scanout_compatibility(
-            test_route(true),
-            true,
-            RenderDeviceMatch::Mismatch,
-            PrimeImportSupport::Supported,
-            vec![TILED_A],
-            true,
-            &[TILED_A, LINEAR],
-        );
-        assert_eq!(
-            compatibility.verdict,
-            DmabufScanoutVerdict::Incompatible(DmabufScanoutIncompatibility::RenderDeviceMismatch)
-        );
-    }
-
-    #[test]
-    fn compatibility_keeps_missing_layout_metadata_unknown_and_attemptable() {
-        let compatibility = classify_dmabuf_scanout_compatibility(
-            test_route(true),
-            true,
-            RenderDeviceMatch::Match,
-            PrimeImportSupport::Supported,
-            Vec::new(),
-            true,
-            &[TILED_A],
-        );
-        assert_eq!(
-            compatibility.verdict,
-            DmabufScanoutVerdict::Unknown(vec![DmabufScanoutUncertainty::NoAdvertisedSharedLayout])
-        );
-        assert!(!compatibility.verdict.blocks_attempt());
-        assert_eq!(compatibility.linear, LinearScanoutSupport::None);
-        assert_eq!(
-            allocation_plans_for_route(true, &compatibility),
-            vec![
-                ScanoutAllocationPlan::ExplicitLinear,
-                ScanoutAllocationPlan::LegacyLinear,
-            ],
-            "unknown metadata must retain the real fallback attempts"
-        );
-    }
-
-    #[test]
-    fn compatibility_keeps_prime_query_failure_unknown_and_attemptable() {
-        let compatibility = classify_dmabuf_scanout_compatibility(
-            test_route(true),
-            true,
-            RenderDeviceMatch::Match,
-            PrimeImportSupport::Unknown,
-            vec![TILED_A],
-            true,
-            &[TILED_A],
-        );
-        assert_eq!(
-            compatibility.verdict,
-            DmabufScanoutVerdict::Unknown(vec![
-                DmabufScanoutUncertainty::KmsPrimeImportCapabilityUnavailable
-            ])
-        );
-        assert!(!compatibility.verdict.blocks_attempt());
-    }
-
-    #[test]
-    fn compatibility_rejects_missing_vulkan_external_memory_fd() {
-        let compatibility = classify_dmabuf_scanout_compatibility(
-            test_route(true),
-            false,
-            RenderDeviceMatch::Unknown,
-            PrimeImportSupport::Unknown,
-            Vec::new(),
-            false,
-            &[],
-        );
-        assert_eq!(
-            compatibility.verdict,
-            DmabufScanoutVerdict::Incompatible(
-                DmabufScanoutIncompatibility::VulkanExternalMemoryFdUnavailable
-            )
-        );
-        assert!(compatibility.verdict.blocks_attempt());
     }
 
     #[test]

@@ -2,14 +2,19 @@ use std::{io, mem, ptr::NonNull, rc::Rc};
 
 use drm::{
     buffer::{Buffer as _, DrmFourcc},
-    control::{Device as ControlDevice, dumbbuffer::DumbBuffer, framebuffer},
+    control::{Device as ControlDevice, dumbbuffer::DumbBuffer as KernelDumbBuffer, framebuffer},
 };
 
 use crate::drm::Device;
 
-pub struct Buffer {
+/// CPU-mapped DRM dumb buffer with an associated legacy framebuffer.
+///
+/// This is the simple KMS allocation type, not the general representation of
+/// every scanout buffer. Vulkan-owned and imported allocations are represented
+/// by the scanout layer instead.
+pub struct DumbBuffer {
     device: Rc<Device>,
-    dumb: DumbBuffer,
+    dumb: KernelDumbBuffer,
     fb_id: framebuffer::Handle,
     ptr: NonNull<u8>,
     len: usize,
@@ -20,7 +25,7 @@ pub struct Buffer {
     /// no munmap, no destroy_dumb_buffer. Resources leak until
     /// process-exit DRM-fd close reaps the kernel-side state.
     /// Set by `disarm()` from the shutdown path when atomic
-    /// `disable_output` failed for this Buffer's CRTC — KMS may
+    /// `disable_output` failed for this DumbBuffer's CRTC — KMS may
     /// still hold the FB, so user-side teardown would corrupt
     /// kernel state.
     ///
@@ -35,7 +40,7 @@ pub struct Buffer {
 // Intentionally `!Send`: the `Rc<Device>` and every clone of it stay on
 // the single core/backend thread.
 
-impl Buffer {
+impl DumbBuffer {
     pub fn new(device: Rc<Device>, width: u16, height: u16) -> io::Result<Self> {
         let mut dumb = device.create_dumb_buffer(
             (u32::from(width), u32::from(height)),
@@ -82,6 +87,10 @@ impl Buffer {
         self.fb_id
     }
 
+    pub(crate) fn handle(&self) -> ::drm::buffer::Handle {
+        self.dumb.handle()
+    }
+
     pub fn width(&self) -> u16 {
         self.width
     }
@@ -114,11 +123,11 @@ impl Buffer {
     }
 }
 
-impl Drop for Buffer {
+impl Drop for DumbBuffer {
     fn drop(&mut self) {
         if self.disarmed {
             log::warn!(
-                "drm Buffer disarmed (atomic disable_output failed); \
+                "DRM dumb buffer disarmed (atomic disable_output failed); \
                  leaking FB/dumb to be reaped by DRM-fd close"
             );
             return;
