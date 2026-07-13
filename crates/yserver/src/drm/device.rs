@@ -1,10 +1,7 @@
 use std::{
     fs::{File, OpenOptions},
     io,
-    os::{
-        fd::OwnedFd,
-        unix::io::{AsFd, BorrowedFd},
-    },
+    os::unix::io::{AsFd, BorrowedFd},
 };
 
 use drm::{ClientCapability, Device as DrmDevice};
@@ -57,28 +54,6 @@ impl Device {
                 format!("failed to acquire DRM master on {path}: {err}"),
             )
         })?;
-        device.enable_atomic_capabilities()?;
-        Ok(device)
-    }
-
-    /// Wrap a DRM primary-node fd that libseat already opened for us.
-    /// Unlike [`Device::open`] this does NOT open the path (libseat owns
-    /// it) and does NOT call `drmSetMaster`: in libseat mode the seat
-    /// manager (logind/seatd) owns DRM master and grants it to the active
-    /// session. `Seat::open` blocks until the session is active before any
-    /// device is opened, so we hold master here and enabling atomic caps
-    /// (which requires master) succeeds. Mirrors wlroots, which never
-    /// calls `drmSetMaster`.
-    ///
-    /// Task 8 (`kms/backend.rs` platform_init) is the caller; this method
-    /// has no caller yet and would otherwise trip `dead_code`.
-    #[allow(dead_code)]
-    pub fn from_owned_fd(fd: OwnedFd, path: &str) -> io::Result<Self> {
-        let file = File::from(fd);
-        let device = Self {
-            file,
-            path: path.to_string(),
-        };
         device.enable_atomic_capabilities()?;
         Ok(device)
     }

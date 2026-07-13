@@ -246,7 +246,7 @@ pub fn process_request(
         40 => handle_translate_coordinates(state, client_id, sequence, body),
         // ── grabs (pure state mutation on ServerState.{pointer,key}_grabs) ──
         26 => handle_grab_pointer(state, backend, client_id, sequence, header, body),
-        27 => handle_ungrab_pointer(state, client_id, sequence, body),
+        27 => handle_ungrab_pointer(state, backend, client_id, sequence, body),
         28 => handle_grab_button(state, client_id, sequence, header, body),
         29 => handle_ungrab_button(state, client_id, sequence, header, body),
         30 => handle_change_active_pointer_grab(state, client_id, sequence, body),
@@ -640,7 +640,7 @@ fn resolve_host_subwindow_visual_to_state(
 /// `RedirectSubwindows` dispatch, gated on
 /// `Backend::supports_redirect_activation()`. v1 (`KmsBackend`)
 /// returns `false`, preserving the post-`3751c11` revert that
-/// fixed MATE; v2 (`KmsBackendV2`) overrides to `true` and the
+/// fixed MATE; v2 (`KmsBackend`) overrides to `true` and the
 /// full allocate + participation-flip path runs.
 ///
 /// `mode` drives the scene-participation flip after a successful
@@ -1466,7 +1466,7 @@ fn destroy_window_subtree(
     // Active core grabs whose grab window just died deactivate (Xorg
     // DeleteWindowFromAnyEvents) — the destroyed windows are gone from
     // the resource table now, so the viewability probe sees them off.
-    release_core_grabs_for_unviewable(state);
+    release_core_grabs_for_unviewable(state, backend);
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -2605,10 +2605,6 @@ fn handle_randr_request(
                 ],
                 _ => Vec::new(),
             };
-            log::warn!(
-                "RANDR-DIAG-OUTQ ListOutputProperties output=0x{output_id:x} → {} atoms",
-                atoms.len(),
-            );
             let buf = x11randr::encode_list_output_properties_reply(byte_order, sequence, &atoms);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
@@ -3184,15 +3180,6 @@ fn handle_randr_request(
                 }
                 _ => None,
             };
-            log::warn!(
-                "RANDR-DIAG-OUTQ GetOutputProperty output=0x{:x} property='{}' → {}",
-                req.output,
-                prop_name.as_deref().unwrap_or("<unknown>"),
-                served.as_ref().map_or_else(
-                    || "None".to_string(),
-                    |(_, _, v)| format!("{} bytes", v.len())
-                ),
-            );
             let buf = match served {
                 // Type-mismatch (client asked for a specific, different type):
                 // reply with the real type + empty value + full bytes_after
@@ -5894,7 +5881,7 @@ fn handle_composite_request(
             let overlay = COMPOSITE_OVERLAY_WINDOW.0;
             // Stage 4e: ask the backend to materialise the COW as a
             // first-class scene entry (allocate screen-extent storage,
-            // populate `windows_v2` + `top_level_order`). v1 picks up
+            // populate `windows` + `top_level_order`). v1 picks up
             // the trait default no-op (`Ok(false)`); v2's override is
             // the load-bearing path for compositing WMs. Backends that
             // already have COW materialised (refcount > 0) return
@@ -5920,7 +5907,7 @@ fn handle_composite_request(
                 }
             };
             if was_zero_to_one {
-                // Backend has materialised its side (`windows_v2` +
+                // Backend has materialised its side (`windows` +
                 // `top_level_order`). Drive the symmetric resources-
                 // side materialization. The host xid is whatever the
                 // backend assigned — for v2 / `RecordingBackend` this
@@ -5960,7 +5947,7 @@ fn handle_composite_request(
             );
             // Stage 4e: decrement the COW refcount; the final release
             // (1→0 transition) tears down the backend's storage +
-            // `windows_v2` + `top_level_order` and the resources-side
+            // `windows` + `top_level_order` and the resources-side
             // COW record. Log-only on Err (the request carries no
             // reply).
             //
@@ -7276,7 +7263,7 @@ pub(crate) fn apply_dpms_transition(
     //       kms_outputs_active guard short-circuits idempotently when
     //       state IS consistent, and re-attempts when desynced.
     //   (2) Spam suppression is already handled at the backend level:
-    //       KmsBackendV2::set_dpms_power early-returns when want_active
+    //       KmsBackend::set_dpms_power early-returns when want_active
     //       equals self.kms_outputs_active.
     if new_level != old {
         log::info!(
@@ -12201,6 +12188,11 @@ fn handle_xi2_request(
                 state.active_pointer_grab = None;
                 state.frozen_pointer_event = None;
                 state.frozen_pointer_queue.clear();
+                // Clear any grab-cursor sprite override, as
+                // `deactivate_core_pointer_grab` does — a core
+                // XGrabPointer(cursor) torn down via XIUngrabDevice
+                // must not strand the grab cursor on the sprite.
+                let _ = backend.set_grab_cursor(None, None);
                 // Same freeze epilogue for the pointer (mirrors
                 // `deactivate_core_pointer_grab`).
                 crate::core_loop::pointer_fanout::xi1_core_grab_bridge_release(
@@ -15733,7 +15725,7 @@ fn handle_reparent_window(
     // redirect helpers would panic / silently misbehave there.
     // Phase 2 tests opt in via
     // `RecordingBackend::with_redirect_activation()` (see
-    // Task 6) and `KmsBackendV2::for_tests()` (which already
+    // Task 6) and `KmsBackend::for_tests()` (which already
     // returns `true`).
     if backend.supports_redirect_activation() {
         let old_parent_redirects_subwindows =
@@ -19673,7 +19665,7 @@ fn handle_unmap_window(
             revert_core_focus_if_unviewable(state);
             // Active grabs on a window that just became unviewable
             // deactivate too (same Xorg path).
-            release_core_grabs_for_unviewable(state);
+            release_core_grabs_for_unviewable(state, backend);
         }
     }
     debug!("client {} #{} UnmapWindow", client_id.0, sequence.0);
@@ -19728,7 +19720,7 @@ fn handle_unmap_subwindows(
     }
     crate::core_loop::xi1_focus::revert_unviewable_focus(state);
     revert_core_focus_if_unviewable(state);
-    release_core_grabs_for_unviewable(state);
+    release_core_grabs_for_unviewable(state, backend);
     debug!("client {} #{} UnmapSubwindows", client_id.0, sequence.0);
     Ok(RequestOutcome::Handled)
 }
@@ -20387,7 +20379,7 @@ fn apply_allow_events(
             .active_pointer_grab
             .is_some_and(|g| g.owner == client_id)
     {
-        deactivate_core_pointer_grab(state, client_id);
+        deactivate_core_pointer_grab(state, backend, client_id);
     }
 
     let keyboard_side = matches!(mode, 3..=7);
@@ -24342,6 +24334,18 @@ fn handle_grab_pointer(
             // the pointer inside the confine window if it is outside.
             state.pointer_confine_to = confine_to;
             confine_pointer_now(state, backend);
+            // Xorg ActivatePointerGrab installs the grab's cursor on the
+            // displayed sprite for the grab's duration (ImageMagick
+            // `import` grabs with a crosshair — #90). `cursor == None`
+            // (xid 0) means "no override"; per-window cursors show
+            // through. A re-grab by the same client with a new cursor
+            // replaces the override here. Resolved to a host cursor
+            // handle the same way XIChangeCursor does.
+            if cursor.0 == 0 {
+                let _ = backend.set_grab_cursor(None, None);
+            } else if let Some(host) = state.resources.cursor_host_xid(cursor) {
+                let _ = backend.set_grab_cursor(None, Some(host));
+            }
         }
     }
     debug!(
@@ -24359,6 +24363,7 @@ fn handle_grab_pointer(
 
 fn handle_ungrab_pointer(
     state: &mut ServerState,
+    backend: &mut dyn Backend,
     client_id: ClientId,
     sequence: SequenceNumber,
     body: &[u8],
@@ -24394,7 +24399,7 @@ fn handle_ungrab_pointer(
         );
         return Ok(RequestOutcome::Handled);
     }
-    deactivate_core_pointer_grab(state, client_id);
+    deactivate_core_pointer_grab(state, backend, client_id);
     debug!("client {} #{} UngrabPointer", client_id.0, sequence.0);
     Ok(RequestOutcome::Handled)
 }
@@ -24402,7 +24407,11 @@ fn handle_ungrab_pointer(
 /// Tear down the active core pointer grab held by `client_id` —
 /// shared by UngrabPointer and the unmap/destroy deactivation path
 /// (Xorg `DeactivateGrab` reached from `DeleteWindowFromAnyEvents`).
-fn deactivate_core_pointer_grab(state: &mut ServerState, client_id: ClientId) {
+fn deactivate_core_pointer_grab(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    client_id: ClientId,
+) {
     state.pointer_confine_to = ResourceId(0);
     let prev_grab_window = state
         .active_pointer_grab
@@ -24413,6 +24422,10 @@ fn deactivate_core_pointer_grab(state: &mut ServerState, client_id: ClientId) {
     state.active_pointer_grab = None;
     state.frozen_pointer_event = None;
     state.frozen_pointer_queue.clear();
+    // Xorg DeactivatePointerGrab reverts the sprite from the grab
+    // cursor back to the per-window/default cursor. Clearing an
+    // override that was never set is a cheap no-op.
+    let _ = backend.set_grab_cursor(None, None);
     // Core↔XI bridge: release any XI1-side hold the core grab placed.
     crate::core_loop::pointer_fanout::xi1_core_grab_bridge_release(
         state,
@@ -24942,7 +24955,7 @@ fn deactivate_core_keyboard_grab(state: &mut ServerState, client_id: ClientId) {
 /// whose grab window stopped being viewable (unmap of it or an
 /// ancestor, or destroy) deactivates. Call after the map-state /
 /// resource changes have landed.
-fn release_core_grabs_for_unviewable(state: &mut ServerState) {
+fn release_core_grabs_for_unviewable(state: &mut ServerState, backend: &mut dyn Backend) {
     let viewable = |state: &ServerState, w: ResourceId| {
         state
             .resources
@@ -24953,7 +24966,7 @@ fn release_core_grabs_for_unviewable(state: &mut ServerState) {
         && (!viewable(state, grab_window)
             || (state.pointer_confine_to.0 != 0 && !viewable(state, state.pointer_confine_to)))
     {
-        deactivate_core_pointer_grab(state, owner);
+        deactivate_core_pointer_grab(state, backend, owner);
     }
     if let Some(g) = state.active_keyboard_grab
         && !viewable(state, g.grab_window)
@@ -32420,7 +32433,7 @@ mod tests {
     // `process_present_pixmap` resolves both endpoints via
     // `state.resources.host_drawable_target(...)`, which returns `None` when
     // `window.host_xid` is `None`. Stage 4d allocated COW storage on the
-    // backend (`KmsBackendV2.cow_id`) and registered with the scene, but
+    // backend (`KmsBackend.cow_id`) and registered with the scene, but
     // left `host_xid` `None` on the yserver-core resource record (seeded
     // that way at `ResourceTable::new` since the COW xid pre-exists the
     // backend-side allocation). Every `PresentPixmap → COW` therefore
@@ -42778,7 +42791,7 @@ mod tests {
     // backing is not touched by reparent.
     //
     // The fifth, user-visible pin lives in
-    // `crates/yserver/src/kms/v2/backend.rs` — it drives the v2
+    // `crates/yserver/src/kms/render/backend.rs` — it drives the v2
     // `resolve_paint_target` ancestor walk through the full
     // `process_request` dispatcher.
     // ────────────────────────────────────────────────────────────
@@ -45116,7 +45129,7 @@ mod tests {
 
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, CLIENT_ID);
-        let _backend = RecordingBackend::new();
+        let mut backend = RecordingBackend::new();
 
         state.resources.create_window(
             yserver_protocol::x11::ClientId(CLIENT_ID),
@@ -45152,6 +45165,7 @@ mod tests {
 
         handle_ungrab_pointer(
             &mut state,
+            &mut backend,
             ClientId(CLIENT_ID),
             SequenceNumber(17),
             &[0u8; 4],

@@ -101,6 +101,10 @@ impl Backend for HostX11Backend {
                     child: 0,
                 }));
             }
+            // ynest is a nested backend fed by the parent X server's input,
+            // not libinput — it never originates a two-finger scroll stop and
+            // has no XI2 smooth-scroll valuators to signal one. No-op.
+            HostInputEvent::PointerScrollStop { .. } => {}
             HostInputEvent::PointerButton {
                 button,
                 pressed,

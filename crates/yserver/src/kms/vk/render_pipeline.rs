@@ -451,7 +451,7 @@ impl RenderPipelineCache {
     /// `2026-05-21-descriptor-pool-ring-design.md`.
     pub(crate) fn allocate_descriptor_for_views_into_ring(
         &self,
-        ring: &mut crate::kms::v2::descriptor_pool_ring::DescriptorPoolRing,
+        ring: &mut crate::kms::render::descriptor_pool_ring::DescriptorPoolRing,
         generation: u64,
         src_view: vk::ImageView,
         mask_view: vk::ImageView,

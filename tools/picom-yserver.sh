@@ -5,13 +5,13 @@
 # (kernel blur via XRenderSetPictureFilter "convolution", per-window
 # alpha via XRenderComposite, Damage-driven redraws) than typical
 # WM compositors (xfwm4, marco) do. Useful for shaking out RENDER
-# / COMPOSITE coverage gaps once the v2 rendering model re-enables
+# / COMPOSITE coverage gaps once the rendering model re-enables
 # compositor support.
 #
 # NB (2026-05-15): on the current rendering model picom redraws
 # once and then goes silent — Damage / XFixes / COW infrastructure
 # is incomplete, so picom never gets notified of subsequent paint.
-# This harness is parked until the v2 rewrite addresses that.
+# This harness is parked until the rendering rewrite addresses that.
 #
 # Optional: pass an xclient program to run alongside (default:
 # xclock) so there's a visible window for picom to redirect:

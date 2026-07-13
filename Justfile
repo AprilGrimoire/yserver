@@ -17,14 +17,6 @@ yserver:
         --qemu-opts="-display gtk -vga none -device virtio-gpu-pci -device virtio-tablet-pci -device virtio-keyboard-pci" \
         -- target/debug/yserver
 
-# Run yserver inside the guest for `seconds`, then send SIGTERM
-# from inside the guest. Exercises the signalfd shutdown path.
-yserver-headless-shutdown seconds="3":
-    cargo build --bin yserver
-    vng -r {{KERNEL}} --disable-microvm --rw \
-        --qemu-opts="-device virtio-gpu-pci" \
-        -- bash -c 'target/debug/yserver & pid=$!; sleep {{seconds}}; kill -TERM $pid; wait $pid'
-
 yserver-hw log="warn":
     cargo build --release --bin yserver
     bash -c '\
@@ -250,7 +242,7 @@ yserver-mate-hw-release-trace log="warn":
 #
 # Also writes a per-vkQueueSubmit2 TSV to `yserver-${session}.submit.tsv`
 # (Stage 5 Task 3 paint-aggregation diagnostic, see
-# crates/yserver/src/kms/v2/submit_trace.rs). One row per submit:
+# crates/yserver/src/kms/render/submit_trace.rs). One row per submit:
 #   frame_id ns_mono kind target_kind target_id batch_size op \
 #   src_class mask_class pipeline_id readback alias zero_draws upload
 # Quick analyses:
@@ -291,7 +283,7 @@ yserver-mate-hw-trace log="trace":
     bash -c '\
         xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
         RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
-            YSERVER_V2_SCENE_WALK_ALL=1 \
+            YSERVER_SCENE_WALK_ALL=1 \
             target/debug/yserver > yserver-hw-mate.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
@@ -356,7 +348,7 @@ yserver-xfce-hw log="warn":
         RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-xfce.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
-        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 YSERVER_V2_SCENE_WALK_ALL=1\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 YSERVER_SCENE_WALK_ALL=1\
             XDG_SESSION_TYPE=x11 \
             dbus-run-session xfce4-session --display :7 > xfce.log 2>&1;\
         kill -TERM $yserver_pid 2>/dev/null;\
@@ -484,15 +476,43 @@ yserver-e27-xterm-hw-trace log="debug":
         kill -TERM $xtrace_pid $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;'
 
+# Release-mode e27 (enlightenment) with core-loop + submit telemetry — a WM
+# telemetry harness for perf triage on a compositing WM (enlightenment composites
+# via its own GL path, like cinnamon). RUST_LOG defaults to `info` so the rollups
+# come through; drop to `warn` for a quieter log (you lose the rollups).
+#   grep "render_telemetry"   yserver-hw-e27.log   # per-second render rollup
+#   grep "loop telemetry" yserver-hw-e27.log   # iter/s + host_input gap
+yserver-e27-hw-telemetry log="info":
+    RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release --bin yserver
+    rm -f yserver-e27.submit.tsv
+    bash -c '\
+        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
+        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
+        export GDK_BACKEND=x11;\
+        export XDG_SESSION_TYPE=x11;\
+        YSERVER_LOOP_TELEMETRY=1 YSERVER_SUBMIT_TRACE=yserver-e27.submit.tsv \
+            RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 \
+            target/release/yserver > yserver-hw-e27.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET GDK_BACKEND=x11 \
+            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
+            DISPLAY=:7 enlightenment_start > e27-hw.log 2>&1 &\
+        sleep 2;\
+        DISPLAY=:7 wezterm ;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;\
+        rm -rf "$xdg_rd" 2>/dev/null;'
+
 # ============================== openbox ==============================
 
 yserver-openbox-hw log="info":
-    cargo build --bin yserver
+    cargo build --release --bin yserver
     bash -c '\
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/debug/yserver > yserver-hw-openbox.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/release/yserver > yserver-hw-openbox.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         DISPLAY=:7 openbox > openbox.log 2>&1 ;\
@@ -500,12 +520,12 @@ yserver-openbox-hw log="info":
         wait $yserver_pid 2>/dev/null;'
 
 yserver-openbox-picom-hw log="info":
-    cargo build --bin yserver
+    cargo build ---release -bin yserver
     bash -c '\
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/debug/yserver > yserver-hw-openbox-picom.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/release/yserver > yserver-hw-openbox-picom.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         DISPLAY=:7 openbox > openbox-picom.log 2>&1 &\
@@ -514,15 +534,45 @@ yserver-openbox-picom-hw log="info":
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;'
 
+# Release-mode openbox + picom in the XRENDER backend, with core-loop + submit
+# telemetry — a WM telemetry harness with a real XRender compositor in the mix
+# (the --backend glx variant above composites via GL instead). Measured clean on
+# bee 2026-07-09: picom composites steadily (~40-60 composite_submits/s, 0 yserver
+# faults). RUST_LOG defaults to `info` for the rollups.
+#   grep "render_telemetry" yserver-hw-openbox-picom.log   # copy_area_calls/s etc
+yserver-openbox-picom-xrender-hw-telemetry log="info":
+    RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release --bin yserver
+    rm -f yserver-openbox-picom.submit.tsv
+    bash -c '\
+        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
+        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
+        export GDK_BACKEND=x11;\
+        export XDG_SESSION_TYPE=x11;\
+        YSERVER_LOOP_TELEMETRY=1 YSERVER_SUBMIT_TRACE=yserver-openbox-picom.submit.tsv \
+            RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 \
+            target/release/yserver > yserver-hw-openbox-picom.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET GDK_BACKEND=x11 \
+            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
+            DISPLAY=:7 openbox > openbox-picom.log 2>&1 &\
+        sleep 2;\
+        DISPLAY=:7 picom --backend xrender --log-level warn --log-file picom.log > picom.out 2>&1 &\
+        sleep 1;\
+        DISPLAY=:7 wezterm ;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;\
+        rm -rf "$xdg_rd" 2>/dev/null;'
+
 # ============================== awesome ==============================
 
 yserver-awesome-hw log="info":
-    cargo build --bin yserver
+    cargo build --release --bin yserver
     bash -c '\
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/debug/yserver > yserver-hw-awesome.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/release/yserver > yserver-hw-awesome.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET GDK_BACKEND=x11 \
@@ -571,13 +621,13 @@ yserver-awesome-hw-telemetry log="info":
         wait $yserver_pid 2>/dev/null;\
         rm -rf "$xdg_rd" 2>/dev/null;'
 
-yserver-awesome-picom-hw log="yserver_core::core_loop::process_request=debug":
-    cargo build --bin yserver
+yserver-awesome-picom-hw log="warn":
+    cargo build --release --bin yserver
     bash -c '\
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
-        stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/debug/yserver > yserver-hw-awesome.log 2>&1 &\
+        stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/release/yserver > yserver-hw-awesome.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         DISPLAY=:7 awesome > awesome.log 2>&1 &\
@@ -616,19 +666,19 @@ yserver-awesome-picom-hw-trace log="debug":
 # ============================== icewm ==============================
 
 yserver-icewm-hw log="info":
-    cargo build --bin yserver
+    cargo build --release --bin yserver
     bash -c '\
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-icewm.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-icewm.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         DISPLAY=:7 icewm > icewm.log 2>&1 ;\
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;'
 
-yserver-icewm-hw-trace log="yserver::kms::v2::pointer=trace":
+yserver-icewm-hw-trace log="yserver::kms::render::pointer=trace":
     cargo build --bin yserver
     bash -c '\
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
@@ -681,9 +731,9 @@ yserver-i3-hw-trace log="debug":
 # ============================== FVWM3 ==============================
 
 yserver-fvwm3-xterm-hw log="info":
-    cargo build --bin yserver
+    cargo build --release --bin yserver
     bash -c '\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-fvwm3.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-fvwm3.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         DISPLAY=:7 fvwm3 > fvwm3-hw.log 2>&1 &\
@@ -707,7 +757,7 @@ yserver-fvwm3-xterm-hw log="info":
 #   - deterministic: pass video=/path/to/file.mp4 to auto-launch `mpv --fs`
 # Close the wezterm to end, then read the per-second rollups:
 #   grep "loop telemetry" yserver-hw-fvwm3.log   # host_input/s + gap_max=..ms
-#   grep "v2_telemetry"   yserver-hw-fvwm3.log   # cursor_move_ebusy/s, full_redraw_fallback/s,
+#   grep "render_telemetry"   yserver-hw-fvwm3.log   # cursor_move_ebusy/s, full_redraw_fallback/s,
 #                                                # frame_present_count/s, missed_pageflips/s, damage_fraction
 # Reading the result — the three candidate mechanisms for the choppy cursor:
 #   gap_max spikes (tens of ms) while moving   -> INPUT path starved (#1)
@@ -745,7 +795,7 @@ yserver-wmaker-xterm-hw log="info":
         RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-wmaker.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
-        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 YSERVER_V2_SCENE_WALK_ALL=1\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 YSERVER_SCENE_WALK_ALL=1\
             XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
             wmaker > wmaker-hw.log 2>&1 &\
         sleep 2;\
@@ -772,7 +822,7 @@ yserver-wmaker-xterm-hw-trace log="debug":
         x11trace -d :7 -D :8 -n -o wmaker.xtrace &\
         xtrace_pid=$!;\
         sleep 1;\
-        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:8 GDK_BACKEND=x11 YSERVER_V2_SCENE_WALK_ALL=1\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:8 GDK_BACKEND=x11 YSERVER_SCENE_WALK_ALL=1\
             XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
             wmaker > wmaker-hw.log 2>&1 &\
         sleep 2;\

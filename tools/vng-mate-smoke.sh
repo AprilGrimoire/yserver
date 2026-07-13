@@ -60,7 +60,7 @@ rm -rf "$xdg_rd"
 
 echo "=== PEAK TELEMETRY ==="
 for m in "paint_submits/s" "composite_submits/s" "queue_submit2/s" "cow_batches_flushed/s" "cow_copies_coalesced/s" "render_batches_flushed/s" "render_composites_coalesced/s" "cpu_fence_wait_ns/s" "cpu_fence_wait_count/s" "frame_present_count/s"; do
-  peak=$(grep "v2_telemetry" yserver-vng.log 2>/dev/null | grep -oE "${m}=[0-9]+" | sort -t= -k2 -rn | head -1)
+  peak=$(grep "render_telemetry" yserver-vng.log 2>/dev/null | grep -oE "${m}=[0-9]+" | sort -t= -k2 -rn | head -1)
   echo "  $peak"
 done
 echo

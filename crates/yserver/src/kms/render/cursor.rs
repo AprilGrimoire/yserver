@@ -1,6 +1,6 @@
 // Cursor rasterisation is full of intentional i32 → u16/u32 saturating
 // casts matched per the codebase's per-call discipline in
-// `kms/v2/backend.rs`. Hoisted to module scope here to avoid clutter
+// `kms/render/backend.rs`. Hoisted to module scope here to avoid clutter
 // inside the algorithm body.
 #![allow(
     clippy::cast_possible_truncation,
@@ -99,12 +99,12 @@ pub(crate) struct AnimFrame {
     /// sub-cursor's sprite alloc was skipped (Vk-less test
     /// fixtures) — mirrors `insert_cursor_record`'s best-effort
     /// `cursor_pixmaps` insert.
-    pub(crate) pixmap: Option<crate::kms::v2::store::DrawableId>,
+    pub(crate) pixmap: Option<crate::kms::render::store::DrawableId>,
     pub(crate) delay: std::time::Duration,
 }
 
 /// Frame list for one animated cursor, keyed by the anim cursor's
-/// host handle in `KmsBackendV2::anim_cursor_records`.
+/// host handle in `KmsBackend::anim_cursor_records`.
 pub(crate) struct AnimCursorRecord {
     pub(crate) frames: Vec<AnimFrame>,
 }

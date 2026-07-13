@@ -377,7 +377,7 @@ impl SubmitTrace {
 
     /// Flush the underlying `BufWriter`. Called periodically (1Hz
     /// via `Telemetry::maybe_emit`) and explicitly during shutdown
-    /// (`KmsBackendV2::disable_output`) so a hung drop chain or
+    /// (`KmsBackend::disable_output`) so a hung drop chain or
     /// hard kill doesn't lose the buffered tail. A failed flush
     /// disables further writes for the rest of the process,
     /// mirroring `record`'s self-quiescing behaviour.

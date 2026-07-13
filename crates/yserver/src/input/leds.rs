@@ -7,10 +7,6 @@
 //! the core stores the mask and arms an eventfd that sits in the input
 //! thread's epoll set alongside the libinput fd; the thread drains the
 //! eventfd and applies the mask to every keyboard device.
-//!
-//! Libseat mode has no thread hop — the backend owns the libinput
-//! context on the core thread and calls `Context::update_leds`
-//! directly; the relay is unused there.
 
 use std::{
     io,

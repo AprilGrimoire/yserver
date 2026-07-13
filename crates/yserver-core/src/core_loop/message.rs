@@ -208,6 +208,13 @@ pub enum HostInputEvent {
         pressed: bool,
         time: u32,
     },
+    /// Two-finger scroll ended (fingers lifted). The backend emits a
+    /// delta-0 XI2 scroll motion so GDK sets `scroll.is_stop`, which
+    /// commits a Firefox history-swipe (bug 1539730). XI2 smooth-scroll
+    /// selectors only — no core event, no button.
+    PointerScrollStop {
+        time: u32,
+    },
     Key(HostKeyEvent),
     /// A new input device has been enumerated by libinput.  Carries a
     /// snapshot of its identity and touchpad configuration so the core can

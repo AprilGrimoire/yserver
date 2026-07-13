@@ -11,7 +11,7 @@ use std::{os::fd::OwnedFd, sync::Arc};
 
 use yserver_core::backend::{CompletedPresentEvent, SyncobjHandle, XshmfenceHandle};
 
-use crate::kms::v2::platform::{FenceTicket, PresentCompletionSignal};
+use crate::kms::render::platform::{FenceTicket, PresentCompletionSignal};
 
 /// One deferred PRESENT completion payload. The drain fires the
 /// wake signal via `wake_pin` + returns the `event` payload to the
@@ -74,7 +74,7 @@ mod tests {
     use yserver_protocol::x11::ClientId;
 
     /// Smoke test that the types compile + can be constructed.
-    /// Real semantics tested in `KmsBackendV2` integration tests.
+    /// Real semantics tested in `KmsBackend` integration tests.
     #[test]
     fn pinned_wake_none_constructs() {
         let pin = PinnedWake::None;

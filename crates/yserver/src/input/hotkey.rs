@@ -1,6 +1,5 @@
 //! Server-internal hotkey detection on raw evdev keycodes, before XKB
-//! translation. Shared by the Direct-mode input thread and the
-//! Libseat-mode on-core libinput dispatch.
+//! translation. Used by the direct-mode input thread.
 
 use crate::input::InputEvent;
 

@@ -489,7 +489,7 @@ pub fn encode_get_cursor_image_empty_reply(
 /// big-endian to match the protocol for big-endian clients).
 ///
 /// `bgra_straight` is the cursor image in straight-alpha BGRA8 (the
-/// canonical [`CursorRecord`](../../../yserver/src/kms/v2/cursor.rs)
+/// canonical [`CursorRecord`](../../../yserver/src/kms/render/cursor.rs)
 /// representation in v2). This routine premultiplies and flips byte
 /// order to produce the ARGB the X11 wire expects.
 ///

@@ -16,7 +16,7 @@
 //!
 //! - `copy_area` (joins 2d alongside scene/blit).
 //! - RENDER / glyphs / text / poly_line / poly_segment / etc.
-//!   Logged-gap on `KmsBackendV2` until Stage 3.
+//!   Logged-gap on `KmsBackend` until Stage 3.
 //! - Per-op batching across multiple ops. 2c uses one
 //!   submission per Backend method call — equivalent perf-wise to
 //!   v1's per-op shape; submit-aggregation arrives in Stage 5.
@@ -45,7 +45,7 @@ use std::{
 use ash::vk;
 
 use super::{
-    glyph_atlas::V2GlyphAtlas,
+    glyph_atlas::GlyphAtlas,
     glyph_pixels::GlyphPixels,
     platform::{FenceTicket, PlatformBackend, PresentCompletionSignal},
     present_completion::{PendingPresentBatch, PendingPresentEntry, PresentBatchWait},
@@ -77,7 +77,7 @@ pub(crate) enum RenderError {
     NoVk,
     #[error("renderer in failed state — refusing further ops")]
     RendererFailed,
-    #[error("unsupported depth {0} for v2 Stage 2c ops")]
+    #[error("unsupported depth {0} for Stage 2c ops")]
     UnsupportedDepth(u8),
     #[error("source byte slice too short for {expected} bytes")]
     TruncatedSource { expected: usize },
@@ -552,7 +552,7 @@ struct SubmittedOp {
     /// slot above. Empty for ops that did not adopt a retired
     /// resource — which is the common case under B.2 (`ensure_*_old`
     /// returns `Ok(None)` when no grow fires).
-    retired_resources: Vec<Box<dyn crate::kms::v2::batch_resource::BatchResource>>,
+    retired_resources: Vec<Box<dyn crate::kms::render::batch_resource::BatchResource>>,
 }
 
 impl SubmittedOp {
@@ -569,7 +569,7 @@ impl SubmittedOp {
     )]
     fn append_retired_scratch(
         &mut self,
-        boxed: Box<dyn crate::kms::v2::batch_resource::BatchResource>,
+        boxed: Box<dyn crate::kms::render::batch_resource::BatchResource>,
     ) {
         self.retired_resources.push(boxed);
     }
@@ -579,7 +579,7 @@ impl SubmittedOp {
     /// `release(&vk)` per Box.
     fn drain_retired_scratch(
         &mut self,
-    ) -> std::vec::Drain<'_, Box<dyn crate::kms::v2::batch_resource::BatchResource>> {
+    ) -> std::vec::Drain<'_, Box<dyn crate::kms::render::batch_resource::BatchResource>> {
         self.retired_resources.drain(..)
     }
 }
@@ -994,7 +994,7 @@ struct RenderEngineInner {
     vk: Arc<VkContext>,
     /// Per-op CBs awaiting fence retirement. Drained by
     /// [`RenderEngine::poll_retired`] (called periodically by
-    /// `KmsBackendV2` and at shutdown).
+    /// `KmsBackend` and at shutdown).
     submitted: VecDeque<SubmittedOp>,
     /// Stage 3b: per-picture GPU-side state. Today only carries
     /// gradient `GradientPicture` instances built lazily by Stage
@@ -1006,7 +1006,7 @@ struct RenderEngineInner {
     picture_paint: HashMap<u32, PicturePaintState>,
     /// Stage 3a: glyph atlas. Lazy — first text run pays the
     /// 16 MiB R8 allocation. `None` until first image_text op.
-    glyph_atlas: Option<V2GlyphAtlas>,
+    glyph_atlas: Option<GlyphAtlas>,
     /// Stage 3a: text pipelines (TextRunTarget descriptor bound to
     /// the atlas image view), keyed by
     /// `(op, dst_format, dst_has_alpha)` — mirroring the RENDER
@@ -1199,7 +1199,7 @@ impl RenderEngineInner {
         {
             let Some(std_op) = StdPictOp::from_u8(op) else {
                 // Callers gate to the standard family before this.
-                log::error!("v2 {context}: ensure_text_pipeline got invalid op {op}");
+                log::error!("render {context}: ensure_text_pipeline got invalid op {op}");
                 return Err(RenderError::Vk(vk::Result::ERROR_UNKNOWN));
             };
             let atlas_view = self
@@ -1218,7 +1218,7 @@ impl RenderEngineInner {
                     e.insert(p);
                 }
                 Err(err) => {
-                    log::error!("v2 {context}: TextPipeline::new failed: {err:?}");
+                    log::error!("render {context}: TextPipeline::new failed: {err:?}");
                     return Err(RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED));
                 }
             }
@@ -1238,7 +1238,7 @@ impl RenderEngineInner {
     /// `crates/yserver/src/kms/scheduler/paint_batch.rs:146-147`).
     /// The trait does NOT implement `Drop` for Vk-handle teardown;
     /// dropping a `Box<dyn BatchResource>` without calling
-    /// [`release`](crate::kms::v2::batch_resource::BatchResource::release)
+    /// [`release`](crate::kms::render::batch_resource::BatchResource::release)
     /// would LEAK the underlying Vk handles. Every retirement path
     /// MUST call `boxed.release(&inner.vk)` explicitly.
     ///
@@ -1299,7 +1299,7 @@ impl RenderEngineInner {
     )]
     pub(crate) fn adopt_retired_resource_for_gpu_retirement(
         &mut self,
-        retired: Option<Box<dyn crate::kms::v2::batch_resource::BatchResource>>,
+        retired: Option<Box<dyn crate::kms::render::batch_resource::BatchResource>>,
     ) {
         let Some(boxed) = retired else { return };
         // (a) Open frame — adopt into its pin set.
@@ -1373,7 +1373,7 @@ impl RenderEngineInner {
     /// going through reset (e.g. a hypothetical "fast-reuse" path),
     /// `vkUpdateDescriptorSets`-at-append would become unsafe. The
     /// audit at
-    /// `crates/yserver/src/kms/v2/descriptor_pool_ring.rs` (Task 3
+    /// `crates/yserver/src/kms/render/descriptor_pool_ring.rs` (Task 3
     /// audit gate) confirms the current ring matches this invariant.
     ///
     /// # Errors
@@ -1504,7 +1504,7 @@ impl RenderEngine {
             return;
         }
         log::warn!(
-            target: "yserver::kms::v2::fbtrace",
+            target: "yserver::kms::render::fbtrace",
             "fbtrace frame_seq={} filter={:?} matched_ops={} total_ops={}",
             frame_seq,
             filter,
@@ -1517,7 +1517,7 @@ impl RenderEngine {
                     if Self::frame_builder_trace_matches_dst(store, filter, rc.dst_id) =>
                 {
                     log::warn!(
-                        target: "yserver::kms::v2::fbtrace",
+                        target: "yserver::kms::render::fbtrace",
                         "fbtrace frame_seq={} op#{} RenderComposite dst={} op={} dst_has_alpha={} mask_ca={} rects={} clips={} src_clear={} mask_clear={} old_layout={:?}",
                         frame_seq, idx, rc.dst_id.as_u64(), rc.op, rc.dst_has_alpha,
                         rc.mask_component_alpha, rc.rects.len(),
@@ -1530,7 +1530,7 @@ impl RenderEngine {
                     if Self::frame_builder_trace_matches_dst(store, filter, ca.dst_id) =>
                 {
                     log::warn!(
-                        target: "yserver::kms::v2::fbtrace",
+                        target: "yserver::kms::render::fbtrace",
                         "fbtrace frame_seq={} op#{} CopyArea dst={} src={} src_off=({}, {}) dst_off=({}, {}) extent={}x{} self_overlap={} old_layouts=({:?}->{:?})",
                         frame_seq, idx, ca.dst_id.as_u64(), ca.src_id.as_u64(),
                         ca.src_rect.offset.x, ca.src_rect.offset.y, ca.dst_rect.offset.x,
@@ -1542,7 +1542,7 @@ impl RenderEngine {
                     if Self::frame_builder_trace_matches_dst(store, filter, pi.dst_id) =>
                 {
                     log::warn!(
-                        target: "yserver::kms::v2::fbtrace",
+                        target: "yserver::kms::render::fbtrace",
                         "fbtrace frame_seq={} op#{} PutImage dst={} off=({}, {}) extent={}x{} old_layout={:?}",
                         frame_seq, idx, pi.dst_id.as_u64(), pi.dst_rect.offset.x,
                         pi.dst_rect.offset.y, pi.dst_rect.extent.width, pi.dst_rect.extent.height,
@@ -1553,7 +1553,7 @@ impl RenderEngine {
                     if Self::frame_builder_trace_matches_dst(store, filter, fr.dst_id) =>
                 {
                     log::warn!(
-                        target: "yserver::kms::v2::fbtrace",
+                        target: "yserver::kms::render::fbtrace",
                         "fbtrace frame_seq={} op#{} FillRect dst={} rects={} color={:?} old_layout={:?}",
                         frame_seq, idx, fr.dst_id.as_u64(), fr.rects.len(), fr.color, fr.dst_old_layout,
                     )
@@ -1562,7 +1562,7 @@ impl RenderEngine {
                     if Self::frame_builder_trace_matches_dst(store, filter, lf.dst_id) =>
                 {
                     log::warn!(
-                        target: "yserver::kms::v2::fbtrace",
+                        target: "yserver::kms::render::fbtrace",
                         "fbtrace frame_seq={} op#{} LogicFill dst={} mode={:?} opaque_alpha={} rects={} color={:?} old_layout={:?}",
                         frame_seq, idx, lf.dst_id.as_u64(), lf.logic_mode, lf.opaque_alpha,
                         lf.rects.len(), lf.color, lf.dst_old_layout,
@@ -1572,7 +1572,7 @@ impl RenderEngine {
                     if Self::frame_builder_trace_matches_dst(store, filter, it.dst_id) =>
                 {
                     log::warn!(
-                        target: "yserver::kms::v2::fbtrace",
+                        target: "yserver::kms::render::fbtrace",
                         "fbtrace frame_seq={} op#{} ImageText dst={} instances={} fg={:?} old_layout={:?}",
                         frame_seq, idx, it.dst_id.as_u64(), it.instance_count, it.foreground_rgba,
                         it.dst_old_layout,
@@ -1582,7 +1582,7 @@ impl RenderEngine {
                     if Self::frame_builder_trace_matches_dst(store, filter, cg.dst_id) =>
                 {
                     log::warn!(
-                        target: "yserver::kms::v2::fbtrace",
+                        target: "yserver::kms::render::fbtrace",
                         "fbtrace frame_seq={} op#{} CompositeGlyphs dst={} instances={} clips={} fg={:?} old_layout={:?}",
                         frame_seq, idx, cg.dst_id.as_u64(), cg.instance_count, cg.clip_scissors.len(),
                         cg.foreground_rgba, cg.dst_old_layout,
@@ -1597,7 +1597,7 @@ impl RenderEngine {
                         RecordedTrapSrcKind::Gradient { .. } => "gradient",
                     };
                     log::warn!(
-                        target: "yserver::kms::v2::fbtrace",
+                        target: "yserver::kms::render::fbtrace",
                         "fbtrace frame_seq={} op#{} RenderTrapsOrTris dst={} op_byte={} dst_has_alpha={} src_kind={} clips={} bbox=({},{} {}x{}) old_layout={:?}",
                         frame_seq, idx, rt.dst_id.as_u64(), rt.op_byte, rt.dst_has_alpha,
                         src_kind, rt.clip_scissors.len(), rt.bbox_x, rt.bbox_y,
@@ -1661,7 +1661,7 @@ impl RenderEngine {
         })
     }
 
-    /// Vk-less constructor — used by `KmsBackendV2::for_tests` and
+    /// Vk-less constructor — used by `KmsBackend::for_tests` and
     /// Stage 1b-era callers that haven't migrated yet. Every paint
     /// op on a stubbed engine returns `NoVk`.
     pub(crate) fn stub() -> Self {
@@ -1880,7 +1880,7 @@ impl RenderEngine {
     }
 
     /// Task 12 test-only: current_layout of a registered snapshot, or `None`.
-    #[allow(dead_code, reason = "Task 12 rollback test (v2_acceptance)")]
+    #[allow(dead_code, reason = "Task 12 rollback test (acceptance)")]
     pub(crate) fn clip_snapshot_layout_for_tests(&self, id: SnapshotId) -> Option<vk::ImageLayout> {
         self.inner
             .as_ref()?
@@ -1890,7 +1890,7 @@ impl RenderEngine {
     }
 
     /// Task 12 test-only: whether a registered snapshot has a `last_render_ticket`.
-    #[allow(dead_code, reason = "Task 12 rollback test (v2_acceptance)")]
+    #[allow(dead_code, reason = "Task 12 rollback test (acceptance)")]
     pub(crate) fn clip_snapshot_has_ticket_for_tests(&self, id: SnapshotId) -> Option<bool> {
         self.inner
             .as_ref()?
@@ -1902,7 +1902,7 @@ impl RenderEngine {
     /// Task 12 test-only: invoke `masked_copy_area` with the mask sourced from a
     /// registered clip SNAPSHOT (`snapshot_id: Some`), exercising the snapshot
     /// first-touch + terminal-state commit + close-failure rollback path.
-    #[allow(dead_code, reason = "Task 12 rollback test (v2_acceptance)")]
+    #[allow(dead_code, reason = "Task 12 rollback test (acceptance)")]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn masked_copy_area_with_snapshot_for_tests(
         &mut self,
@@ -1944,7 +1944,7 @@ impl RenderEngine {
         if let Err(e) =
             self.close_open_frame(store, platform, super::frame_builder::CloseReason::Shutdown)
         {
-            log::warn!("v2 shutdown: close_open_frame failed: {e:?}");
+            log::warn!("render shutdown: close_open_frame failed: {e:?}");
         }
         self.drain_all(platform);
     }
@@ -1973,7 +1973,7 @@ impl RenderEngine {
             .is_some_and(|i| i.pending_render_batch.take().is_some())
         {
             log::warn!(
-                "v2 drain_all: open render_batch dropped without flush \
+                "render drain_all: open render_batch dropped without flush \
                  (caller must close batches before drain_all)"
             );
         }
@@ -2002,7 +2002,7 @@ impl RenderEngine {
                 if let Some(inner) = inner_opt {
                     inner.pending_group_ops.clear();
                 }
-                log::warn!("v2 drain_all: flush_submit_group failed: {e:?}");
+                log::warn!("render drain_all: flush_submit_group failed: {e:?}");
             }
             (Ok(_), None) => {}
         }
@@ -2582,7 +2582,7 @@ impl RenderEngine {
                             } = rt.src_kind
                         {
                             open_frame.pins.adopt_retired(Box::new(picture.clone())
-                                as Box<dyn crate::kms::v2::batch_resource::BatchResource>);
+                                as Box<dyn crate::kms::render::batch_resource::BatchResource>);
                         }
                     }
                     inner
@@ -2741,7 +2741,7 @@ impl RenderEngine {
 
     /// Phase A: count of ops parked in pending_group_ops (not yet
     /// committed to `submitted`). Test helper — also used by the
-    /// backend wrapper exposed to v2_acceptance integration tests.
+    /// backend wrapper exposed to acceptance integration tests.
     pub(crate) fn pending_group_ops_count_for_tests(&self) -> usize {
         self.inner.as_ref().map_or(0, |i| i.pending_group_ops.len())
     }
@@ -2777,7 +2777,7 @@ impl RenderEngine {
     /// `RecordedOp::RenderComposite`'s `dst_old_layout` in append
     /// order. Returns an empty vec if no frame is open. Used by the
     /// second-op-in-frame overlay test (see
-    /// `KmsBackendV2::frame_builder_peek_render_composite_dst_old_layouts_for_tests`).
+    /// `KmsBackend::frame_builder_peek_render_composite_dst_old_layouts_for_tests`).
     /// The `RecordedRenderComposite` payload is `pub(crate)` so the
     /// integration crate cannot match on it directly — this returns
     /// the minimum scalar needed for the assertion.
@@ -2800,7 +2800,7 @@ impl RenderEngine {
     }
 
     /// Phase B.1 Task 21: monotonic count of all `FrameBuilder` opens
-    /// since init. Delta-tracked by `KmsBackendV2::drain_frame_builder_telemetry`
+    /// since init. Delta-tracked by `KmsBackend::drain_frame_builder_telemetry`
     /// to emit one `record_frame_builder_open` per new open.
     pub(crate) fn frame_builder_lifetime_opens(&self) -> u64 {
         self.inner
@@ -2828,8 +2828,8 @@ impl RenderEngine {
     /// True if either the frame builder has an open frame OR a render-
     /// composite coalescing batch is currently open (CB recorded but
     /// not yet submitted). Used by the eager-touch regression tests and by
-    /// `KmsBackendV2::has_pending_batches_for_tests` (the wrapper
-    /// the v2_acceptance test asserts on).
+    /// `KmsBackend::has_pending_batches_for_tests` (the wrapper
+    /// the acceptance test asserts on).
     ///
     /// Phase B.3 (N10): the frame builder's open frame is the
     /// equivalent of "pending COW work" after the cow-batch deletion.
@@ -2856,7 +2856,7 @@ impl RenderEngine {
     }
 
     /// Stage 5 Task 4 layer 1: ring residency for the acceptance
-    /// gate (`v2_render_composite_pool_creates_bounded_after_warmup`).
+    /// gate (`render_composite_pool_creates_bounded_after_warmup`).
     pub(crate) fn descriptor_pool_ring_pool_count(&self) -> usize {
         self.inner
             .as_ref()
@@ -3031,7 +3031,7 @@ impl RenderEngine {
 
     /// Stage 3b + B.2 fix + B.3 hotfix 2: drop the engine's
     /// `picture_paint` entry for `host_pic`. Called by
-    /// `KmsBackendV2::render_free_picture` after removing the picture
+    /// `KmsBackend::render_free_picture` after removing the picture
     /// record from `KmsCore.pictures`.
     ///
     /// **B.2 fix**: routes the `GradientPicture` through
@@ -3056,9 +3056,8 @@ impl RenderEngine {
         };
         match state {
             PicturePaintState::Gradient(gradient) => {
-                inner
-                    .adopt_retired_resource_for_gpu_retirement(Some(Box::new(gradient)
-                        as Box<dyn crate::kms::v2::batch_resource::BatchResource>));
+                inner.adopt_retired_resource_for_gpu_retirement(Some(Box::new(gradient)
+                    as Box<dyn crate::kms::render::batch_resource::BatchResource>));
             }
         }
     }
@@ -3155,7 +3154,7 @@ impl RenderEngine {
     /// Stage 3c: how many cached drawable views the engine
     /// currently holds. Test-only — used to assert eviction on
     /// drawable retire. Also exposed to integration tests via
-    /// `KmsBackendV2::drawable_view_cache_len` — not gated on
+    /// `KmsBackend::drawable_view_cache_len` — not gated on
     /// `cfg(test)` because `tests/` integration crates compile
     /// against the regular lib build, not the `--cfg test` one.
     pub(crate) fn drawable_view_cache_len(&self) -> usize {
@@ -3208,7 +3207,7 @@ impl RenderEngine {
 
         if inner.render_pipelines.is_none() {
             let cache = RenderPipelineCache::new(Arc::clone(&inner.vk)).map_err(|e| {
-                log::error!("v2 ensure_render_assets: RenderPipelineCache::new failed: {e:?}");
+                log::error!("render ensure_render_assets: RenderPipelineCache::new failed: {e:?}");
                 RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
             })?;
             inner.render_pipelines = Some(cache);
@@ -3219,7 +3218,7 @@ impl RenderEngine {
                 &inner.vk,
             ))
             .map_err(|e| {
-                log::error!("v2 ensure_render_assets: MaskedBlitPipeline::new failed: {e:?}");
+                log::error!("render ensure_render_assets: MaskedBlitPipeline::new failed: {e:?}");
                 RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
             })?;
             inner.masked_blit = Some(mb);
@@ -3236,12 +3235,14 @@ impl RenderEngine {
         // mirror that for solid_src/solid_mask. Cost: two extra
         // synchronous submits at engine init.
         let pool_for_init_clears = platform.ops_command_pool_handle().ok_or_else(|| {
-            log::error!("v2 ensure_render_assets: no ops_command_pool for solid-image init clears");
+            log::error!(
+                "render ensure_render_assets: no ops_command_pool for solid-image init clears"
+            );
             RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
         })?;
         if inner.solid_src_image.is_none() {
             let mut s = SolidColorImage::new(Arc::clone(&inner.vk)).map_err(|e| {
-                log::error!("v2 ensure_render_assets: solid_src SolidColorImage failed: {e:?}");
+                log::error!("render ensure_render_assets: solid_src SolidColorImage failed: {e:?}");
                 RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
             })?;
             crate::kms::vk::ops::run_one_shot_op(&inner.vk, pool_for_init_clears, |vk, cb| {
@@ -3249,11 +3250,13 @@ impl RenderEngine {
                 Ok(())
             })
             .map_err(|e| {
-                log::error!("v2 ensure_render_assets: solid_src init-clear submit failed: {e:?}");
+                log::error!(
+                    "render ensure_render_assets: solid_src init-clear submit failed: {e:?}"
+                );
                 RenderError::Vk(e)
             })?;
             log::info!(
-                "v2 ensure_render_assets: solid_src_image image={:?} view={:?}",
+                "render ensure_render_assets: solid_src_image image={:?} view={:?}",
                 s.image(),
                 s.image_view(),
             );
@@ -3261,7 +3264,9 @@ impl RenderEngine {
         }
         if inner.solid_mask_image.is_none() {
             let mut s = SolidColorImage::new(Arc::clone(&inner.vk)).map_err(|e| {
-                log::error!("v2 ensure_render_assets: solid_mask SolidColorImage failed: {e:?}");
+                log::error!(
+                    "render ensure_render_assets: solid_mask SolidColorImage failed: {e:?}"
+                );
                 RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
             })?;
             crate::kms::vk::ops::run_one_shot_op(&inner.vk, pool_for_init_clears, |vk, cb| {
@@ -3269,11 +3274,13 @@ impl RenderEngine {
                 Ok(())
             })
             .map_err(|e| {
-                log::error!("v2 ensure_render_assets: solid_mask init-clear submit failed: {e:?}");
+                log::error!(
+                    "render ensure_render_assets: solid_mask init-clear submit failed: {e:?}"
+                );
                 RenderError::Vk(e)
             })?;
             log::info!(
-                "v2 ensure_render_assets: solid_mask_image image={:?} view={:?}",
+                "render ensure_render_assets: solid_mask_image image={:?} view={:?}",
                 s.image(),
                 s.image_view(),
             );
@@ -3281,7 +3288,9 @@ impl RenderEngine {
         }
         if inner.white_mask_image.is_none() {
             let mut s = SolidColorImage::new(Arc::clone(&inner.vk)).map_err(|e| {
-                log::error!("v2 ensure_render_assets: white_mask SolidColorImage failed: {e:?}");
+                log::error!(
+                    "render ensure_render_assets: white_mask SolidColorImage failed: {e:?}"
+                );
                 RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
             })?;
             crate::kms::vk::ops::run_one_shot_op(&inner.vk, pool_for_init_clears, |vk, cb| {
@@ -3289,11 +3298,11 @@ impl RenderEngine {
                 Ok(())
             })
             .map_err(|e| {
-                log::error!("v2 ensure_render_assets: white-clear submit failed: {e:?}");
+                log::error!("render ensure_render_assets: white-clear submit failed: {e:?}");
                 RenderError::Vk(e)
             })?;
             log::info!(
-                "v2 ensure_render_assets: white_mask_image image={:?} view={:?}",
+                "render ensure_render_assets: white_mask_image image={:?} view={:?}",
                 s.image(),
                 s.image_view(),
             );
@@ -3329,14 +3338,14 @@ impl RenderEngine {
         if inner.trap_pipeline.is_none() {
             let p =
                 TrapPipeline::new(Arc::clone(&inner.vk), vk::Format::R8_UNORM).map_err(|e| {
-                    log::error!("v2 ensure_trap_assets: TrapPipeline::new failed: {e:?}");
+                    log::error!("render ensure_trap_assets: TrapPipeline::new failed: {e:?}");
                     RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
                 })?;
             inner.trap_pipeline = Some(p);
         }
         if inner.mask_scratch.is_none() {
             let s = MaskScratch::new(Arc::clone(&inner.vk)).map_err(|e| {
-                log::error!("v2 ensure_trap_assets: MaskScratch::new failed: {e:?}");
+                log::error!("render ensure_trap_assets: MaskScratch::new failed: {e:?}");
                 RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
             })?;
             inner.mask_scratch = Some(s);
@@ -3345,7 +3354,7 @@ impl RenderEngine {
     }
 
     /// Stage 3c: invalidate any cached drawable views referencing
-    /// `id`. Called by `KmsBackendV2` after a drawable has actually
+    /// `id`. Called by `KmsBackend` after a drawable has actually
     /// retired (storage destroyed); evicting earlier would leave
     /// dangling Vk handles since `vk::ImageView`'s underlying image
     /// is gone.
@@ -3755,7 +3764,7 @@ impl RenderEngine {
         let cache =
             LogicFillPipelineCache::new(Arc::clone(&inner.vk), color_format).map_err(|e| {
                 log::error!(
-                    "v2 ensure_logic_fill_cache: LogicFillPipelineCache::new failed: {e:?}"
+                    "render ensure_logic_fill_cache: LogicFillPipelineCache::new failed: {e:?}"
                 );
                 RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
             })?;
@@ -4745,7 +4754,7 @@ impl RenderEngine {
             .expect("ensured")
             .get(std_op, dst_format, dst_has_alpha, mask_component_alpha)
             .map_err(|e| {
-                log::warn!("v2 try_append_render_batch: pipeline build failed: {e:?}");
+                log::warn!("render try_append_render_batch: pipeline build failed: {e:?}");
                 RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
             })?;
         let pipeline_layout = inner
@@ -4986,7 +4995,7 @@ impl RenderEngine {
         reason.record();
         if platform.renderer_failed {
             log::debug!(
-                "v2 flush_render_batch: renderer_failed; dropping batch \
+                "render flush_render_batch: renderer_failed; dropping batch \
                  (coalesced {} composites)",
                 batch.coalesced_count,
             );
@@ -5407,7 +5416,7 @@ impl RenderEngine {
         // (project_cinnamon_nvidia_chop_shm_getimage). Gated on the same
         // YSERVER_LOOP_TELEMETRY toggle as the rest of v2 telemetry, and
         // emitted in the same grep/awk-parsable `key=value` line format so it
-        // sits alongside the `v2_telemetry:` lines. Only the slow tail
+        // sits alongside the `render_telemetry:` lines. Only the slow tail
         // (>= GET_IMAGE_SLOW_MS) logs, so the common fast read stays silent and
         // the 50-300ms outliers stand out. `wait_ms` dominating ⇒ blocked on
         // the readback fence (behind the in-flight compose); `close_frame_ms`/
@@ -5470,7 +5479,7 @@ impl RenderEngine {
     /// and queues a draw at the supplied destination coords.
     /// Stage 3a: drive a single text run against `target`'s
     /// storage. CPU-side glyph rasterisation is the caller's
-    /// concern (KmsBackendV2 wraps the v1 FreeType path); the
+    /// concern (KmsBackend wraps the v1 FreeType path); the
     /// engine takes the resulting [`PreparedGlyph`] slice, interns
     /// each into the atlas, and records one TextPipeline draw
     /// covering the whole run.
@@ -5539,7 +5548,7 @@ impl RenderEngine {
         };
         if target_format != vk::Format::B8G8R8A8_UNORM {
             log::warn!(
-                "v2 image_text (frame_builder): target xid={:?} has format {:?}; \
+                "render image_text (frame_builder): target xid={:?} has format {:?}; \
                  text pipeline only supports B8G8R8A8_UNORM — dropping run",
                 store.get(target).map(|d| d.xid),
                 target_format,
@@ -5547,13 +5556,13 @@ impl RenderEngine {
             return Ok(stats);
         }
 
-        // (4) Lazy-init V2GlyphAtlas + TextPipeline (preserve
+        // (4) Lazy-init GlyphAtlas + TextPipeline (preserve
         //     engine.rs:4531-4553 verbatim in spirit).
         if inner.glyph_atlas.is_none() {
-            match V2GlyphAtlas::new(Arc::clone(&inner.vk)) {
+            match GlyphAtlas::new(Arc::clone(&inner.vk)) {
                 Ok(a) => inner.glyph_atlas = Some(a),
                 Err(e) => {
-                    log::error!("v2 image_text (frame_builder): V2GlyphAtlas::new failed: {e:?}");
+                    log::error!("render image_text (frame_builder): GlyphAtlas::new failed: {e:?}");
                     return Err(RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED));
                 }
             }
@@ -5608,7 +5617,7 @@ impl RenderEngine {
             let atlas_pre_layout: vk::ImageLayout = inner
                 .glyph_atlas
                 .as_ref()
-                .map(super::glyph_atlas::V2GlyphAtlas::current_layout)
+                .map(super::glyph_atlas::GlyphAtlas::current_layout)
                 .unwrap_or(vk::ImageLayout::UNDEFINED);
             let open = inner.frame_builder.open.as_mut().expect("open");
             if open.atlas_prev_ticket_snapshot.is_none() {
@@ -5691,7 +5700,7 @@ impl RenderEngine {
                 let copy_len = (w_u as usize) * (h_u as usize);
                 if g.pixels.len() < copy_len {
                     log::warn!(
-                        "v2 image_text (frame_builder): glyph pixels {} < {} expected; \
+                        "render image_text (frame_builder): glyph pixels {} < {} expected; \
                          dropping pre-pack",
                         g.pixels.len(),
                         copy_len,
@@ -5875,7 +5884,7 @@ impl RenderEngine {
     // ── Op: composite_glyphs (Stage 3d) ─────────────────────────
 
     /// Record a RENDER `CompositeGlyphs` against `dst`. Backend
-    /// wrapper (`KmsBackendV2::render_composite_glyphs`) is
+    /// wrapper (`KmsBackend::render_composite_glyphs`) is
     /// responsible for: (a) gating on `op == Over` + SolidFill
     /// source (plan §3d "v1-parity scope"), (b) parsing the
     /// `items` glyph-element stream including the inline `0xFF 0
@@ -6009,7 +6018,7 @@ impl RenderEngine {
             || (dst_format == vk::Format::R8_UNORM && dst_depth == 8);
         if !dst_supported {
             log::warn!(
-                "v2 composite_glyphs (frame_builder): dst xid={:?} has format {:?} \
+                "render composite_glyphs (frame_builder): dst xid={:?} has format {:?} \
                  depth {dst_depth}; text pipeline supports B8G8R8A8_UNORM and \
                  depth-8 R8_UNORM — dropping run",
                 store.get(dst_id).map(|d| d.xid),
@@ -6026,11 +6035,11 @@ impl RenderEngine {
         //     pipeline entry. Build at RECORD time so emit can look
         //     the entry up immutably.
         if inner.glyph_atlas.is_none() {
-            match V2GlyphAtlas::new(Arc::clone(&inner.vk)) {
+            match GlyphAtlas::new(Arc::clone(&inner.vk)) {
                 Ok(a) => inner.glyph_atlas = Some(a),
                 Err(e) => {
                     log::error!(
-                        "v2 composite_glyphs (frame_builder): V2GlyphAtlas::new failed: {e:?}"
+                        "render composite_glyphs (frame_builder): GlyphAtlas::new failed: {e:?}"
                     );
                     return Err(RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED));
                 }
@@ -6088,7 +6097,7 @@ impl RenderEngine {
         // (5) Snapshot atlas prev ticket + atlas layout (first-touch
         //     only). The atlas snapshot is the rollback target if the
         //     close fails AFTER any upload op recorded; record_upload
-        //     mutates `V2GlyphAtlas::current_layout` in place.
+        //     mutates `GlyphAtlas::current_layout` in place.
         {
             let atlas_pre_ticket: Option<FenceTicket> = inner
                 .glyph_atlas
@@ -6097,7 +6106,7 @@ impl RenderEngine {
             let atlas_pre_layout: vk::ImageLayout = inner
                 .glyph_atlas
                 .as_ref()
-                .map(super::glyph_atlas::V2GlyphAtlas::current_layout)
+                .map(super::glyph_atlas::GlyphAtlas::current_layout)
                 .unwrap_or(vk::ImageLayout::UNDEFINED);
             let open = inner.frame_builder.open.as_mut().expect("open");
             if open.atlas_prev_ticket_snapshot.is_none() {
@@ -6191,7 +6200,7 @@ impl RenderEngine {
             let atlas_pre_layout_reopened = inner
                 .glyph_atlas
                 .as_ref()
-                .map(super::glyph_atlas::V2GlyphAtlas::current_layout)
+                .map(super::glyph_atlas::GlyphAtlas::current_layout)
                 .unwrap_or(vk::ImageLayout::UNDEFINED);
             let atlas_pre_ticket_reopened = inner
                 .glyph_atlas
@@ -6213,7 +6222,7 @@ impl RenderEngine {
             // single call".
             if prospective_misses > ceiling {
                 log::warn!(
-                    "v2 composite_glyphs (frame_builder): single call requested {} \
+                    "render composite_glyphs (frame_builder): single call requested {} \
                      atlas misses but per-frame ceiling is {}; will drop excess",
                     prospective_misses,
                     ceiling,
@@ -6301,7 +6310,7 @@ impl RenderEngine {
                 // 2026-07-08 render-optimization gaps).
                 let Some(a8) = g.pixels.to_a8(g.w, g.h) else {
                     log::warn!(
-                        "v2 composite_glyphs (frame_builder): glyph pixels too short \
+                        "render composite_glyphs (frame_builder): glyph pixels too short \
                          for {}x{}; dropping pre-pack",
                         g.w,
                         g.h,
@@ -6620,7 +6629,38 @@ impl RenderEngine {
         // exists anymore. No M2 close here — this IS the frame
         // builder; closing the open frame at the top would defeat op
         // collapse.
-        self.render_composite_via_frame_builder(
+        //
+        // XFCE-submenu fix — SOURCE-CLASS submit boundary. A Composite
+        // whose SOURCE is an active redirect-target backing (xfwm's
+        // redirected popup window backings) is submitted in ISOLATION:
+        // the open frame is closed before AND after recording it, so no
+        // other op shares its submission. When >1 redirect-source
+        // Composite batches into one submit, the compositor intermittently
+        // samples stale/zero source content and the popup composites empty
+        // (submenu "painted into its backing but absent from xfwm's
+        // frame"), self-healing on the next incidental recomposite. This
+        // only bites when the frame batches ≥2 such composites, which is
+        // why it reproduces on integrated GPUs (eiger/air, and any bare-TTY
+        // launch that pauses the loop between composites) but not the
+        // discrete RX580 or a lightdm launch (both drain ~1 composite per
+        // submit). Global close-after-EACH proved the fix but stormed
+        // Cinnamon (300-400 submits/s); a dependency-(write→sample) keyed
+        // boundary failed to reproduce its correctness. Restricting to the
+        // source CLASS keeps ordinary composites (GL compositors, app
+        // paints) batched while isolating exactly xfwm's popup composites.
+        // HW-confirmed on eiger TTY 2026-07-13.
+        let src_is_redirect_backing = match &src {
+            ResolvedSource::Drawable(id) => store.is_active_redirect_target(*id),
+            _ => false,
+        };
+        if src_is_redirect_backing {
+            self.close_open_frame(
+                store,
+                platform,
+                super::frame_builder::CloseReason::RedirectSourceBoundary,
+            )?;
+        }
+        let stats = self.render_composite_via_frame_builder(
             store,
             platform,
             op,
@@ -6637,7 +6677,15 @@ impl RenderEngine {
             src_pict_format,
             mask_pict_format,
             dst_pict_format,
-        )
+        )?;
+        if src_is_redirect_backing {
+            self.close_open_frame(
+                store,
+                platform,
+                super::frame_builder::CloseReason::RedirectSourceBoundary,
+            )?;
+        }
+        Ok(stats)
     }
 
     /// Phase B.2 Task 9: frame-builder composite path — prelude only.
@@ -6730,7 +6778,7 @@ impl RenderEngine {
             vk::Format::B8G8R8A8_UNORM | vk::Format::R8_UNORM
         ) {
             log::debug!(
-                "v2 render_composite (frame_builder) gap: dst format \
+                "render render_composite (frame_builder) gap: dst format \
                  {dst_format:?} not BGRA/R8 (dst id={dst_id:?})"
             );
             return Ok(stats);
@@ -6740,7 +6788,7 @@ impl RenderEngine {
         // Map the protocol op byte to the pipeline cache's enum.
         let Some(std_op) = StdPictOp::from_u8(op) else {
             log::debug!(
-                "v2 render_composite (frame_builder) gap: unsupported op {op} \
+                "render render_composite (frame_builder) gap: unsupported op {op} \
                  (dst id={dst_id:?})"
             );
             return Ok(stats);
@@ -6809,7 +6857,7 @@ impl RenderEngine {
                     .ensure_returning_old(dst_format, dst_extent.width, dst_extent.height)
                     .map_err(|e| {
                         log::warn!(
-                            "v2 render_composite (frame_builder): dst_readback \
+                            "render render_composite (frame_builder): dst_readback \
                              ensure failed: {e:?}"
                         );
                         RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
@@ -6828,7 +6876,7 @@ impl RenderEngine {
                     .ensure_returning_old(dst_format, dst_extent.width, dst_extent.height)
                     .map_err(|e| {
                         log::warn!(
-                            "v2 render_composite (frame_builder): \
+                            "render render_composite (frame_builder): \
                              src_alias_readback ensure failed: {e:?}"
                         );
                         RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
@@ -6924,14 +6972,14 @@ impl RenderEngine {
                 Ok(Some(v)) => Some(v),
                 Ok(None) => {
                     log::warn!(
-                        "v2 render_composite (frame_builder): \
+                        "render render_composite (frame_builder): \
                          src_alias_readback view None — skipping"
                     );
                     return Ok(stats);
                 }
                 Err(e) => {
                     log::warn!(
-                        "v2 render_composite (frame_builder): \
+                        "render render_composite (frame_builder): \
                          src_alias_readback view build failed: {e:?}"
                     );
                     return Ok(stats);
@@ -6964,14 +7012,14 @@ impl RenderEngine {
                 Ok(Some(v)) => Some(v),
                 Ok(None) => {
                     log::warn!(
-                        "v2 render_composite (frame_builder): \
+                        "render render_composite (frame_builder): \
                          dst_readback view None — skipping"
                     );
                     return Ok(stats);
                 }
                 Err(e) => {
                     log::warn!(
-                        "v2 render_composite (frame_builder): \
+                        "render render_composite (frame_builder): \
                          dst_readback view build failed: {e:?}"
                     );
                     return Ok(stats);
@@ -7075,7 +7123,7 @@ impl RenderEngine {
                         }
                         None => {
                             log::debug!(
-                                "v2 render_composite (frame_builder) gap: \
+                                "render render_composite (frame_builder) gap: \
                                  gradient picture 0x{xid:x} missing from \
                                  engine.picture_paint (LUT build likely failed)"
                             );
@@ -7085,7 +7133,7 @@ impl RenderEngine {
                 }
                 ResolvedSource::None => {
                     log::debug!(
-                        "v2 render_composite (frame_builder) gap: src is \
+                        "render render_composite (frame_builder) gap: src is \
                          None (protocol requires src)"
                     );
                     return Ok(stats);
@@ -7153,7 +7201,7 @@ impl RenderEngine {
                         }
                         None => {
                             log::debug!(
-                                "v2 render_composite (frame_builder) gap: \
+                                "render render_composite (frame_builder) gap: \
                                  gradient mask picture 0x{xid:x} missing \
                                  from engine.picture_paint (LUT build likely \
                                  failed)"
@@ -7189,7 +7237,7 @@ impl RenderEngine {
             .get(std_op, dst_format, dst_has_alpha, mask_component_alpha)
             .map_err(|e| {
                 log::warn!(
-                    "v2 render_composite (frame_builder): pipeline build failed \
+                    "render render_composite (frame_builder): pipeline build failed \
                      for op {op}: {e:?}"
                 );
                 RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
@@ -7489,20 +7537,20 @@ impl RenderEngine {
             dst_format,
             vk::Format::B8G8R8A8_UNORM | vk::Format::R8_UNORM
         ) {
-            log::debug!("v2 render_traps_or_tris gap: dst format {dst_format:?} unsupported");
+            log::debug!("render render_traps_or_tris gap: dst format {dst_format:?} unsupported");
             return Ok(stats);
         }
         // Audit #4 (2026-05-19): pict_format-aware dst alpha.
         let dst_has_alpha = dst_has_alpha_for_pict_format(dst_format, dst_depth, dst_pict_format);
         let Some(std_op) = StdPictOp::from_u8(op) else {
-            log::debug!("v2 render_traps_or_tris gap: unsupported op {op}");
+            log::debug!("render render_traps_or_tris gap: unsupported op {op}");
             return Ok(stats);
         };
         let needs_dst_readback = std_op.needs_dst_readback();
 
         // Self-alias gate (preserve legacy at engine.rs:7271-7274).
         if matches!(src, ResolvedSource::Drawable(id) if id == dst_id) {
-            log::debug!("v2 render_traps_or_tris gap: src self-alias (out of scope for 3e.2)");
+            log::debug!("render render_traps_or_tris gap: src self-alias (out of scope for 3e.2)");
             return Ok(stats);
         }
 
@@ -7562,7 +7610,7 @@ impl RenderEngine {
                     .expect("ensured")
                     .ensure_image_size_returning_old(bbox_w, bbox_h)
                     .map_err(|e| {
-                        log::warn!("v2 render_traps_or_tris: mask ensure_image_size: {e:?}");
+                        log::warn!("render render_traps_or_tris: mask ensure_image_size: {e:?}");
                         RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
                     })?
             };
@@ -7606,7 +7654,7 @@ impl RenderEngine {
                         .expect("ensured")
                         .ensure_returning_old(dst_format, dst_extent.width, dst_extent.height)
                         .map_err(|e| {
-                            log::warn!("v2 render_traps_or_tris: dst readback ensure: {e:?}");
+                            log::warn!("render render_traps_or_tris: dst readback ensure: {e:?}");
                             RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
                         })?
                 };
@@ -7646,14 +7694,14 @@ impl RenderEngine {
                     }
                     None => {
                         log::debug!(
-                            "v2 render_traps_or_tris gap: gradient picture 0x{xid:x} \
+                            "render render_traps_or_tris gap: gradient picture 0x{xid:x} \
                              missing from engine.picture_paint (LUT build likely failed)"
                         );
                         return Ok(stats);
                     }
                 },
                 ResolvedSource::None => {
-                    log::debug!("v2 render_traps_or_tris gap: src None");
+                    log::debug!("render render_traps_or_tris gap: src None");
                     return Ok(stats);
                 }
             }
@@ -8335,7 +8383,7 @@ pub(crate) struct CompositeGlyphInput<'a> {
 }
 
 /// Telemetry surface for one [`RenderEngine::image_text`] call.
-/// Caller (KmsBackendV2) feeds these into the telemetry sink so
+/// Caller (KmsBackend) feeds these into the telemetry sink so
 /// `atlas_intern/s`, `glyph_uploads/s`, and the lifetime
 /// `glyphs_dropped_atlas_full` counter all stay accurate.
 #[derive(Debug, Default, Clone, Copy)]
@@ -10585,7 +10633,7 @@ impl CompositeTarget for RecordedCompositeTarget {
 /// - **Touched-drawable `last_render_ticket` commit:** no-op — the
 ///   recorder already called `store.touch_render_fence` at append.
 /// - **Atlas layout commit:** the B.1 recorder mutates
-///   `V2GlyphAtlas::current_layout` in place during composite_glyphs,
+///   `GlyphAtlas::current_layout` in place during composite_glyphs,
 ///   so the atlas overlay is structurally empty on B.1 frames.
 ///   Reserved as a no-op-friendly write for Task 11 (when ported ops
 ///   read the atlas layout via overlay too). Idempotent against the
@@ -12288,7 +12336,7 @@ mod tests {
     //
     // Each `#[ignore]` test needs a live Vulkan ICD (lavapipe is
     // fine). Run with:
-    //   `cargo test -p yserver --lib kms::v2::engine::tests:: -- --ignored`
+    //   `cargo test -p yserver --lib kms::render::engine::tests:: -- --ignored`
     // The Stage 2 acceptance harness (Stage 2f) folds these into
     // the synthetic acceptance binary.
 
@@ -13590,7 +13638,7 @@ mod tests {
     // round-trips via `get_image` and asserts pixel-level
     // correctness against a CPU oracle. The seventh acceptance
     // test (`render_composite_no_gc_clip_leak`) lives in
-    // `tests/v2_acceptance.rs` because the "no GC clip leak"
+    // `tests/acceptance.rs` because the "no GC clip leak"
     // property is a Backend-trait invariant (engine has no GC
     // clip notion).
 
@@ -15179,7 +15227,7 @@ mod tests {
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn engine_exposes_descriptor_pool_ring_lifetime_counters() {
-        let b = match super::super::backend::KmsBackendV2::for_tests_with_vk() {
+        let b = match super::super::backend::KmsBackend::for_tests_with_vk() {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("skipping: no Vk: {e}");

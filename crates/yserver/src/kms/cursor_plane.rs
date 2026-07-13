@@ -570,7 +570,7 @@ mod tests {
     /// VT-leave / shutdown / drain_all hooks can fire blindly.
     #[test]
     fn unavailable_plane_returns_err_not_panic() {
-        use crate::kms::v2::platform::PlatformBackend;
+        use crate::kms::render::platform::PlatformBackend;
 
         let mut p = PlatformBackend::for_tests();
         assert!(!p.cursor_plane_available());

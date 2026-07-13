@@ -33,7 +33,7 @@ use std::{
 
 use ash::vk;
 
-use crate::kms::{v2::batch_resource::BatchResource, vk::device::VkContext};
+use crate::kms::{render::batch_resource::BatchResource, vk::device::VkContext};
 
 /// Per-bucket cap. 32 BGRA8 256×256 images is 8 MB per bucket
 /// (post-MAX_POOLED_DIM=256 bump 2026-05-26); across ~4–8 active

@@ -47,7 +47,7 @@ pub(crate) enum CloseReason {
     /// Idle / no-pageflip case. A frame open > T ms forces close to
     /// release pinned resources.
     Timeout,
-    /// `KmsBackendV2::shutdown` is tearing down platform state.
+    /// `KmsBackend::shutdown` is tearing down platform state.
     Shutdown,
     /// `max_pinned_resources_per_frame` ceiling hit (1024 default).
     PinCeiling,
@@ -63,6 +63,15 @@ pub(crate) enum CloseReason {
                   enumerates it and downstream code can match it."
     )]
     ScratchGrow,
+    /// A RENDER Composite whose SOURCE is an active redirect-target
+    /// backing (xfwm's redirected popup backings) is isolated into its
+    /// own submit — the open frame is closed before AND after recording
+    /// it. Batching >1 such composite into one deferred submit made the
+    /// compositor sample stale/zero source content, compositing popups
+    /// empty (the XFCE "submenu painted but not shown" bug, fixed
+    /// 2026-07-13). Ordinary composites stay batched. See
+    /// `RenderEngine::render_composite`.
+    RedirectSourceBoundary,
 }
 
 /// `FrameBuilder` lifecycle. `Closed` is the hot path for X11 traffic
@@ -323,7 +332,7 @@ pub(crate) struct OpenFrame {
     pub(crate) layouts: FrameLayoutTable,
     pub(crate) touched: TouchedDrawables,
     pub(crate) pending_glyph_inserts: PendingGlyphInserts,
-    /// Snapshot of `V2GlyphAtlas::last_render_ticket` taken at the first
+    /// Snapshot of `GlyphAtlas::last_render_ticket` taken at the first
     /// glyph append-in-frame. `Some(None)` means "the atlas had no
     /// prior ticket" — distinct from `None` which means "not yet
     /// touched in this frame".
@@ -389,7 +398,7 @@ mod state_tests {
     }
 
     #[test]
-    fn close_reason_has_nine_variants_for_b2() {
+    fn close_reason_has_ten_variants() {
         fn _exhaustive(r: CloseReason) -> &'static str {
             match r {
                 CloseReason::SceneCompose => "scene_compose",
@@ -401,10 +410,15 @@ mod state_tests {
                 CloseReason::Shutdown => "shutdown",
                 CloseReason::PinCeiling => "pin_ceiling",
                 CloseReason::ScratchGrow => "scratch_grow",
+                CloseReason::RedirectSourceBoundary => "redirect_source_boundary",
             }
         }
         assert_eq!(_exhaustive(CloseReason::SceneCompose), "scene_compose");
         assert_eq!(_exhaustive(CloseReason::ScratchGrow), "scratch_grow");
+        assert_eq!(
+            _exhaustive(CloseReason::RedirectSourceBoundary),
+            "redirect_source_boundary"
+        );
     }
 }
 
@@ -1018,7 +1032,7 @@ pub(crate) struct FramePinSet {
     /// `submitted.back` instead. The field is wired now so the
     /// helper compiles; B.3+ may populate it when mid-frame retire
     /// becomes possible.
-    pub(crate) retired_resources: Vec<Box<dyn crate::kms::v2::batch_resource::BatchResource>>,
+    pub(crate) retired_resources: Vec<Box<dyn crate::kms::render::batch_resource::BatchResource>>,
 }
 
 impl FramePinSet {
@@ -1049,7 +1063,7 @@ impl FramePinSet {
     )]
     pub(crate) fn adopt_retired(
         &mut self,
-        boxed: Box<dyn crate::kms::v2::batch_resource::BatchResource>,
+        boxed: Box<dyn crate::kms::render::batch_resource::BatchResource>,
     ) {
         self.retired_resources.push(boxed);
     }
@@ -1070,7 +1084,7 @@ mod pin_tests {
 
     // No-Vk pin tests can't construct a real StagingBuffer (it owns Vk
     // handles). Pin tests here verify the bookkeeping; integration
-    // tests in v2_acceptance.rs verify the real-Vk path.
+    // tests in acceptance.rs verify the real-Vk path.
 
     #[test]
     fn fresh_pin_set_is_empty() {
@@ -1089,7 +1103,7 @@ mod pin_tests {
         // test never calls `release`; it only verifies bookkeeping.
         #[derive(Debug)]
         struct FakeRetired;
-        impl crate::kms::v2::batch_resource::BatchResource for FakeRetired {
+        impl crate::kms::render::batch_resource::BatchResource for FakeRetired {
             fn release(self: Box<Self>, _vk: &crate::kms::vk::device::VkContext) {
                 // No-op: test never invokes this path.
             }
@@ -1380,7 +1394,7 @@ mod op_tests {
             user_src_xform: crate::kms::vk::ops::render::AffineXform::IDENTITY,
             src_origin_x: 0,
             src_origin_y: 0,
-            prim_kind: crate::kms::v2::engine::TrapPrimKind::Trapezoid,
+            prim_kind: crate::kms::render::engine::TrapPrimKind::Trapezoid,
             bbox_x: 0,
             bbox_y: 0,
             bbox_w: 0,
@@ -1426,7 +1440,7 @@ mod op_tests {
         ];
 
         // Mirror the filter_map from close_open_frame's scratch walk.
-        let scratches: Vec<crate::kms::v2::engine::ScratchImage> = ops
+        let scratches: Vec<crate::kms::render::engine::ScratchImage> = ops
             .iter()
             .filter_map(|op| match op {
                 RecordedOp::CopyArea(_) => {
@@ -1467,7 +1481,7 @@ pub(crate) struct LayoutOverlayEntry {
 ///
 /// Atlas image layout is tracked separately: the overlay carries a
 /// single `Option<LayoutOverlayEntry>` for the atlas because there's
-/// exactly one atlas per engine, and `V2GlyphAtlas::current_layout`
+/// exactly one atlas per engine, and `GlyphAtlas::current_layout`
 /// is the single source of truth that the commit step writes back.
 #[derive(Debug, Default)]
 pub(crate) struct FrameLayoutTable {
@@ -1676,10 +1690,10 @@ mod touched_tests {
 }
 
 /// Pending glyph cache inserts. `composite_glyphs`'s upload path
-/// already calls `V2GlyphAtlas::pack` (shelf advance, monotonic — the
+/// already calls `GlyphAtlas::pack` (shelf advance, monotonic — the
 /// slot stays consumed even if the frame fails), but `insert_entry`
 /// (cache commit) is deferred here. Close-success drains this and
-/// calls `V2GlyphAtlas::insert_entry` on the atlas; close-failure
+/// calls `GlyphAtlas::insert_entry` on the atlas; close-failure
 /// drops the list — the slot leaks but the cache stays consistent
 /// (next paint re-packs).
 #[derive(Debug, Default)]

@@ -6,8 +6,8 @@ pub mod kms;
 pub mod launch;
 pub(crate) mod platform;
 pub mod present;
-mod seat;
 pub mod version;
+mod vt;
 
 use std::{fs, io, path::PathBuf, thread};
 
@@ -41,21 +41,51 @@ fn install_backend_root_bindings(state: &mut ServerState, backend: &dyn Backend)
     }
 }
 
-/// Refuse to start when libinput's initial seat enumeration opened zero input
-/// devices. A display server with no keyboard or mouse is unusable — the only
-/// escape is to VT-switch and zap — so we fail fast with an actionable error
-/// pointing at the usual cause (issue #64) instead of coming up dead. `opened`
-/// is the count of `DeviceAdded` events from the initial dispatch.
+/// Refuse to start when libinput's initial seat enumeration opened zero
+/// **usable** (keyboard- or pointer-capable) input devices. A display server
+/// with no keyboard or mouse is unusable — you can't even zap out — so we fail
+/// fast with an actionable error instead of coming up dead (issue #64).
+///
+/// `opened` counts keyboard/pointer-capable devices only. This matters when the
+/// process lacks input access (e.g. started over SSH, not from the console): the
+/// real keyboard/mouse are permission-denied, yet a lone non-usable node (e.g. a
+/// HID "System Control" collection) can still open — that must not satisfy the
+/// guard.
 fn ensure_input_devices_opened(opened: usize) -> io::Result<()> {
     if opened == 0 {
         return Err(io::Error::other(
-            "no input devices could be opened under /dev/input.\n\
-             This usually means the user is not in the 'input' group or not \
-             active on seat0.\n\
-             See `loginctl seat-status seat0`, or add the user to the 'input' group.",
+            "no usable input devices (keyboard or pointer) could be opened under \
+             /dev/input (the device nodes exist but are permission-denied).\n\
+             yserver needs direct access to input devices: add the user to the \
+             'input' group, and start it from the console — not over SSH.",
         ));
     }
     Ok(())
+}
+
+/// What the startup path should do about input: spawn the input thread if a
+/// libinput context was created, or refuse to start if not.
+#[derive(Debug, PartialEq, Eq)]
+enum InputStartup {
+    /// A live libinput context — spawn the input thread.
+    DirectSpawn,
+    /// No libinput context at all — refuse to start.
+    AbortNoInput,
+}
+
+/// Decide the input-startup action. yserver is always Direct and requires
+/// input: coming up without it yields a session that is dead on arrival and
+/// cannot even be zapped (zap is itself an input event), so we refuse to start.
+/// `has_input_ctx == false` means `SendContext::new()` failed — libinput was
+/// unavailable or every input device was permission-denied (not in the `input`
+/// group / not on the console). Extracted as a pure fn so the abort is
+/// unit-testable; `run()` itself is not.
+fn input_startup_action(has_input_ctx: bool) -> InputStartup {
+    if has_input_ctx {
+        InputStartup::DirectSpawn
+    } else {
+        InputStartup::AbortNoInput
+    }
 }
 
 pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
@@ -72,6 +102,23 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     // dies during startup and we get reparented, getppid() at readiness
     // would point at a subreaper or PID 1. Xorg captures it the same way.
     let parent_pid = launch::startup_parent_pid();
+
+    // Block the termination signals and take the signalfd BEFORE spawning
+    // ANY thread. A process-directed signal (e.g. the `kill -TERM` a
+    // launcher sends at shutdown) is delivered by the kernel to an
+    // ARBITRARY thread that has not blocked it. If even one thread has
+    // SIGTERM unblocked — e.g. the `YSERVER_LOOP_TELEMETRY` vk-call-rate
+    // thread spawned just below, which previously started before this
+    // point and so inherited the empty startup mask — the signal lands
+    // there and runs the DEFAULT action, terminating the process WITHOUT
+    // the signalfd, the graceful `Message::Shutdown`, or
+    // `ConsoleGuard::Drop`. On a VC that left the console dead (K_OFF +
+    // KD_GRAPHICS never restored) — the telemetry-mode-logout hang. Block
+    // here, first, so every later-spawned thread inherits the mask and the
+    // signal can only reach the signalfd. MUST stay after
+    // `sigusr1_is_ignored()` above, which reads the inherited SIGUSR1
+    // disposition before we mask it.
+    let signal_fd = block_termination_signals()?;
 
     // Vulkan-call-rate telemetry: emit a per-second snapshot of
     // call counters from `kms::vk::call_stats::VK_CALLS`. Gated on
@@ -248,8 +295,6 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
         });
     }
 
-    let signal_fd = block_termination_signals()?;
-
     // Take over the console TTY before opening anything else: stops the
     // kernel keyboard driver from delivering Ctrl-C / Ctrl-Z / etc. as
     // signals to the controlling TTY's foreground process group, which
@@ -270,16 +315,10 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
             .join(", ")
     );
 
-    // Open the seat first so DRM + input device opens can route through
-    // it in libseat mode. Falls back to `Seat::Direct` silently when
-    // libseat is unavailable (no seat manager / not on a real VT).
-    let seat = crate::seat::Seat::open();
-
-    // Build the backend in seat-aware fashion. In libseat mode the DRM
-    // card is opened through the seat and libinput lives on the core
-    // thread. In Direct mode today's behaviour is preserved exactly.
-    let mut backend =
-        build_kms_backend_v2(seat, &device_paths, console_guard, opts.layout.clone())?;
+    // Always Direct (self-managed DRM master + VT_PROCESS): open DRM +
+    // libinput directly, arming VT_PROCESS when a controlling console is
+    // present.
+    let mut backend = build_kms_backend(&device_paths, console_guard, opts.layout.clone())?;
     let (fb_w, fb_h) = backend.fb_dimensions();
     log::info!("yserver: scanout {fb_w}x{fb_h}");
 
@@ -344,69 +383,83 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     // Build the channel + waker before spawning anything: senders need
     // a clone, run_core needs the receiver.
     let (poll, sender, rx) = core_loop::channel()?;
+    // Backend-originated failures (GPU/device loss, unrecoverable VT resume
+    // errors) use the same core-channel shutdown path as input hotkeys.
+    backend.set_input_sender(sender.clone_handle());
 
-    // Libseat mode: the backend owns libinput on the core thread.
-    // Hand it the sender for Shutdown/Dump messages from the on-core
-    // hotkey path. No input thread in this mode.
-    //
-    // Direct mode: spawn the dedicated libinput sender thread exactly
-    // as before. After `take_input_ctx`, the backend's `poll_fds()`
-    // returns only the DRM fd, so run_core's E3 registration step
-    // won't double-poll libinput.
-    if backend.is_libseat_mode() {
-        backend.set_input_sender(sender.clone_handle());
-        log::info!("yserver: libseat mode — libinput on core thread, no input thread spawned");
-    } else if let Some(mut input_ctx) = backend.take_input_ctx() {
-        // Drain libinput's initial seat enumeration here, on the main thread,
-        // BEFORE signalling readiness — so we can refuse to start when no input
-        // device could be opened (issue #64) rather than coming up with a dead
-        // keyboard and mouse. `udev_assign_seat` queues `DeviceAdded`
-        // synchronously and a single dispatch consumes the initial enumeration
-        // (the same contract the input thread relied on). The drained events
-        // are handed to the thread so device registration is unchanged.
-        let initial_events = match input_ctx.dispatch() {
-            Ok(evs) => evs,
-            Err(err) => {
-                log::warn!("yserver: initial libinput dispatch: {err}");
-                Vec::new()
-            }
-        };
-        let opened = initial_events
-            .iter()
-            .filter(|e| matches!(e, crate::input::InputEvent::DeviceAdded(_)))
-            .count();
-        ensure_input_devices_opened(opened)?;
-        log::info!("yserver: {opened} input device(s) opened at startup");
-
-        let input_sender = sender.clone_handle();
-        let input_control = std::sync::Arc::new(crate::input_thread::InputThreadControl::new()?);
-        // Lock-LED relay: the core thread owns the XKB lock state, the
-        // input thread owns the libinput devices; LED transitions
-        // cross via this eventfd-backed mask.
-        let led_relay = std::sync::Arc::new(crate::input::LedRelay::new()?);
-        backend.set_input_thread_control(std::sync::Arc::clone(&input_control));
-        backend.set_led_relay(std::sync::Arc::clone(&led_relay));
-        log::info!("yserver: Direct mode — spawning libinput sender thread");
-        // Seed the input thread's cursor at the primary-output centre so it
-        // agrees with the core's startup position (Xorg-style warp to display 0).
-        let (init_cx, init_cy) = backend.initial_pointer_position();
-        thread::Builder::new()
-            .name("yserver-libinput".into())
-            .spawn(move || {
-                if let Err(err) = input_thread::run(
-                    input_ctx,
-                    initial_events,
-                    input_sender,
-                    u32::from(fb_w),
-                    u32::from(fb_h),
-                    init_cx,
-                    init_cy,
-                    input_control,
-                    led_relay,
-                ) {
-                    log::warn!("yserver: libinput thread exited: {err}");
+    // Spawn the dedicated libinput sender thread. After `take_input_ctx`
+    // the backend's `poll_fds()` no longer returns the libinput fd, so
+    // run_core's E3 registration step won't double-poll libinput.
+    // Take the libinput context (created in `platform_init`). `None` means
+    // `SendContext::new()` failed — libinput unavailable, or every input
+    // device was permission-denied — so we refuse to start below.
+    let direct_input_ctx = backend.take_input_ctx();
+    match input_startup_action(direct_input_ctx.is_some()) {
+        InputStartup::AbortNoInput => {
+            // libinput could not be set up at all (`SendContext::new()` failed
+            // → `take_input_ctx()` is None). Refuse to start: a session with no
+            // input is dead on arrival and cannot even be zapped.
+            ensure_input_devices_opened(0)?;
+            unreachable!("ensure_input_devices_opened(0) always returns Err");
+        }
+        InputStartup::DirectSpawn => {
+            let mut input_ctx =
+                direct_input_ctx.expect("DirectSpawn action implies Some(input_ctx)");
+            // Drain libinput's initial seat enumeration here, on the main thread,
+            // BEFORE signalling readiness — so we can refuse to start when no input
+            // device could be opened (issue #64) rather than coming up with a dead
+            // keyboard and mouse. `udev_assign_seat` queues `DeviceAdded`
+            // synchronously and a single dispatch consumes the initial enumeration
+            // (the same contract the input thread relied on). The drained events
+            // are handed to the thread so device registration is unchanged.
+            let initial_events = match input_ctx.dispatch() {
+                Ok(evs) => evs,
+                Err(err) => {
+                    log::warn!("yserver: initial libinput dispatch: {err}");
+                    Vec::new()
                 }
-            })?;
+            };
+            // Count only USABLE (keyboard- or pointer-capable) devices, not
+            // every DeviceAdded: when not on seat0, the real keyboard/mouse
+            // are permission-denied while a lone non-usable node (e.g. a HID
+            // "System Control" collection) may still open — that must NOT
+            // satisfy the guard, or we come up with a dead, un-zappable
+            // session. The context tracks capability at add time.
+            let opened = input_ctx.usable_input_device_count();
+            ensure_input_devices_opened(opened)?;
+            log::info!("yserver: {opened} usable input device(s) opened at startup");
+
+            let input_sender = sender.clone_handle();
+            let input_control =
+                std::sync::Arc::new(crate::input_thread::InputThreadControl::new()?);
+            // Lock-LED relay: the core thread owns the XKB lock state, the
+            // input thread owns the libinput devices; LED transitions
+            // cross via this eventfd-backed mask.
+            let led_relay = std::sync::Arc::new(crate::input::LedRelay::new()?);
+            backend.set_input_thread_control(std::sync::Arc::clone(&input_control));
+            backend.set_led_relay(std::sync::Arc::clone(&led_relay));
+            log::info!("yserver: Direct mode — spawning libinput sender thread");
+            // Seed the input thread's cursor at the primary-output centre so it
+            // agrees with the core's startup position (Xorg-style warp to display 0).
+            let (init_cx, init_cy) = backend.initial_pointer_position();
+            thread::Builder::new()
+                .name("yserver-libinput".into())
+                .spawn(move || {
+                    if let Err(err) = input_thread::run(
+                        input_ctx,
+                        initial_events,
+                        input_sender,
+                        u32::from(fb_w),
+                        u32::from(fb_h),
+                        init_cx,
+                        init_cy,
+                        input_control,
+                        led_relay,
+                    ) {
+                        log::warn!("yserver: libinput thread exited: {err}");
+                    }
+                })?;
+        }
     }
 
     // signalfd → Message bridge. yserver-core deliberately doesn't
@@ -562,58 +615,15 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     result
 }
 
-/// Build a `KmsBackendV2` in either libseat or Direct mode depending on
-/// `seat`. This is the single decision point for the mode branch.
-///
-/// **Libseat mode** (`seat == Seat::Libseat`):
-/// - Opens the ordered DRM card list through the seat. Individual failures
-///   are skipped, and an empty result starts without KMS scanout.
-/// - Builds a `crate::input::Context` on the core thread via
-///   `Context::new_libseat` (FATAL on failure for the same reason).
-/// - Returns a `KmsBackendV2` with `is_libseat_mode() == true`.
-///
-/// **Direct mode** (`seat == Seat::Direct`):
-/// - Calls `KmsBackendV2::open(device_paths, console_guard, layout)` — the
-///   direct-device path, with optional VT_PROCESS arming when a real
-///   controlling console is present.
-/// - Returns a `KmsBackendV2` with `is_libseat_mode() == false`.
-fn build_kms_backend_v2(
-    seat: crate::seat::Seat,
+/// Build a Direct-only `KmsBackend` over the ordered DRM device list.
+/// yserver self-manages DRM master with VT_PROCESS, arming VT switching
+/// when a controlling console is present.
+fn build_kms_backend(
     device_paths: &[std::path::PathBuf],
     console_guard: crate::kms::ConsoleGuardOpt,
     layout: Option<String>,
-) -> io::Result<crate::kms::v2::KmsBackendV2> {
-    match seat {
-        crate::seat::Seat::Libseat { ref inner, .. } => {
-            // Build on-core libinput first (before DRM open) so any failure
-            // is reported clearly. If libinput fails here it is FATAL —
-            // we're committed to libseat mode.
-            let core_libinput = crate::input::Context::new_libseat(std::rc::Rc::clone(inner))
-                .map_err(|e| {
-                    io::Error::other(format!(
-                        "libseat mode: building on-core libinput context failed: {e}"
-                    ))
-                })?;
-            let core_libinput_fd = core_libinput.fd();
-            let seat_fd = inner.borrow_mut().fd().map_err(|e| {
-                io::Error::other(format!("libseat mode: getting seat fd failed: {e}"))
-            })?;
-            crate::kms::v2::KmsBackendV2::open_libseat(
-                seat,
-                device_paths,
-                console_guard,
-                core_libinput,
-                seat_fd,
-                core_libinput_fd,
-                layout,
-            )
-        }
-        crate::seat::Seat::Direct => {
-            // Direct path: open DRM + libinput directly, optionally
-            // arming VT_PROCESS if we have a controlling console.
-            crate::kms::v2::KmsBackendV2::open(device_paths, console_guard, layout)
-        }
-    }
+) -> io::Result<crate::kms::render::KmsBackend> {
+    crate::kms::render::KmsBackend::open(device_paths, console_guard, layout)
 }
 
 fn resolve_drm_devices() -> io::Result<Vec<std::path::PathBuf>> {
@@ -625,6 +635,14 @@ fn block_termination_signals() -> io::Result<SignalFd> {
     let mut mask = SigSet::empty();
     mask.add(Signal::SIGINT);
     mask.add(Signal::SIGTERM);
+    // SIGHUP → route through the signalfd → graceful shutdown, same as
+    // SIGTERM. On session/logout the kernel can HUP the process; with
+    // SIGHUP at its default disposition the process terminates WITHOUT
+    // running `Drop`, so `ConsoleGuard` never restores the VT and the
+    // console is left dead (K_OFF + KD_GRAPHICS). Blocking it here makes
+    // the signalfd log it ("received signal 1") and drive the graceful
+    // path that restores the console. (dirty-exit-on-telemetry-logout hunt)
+    mask.add(Signal::SIGHUP);
     // SIGUSR1 → diagnostic scanout dump. Blocked so signalfd consumes
     // it instead of the default-action (which would terminate us).
     mask.add(Signal::SIGUSR1);
@@ -645,6 +663,7 @@ fn block_termination_signals() -> io::Result<nix::sys::event::Kqueue> {
     let mut mask = SigSet::empty();
     mask.add(Signal::SIGINT);
     mask.add(Signal::SIGTERM);
+    mask.add(Signal::SIGHUP);
     mask.add(Signal::SIGUSR1);
     mask.add(Signal::SIGUSR2);
     sigprocmask(SigmaskHow::SIG_BLOCK, Some(&mask), None)
@@ -662,6 +681,14 @@ fn block_termination_signals() -> io::Result<nix::sys::event::Kqueue> {
         ),
         KEvent::new(
             libc::SIGTERM as usize,
+            EventFilter::EVFILT_SIGNAL,
+            EvFlags::EV_ADD,
+            FilterFlag::empty(),
+            0,
+            0isize,
+        ),
+        KEvent::new(
+            libc::SIGHUP as usize,
             EventFilter::EVFILT_SIGNAL,
             EvFlags::EV_ADD,
             FilterFlag::empty(),
@@ -693,7 +720,10 @@ fn block_termination_signals() -> io::Result<nix::sys::event::Kqueue> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_input_devices_opened, install_backend_root_bindings};
+    use super::{
+        InputStartup, ensure_input_devices_opened, input_startup_action,
+        install_backend_root_bindings,
+    };
     use yserver_core::{
         backend::Backend,
         resources::{ARGB_COLORMAP, ARGB_VISUAL, ROOT_VISUAL, ROOT_WINDOW},
@@ -703,7 +733,7 @@ mod tests {
     #[test]
     fn install_backend_root_bindings_sets_root_host_xid_and_visuals() {
         let mut state = ServerState::new();
-        let backend = crate::kms::v2::KmsBackendV2::for_tests();
+        let backend = crate::kms::render::KmsBackend::for_tests();
 
         install_backend_root_bindings(&mut state, &backend as &dyn Backend);
 
@@ -739,12 +769,29 @@ mod tests {
             msg.contains("'input' group"),
             "missing input-group hint: {msg}"
         );
-        assert!(msg.contains("seat0"), "missing seat0 hint: {msg}");
+        assert!(
+            msg.contains("console") || msg.contains("SSH"),
+            "missing console/SSH hint: {msg}"
+        );
     }
 
     #[test]
     fn ensure_input_devices_opened_accepts_one_or_more() {
         assert!(ensure_input_devices_opened(1).is_ok());
         assert!(ensure_input_devices_opened(8).is_ok());
+    }
+
+    #[test]
+    fn direct_mode_without_input_ctx_aborts_startup() {
+        // Regression: always-Direct with a failed libinput setup
+        // (`SendContext::new()` Err → `take_input_ctx()` None) must abort,
+        // not fall through to a dead session that can't be zapped. This is
+        // the gap the `opened == 0` guard did NOT cover.
+        assert_eq!(input_startup_action(false), InputStartup::AbortNoInput);
+    }
+
+    #[test]
+    fn with_input_ctx_spawns_input_thread() {
+        assert_eq!(input_startup_action(true), InputStartup::DirectSpawn);
     }
 }

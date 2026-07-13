@@ -1,8 +1,13 @@
-# Status — Rendering model v2
+# Status — KMS render backend
 
-Working doc for the rendering-model-v2 program. The spec is at
-`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`; this
-file tracks execution against it.
+Working doc for the KMS render backend. The governing spec still
+lives at `docs/superpowers/specs/2026-05-15-rendering-model-v2.md`;
+that filename is historical, and this file tracks execution
+against it.
+
+Historical sections below still mention `v2` where they quote old
+branch names, plan/spec filenames, file paths, test names, env vars,
+or log strings from the migration period.
 
 Earlier program docs are archived:
 
@@ -32,8 +37,9 @@ Cross-cutting bugs and followups that don't fit a stage live in
   abandoned `render-convolution-filter` branch: QueryFilters
   standard list, NameWindowPixmap diagnosis docs, Justfile xtrace
   `rm`, picom validation harness.
-- Active dev branch: `fix/idle-compositor` (off `master`). All v2
-  work (Stages 1–4 + Stage 5 Task 3 + Task 4 layer 1) has been
+- Active dev branch: `fix/idle-compositor` (off `master`). All
+  render-backend work (Stages 1–4 + Stage 5 Task 3 + Task 4 layer 1)
+  has been
   fast-forwarded from `rendering-model-v2` →
   `cow-authoritative-mode` → `perf` into `master`; `master`
   remains the integration branch. **v1 retired 2026-05-26** after
@@ -45,8 +51,9 @@ Cross-cutting bugs and followups that don't fit a stage live in
   deleted: 14,596 lines removed across 14 files. What remains in
   `kms/backend.rs` is shared helper/data code (rasterisers, wire-byte
   readers, `ClipMaskCache`, `ActiveOutput`, `platform_init`,
-  `parse_add_glyphs`) still consumed by v2. The old scheduler batch
-  resource abstraction now lives under `kms/v2/batch_resource.rs`.
+  `parse_add_glyphs`) still consumed by the render backend. The old
+  scheduler batch-resource abstraction now lives under
+  `kms/render/batch_resource.rs`.
 - 2026-06-19 gitk/Cinnamon follow-up: the remaining title-strip /
   grey-window investigation produced a concrete v2 resolver fix.
   `resolve_paint_target` now keeps walking the window hierarchy
@@ -153,15 +160,16 @@ Cross-cutting bugs and followups that don't fit a stage live in
   `window_under_cursor` descends into sub-window tree (xfwm4
   resize-edge sub-windows), XFixes SetCursorName/GetCursorName
   round-trip, hardware/software cursor split with
-  `YSERVER_V2_HW_CURSOR=1` opt-in. RANDR `Set{Screen,Crtc}Config`
+  `YSERVER_HW_CURSOR=1` opt-in. RANDR `Set{Screen,Crtc}Config`
   now validates against `state.randr.modes`.
 - Full narrative of the diagnosis chain that drove the Stage 4
   close is archived at
   [`status-archive-2026-05-21.md`](status-archive-2026-05-21.md).
   Stage 4 sub-stage history (4a through 4d.7) still lives below
   under the now-`[x]` Stage 4 sections.
-- **Next live work**: Stage 5 — make v2 fast. Plan at
-  `docs/superpowers/plans/2026-05-20-stage-5-make-v2-fast.md`.
+- **Next live work**: Stage 5 — make the render backend fast. Plan at
+  `docs/superpowers/plans/2026-05-20-stage-5-make-v2-fast.md`
+  (historical filename).
   Phase A closed 2026-05-24; Phase B sub-phases B.1, B.2, B.3
   all CLOSED by 2026-05-26 — bee MATE drag is lag-free across
   the chain, silence dual-output passes, yoga and air (Apple M1
@@ -358,8 +366,9 @@ Cross-cutting bugs and followups that don't fit a stage live in
   The outbound cap now allows a single large reply to buffer when the
   queue is empty, disconnect teardown actively `shutdown(Both)`s the
   socket so peers see EOF, `GetImage` reply headers are patched in the
-  client byte order, and the v2 backend routes root-window `GetImage`
-  through on-screen scanout readback instead of root storage. The new
+  client byte order, and the render backend routes root-window
+  `GetImage` through on-screen scanout readback instead of root
+  storage. The new
   root screenshot path is covered by unit tests and a backend
   compile-time smoke; live `xwd -root` desktop smoke still needs a real
   KMS session.
@@ -381,7 +390,7 @@ Cross-cutting bugs and followups that don't fit a stage live in
   `cargo +nightly fmt`.
 - **2026-06-12 HW text-cursor offset diagnosed/fixed**: `silence` was
   selecting text above the visible I-beam only with
-  `YSERVER_V2_HW_CURSOR=1`; `eiger`/Asahi looked correct because the
+  `YSERVER_HW_CURSOR=1`; `eiger`/Asahi looked correct because the
   driver disables the HW cursor path and falls back to SW composition.
   Root cause: the steady-state `cursor_plane_move` fast path advanced
   the DRM cursor plane in root/CRTC coordinates without subtracting the
@@ -428,7 +437,7 @@ Cross-cutting bugs and followups that don't fit a stage live in
   test -p yserver-core --lib` 393/393 green. `cargo clippy
   --all-targets --all-features -- -D warnings` is still blocked by
   pre-existing `doc_lazy_continuation` warnings in
-  `crates/yserver/src/kms/v2/engine.rs:118`. A working Xorg
+  `crates/yserver/src/kms/render/engine.rs:118`. A working Xorg
   `x11trace` for the same `cinnamon-settings applets` repro then
   showed the remaining live click path was much closer than
   expected: ButtonPress / replayed ButtonPress / ButtonRelease hit
@@ -808,8 +817,9 @@ never fires, cursor only updates at ~5-9 Hz. A per-iter cursor flush in
 (~200 cursor-EBUSYs/sec) because kernel cursor commits are vblank-paced
 and we were spamming them.
 
-The plan went through 4 codex review rounds (`docs/superpowers/plans/2026-05-28-cursor-bundled-atomic.md`)
-and converged on a clean atomic-bundle design — but the design was wrong
+The plan went through 4 codex review rounds on the
+`bundle-cursor-atomic` branch and converged on a clean atomic-bundle
+design — but the design was wrong
 for an X server, regardless of correctness of the implementation.
 
 **The fix that landed** (`0b3fd0c fix(kms/cursor): use legacy ioctls for HW cursor`):
@@ -1033,8 +1043,9 @@ produces empty output (icons invisible) → applet's FillRect Clear
 on the same picture damages the backing → DAMAGE-Notify → applet
 wakes → 60 Hz loop. One defect, two symptoms.
 
-Plan executed (`docs/superpowers/plans/2026-05-31-render-source-picture-redirect.md`
-on the parked branch): 10 commits on `fix/applet` landing
+Plan executed on the parked `fix/applet` branch
+(`docs/superpowers/findings/2026-05-31-render-source-picture-redirect.md`):
+10 commits landing
 `KmsBackendV2::resolve_source_picture` + Phase 2 wire-up in
 `render_composite` + Phase 3 in `render_trapezoids` /
 `render_triangles_op` (engine signature gained `src_offset: (i32, i32)`)
@@ -1130,7 +1141,9 @@ RENDER paint paths. Specifically:
 path Compiz / picom-glx / muffin need (no copy-upload fallback). Unblocks
 `project_compiz_is_required`.
 
-Spec/plan: `docs/superpowers/{specs,plans}/2026-06-09-glx-texture-from-pixmap.md`
+Spec/plan:
+`docs/superpowers/specs/2026-06-09-glx-texture-from-pixmap-design.md`
+and `docs/superpowers/plans/2026-06-09-glx-texture-from-pixmap.md`
 (post-implementation findings appended to the plan). Root-cause findings:
 `docs/superpowers/findings/2026-06-09-glx-tfp-radv-export-rootcause.md`.
 
@@ -2033,7 +2046,7 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
       Additional polish landed in the same diff:
       - **`do_dump_scanout_v2`** (~150 LoC): real PPM
         readback via Vk staging buffer + image-to-buffer
-        copy; was a `log_v2_gap` before. `yserver-v2-scanout-<n>-out<i>.ppm`
+        copy; was a `log_v2_gap` before. `yserver-scanout-<n>-out<i>.ppm`
         per dump.
       - **`drain_page_flip_events`**: drains DRM events and
         returns per-output indices; `on_page_flip_ready` only

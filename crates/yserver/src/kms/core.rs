@@ -1,5 +1,5 @@
 //! `KmsCore` — protocol-bookkeeping state shared between
-//! `KmsBackend` (v1) and `KmsBackendV2` (v2, lands in Stage 1b).
+//! `KmsBackend` (v1) and `KmsBackend` (v2, lands in Stage 1b).
 //!
 //! Per the rendering-model-v2 spec (`docs/superpowers/specs/
 //! 2026-05-15-rendering-model-v2.md` § "KmsCore scope — narrowly
@@ -1601,7 +1601,7 @@ impl AliasRegistry {
 // ───────────────────────────────────────────────────────────────
 
 /// Protocol-bookkeeping state shared between `KmsBackend` (v1) and
-/// `KmsBackendV2` (v2). Owns *what the protocol says exists*, not
+/// `KmsBackend` (v2). Owns *what the protocol says exists*, not
 /// *how the backend stores it*.
 pub(crate) struct KmsCore {
     // XID / ID maps
@@ -1696,7 +1696,7 @@ pub(crate) struct KmsCore {
     /// storage. Protocol-side bookkeeping per the v2 plan
     /// §"`KmsCore` scope — narrowly drawn": this is metadata (a
     /// counter), not a storage handle. The `DrawableId` of the
-    /// allocated COW storage lives on `KmsBackendV2.cow_id`.
+    /// allocated COW storage lives on `KmsBackend.cow_id`.
     ///
     /// See Stage 4 plan §4d "Composite Overlay Window (COW) as
     /// first-class scene entry" + spec lines 453, 459, 470 for

@@ -15,8 +15,12 @@
 //! scratch as `binding 2`, and let the pipeline write to the
 //! attachment as usual.
 //!
-//! This module keeps one scratch per dst format (BGRA + R8). They
-//! grow power-of-two on demand and are reused across calls. R8
+//! This module keeps one scratch per dst format (BGRA + R8), sized to
+//! the EXACT requested extent (reallocated when the extent changes).
+//! Over-allocating (the old power-of-two/min-64 sizing) sampled
+//! unwritten texels: the shader normalizes sample coordinates by the
+//! logical drawable extent, so a small copy into a larger scratch read
+//! outside the written region — undefined content. R8
 //! variants expose a swizzled view (`a = R`) so the shader sees
 //! `(0, 0, 0, alpha)` — matching the `mask_image_view` convention
 //! and X RENDER's "rgb defaults to 0 for alpha-only pictures".
@@ -26,7 +30,7 @@ use std::sync::Arc;
 use ash::vk;
 
 use super::device::VkContext;
-use crate::kms::v2::batch_resource::BatchResource;
+use crate::kms::render::batch_resource::BatchResource;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DstReadbackError {
@@ -116,7 +120,7 @@ impl DstReadback {
             vk::Format::R8_UNORM => self.r8.as_ref(),
             _ => return false,
         };
-        slot.is_some_and(|s| s.extent.width >= width && s.extent.height >= height)
+        slot.is_some_and(|s| s.extent.width == width && s.extent.height == height)
     }
 
     /// 5-T4: like the pre-Phase-5 `ensure` but returns the old
@@ -139,20 +143,14 @@ impl DstReadback {
             _ => return Err(DstReadbackError::NoMemoryType),
         };
         if let Some(img) = slot.as_ref()
-            && img.extent.width >= width
-            && img.extent.height >= height
+            && img.extent.width == width
+            && img.extent.height == height
         {
             return Ok(None);
         }
-        let new_extent = match slot.as_ref() {
-            Some(img) => vk::Extent2D {
-                width: img.extent.width.max(width).next_power_of_two().max(64),
-                height: img.extent.height.max(height).next_power_of_two().max(64),
-            },
-            None => vk::Extent2D {
-                width: width.next_power_of_two().max(64),
-                height: height.next_power_of_two().max(64),
-            },
+        let new_extent = vk::Extent2D {
+            width: width.max(1),
+            height: height.max(1),
         };
         let new_img = allocate(&self.vk, format, new_extent)?;
         // Allocation succeeded — past here the function MUST NOT fail.
@@ -437,4 +435,49 @@ fn color_subresource_range() -> vk::ImageSubresourceRange {
         .aspect_mask(vk::ImageAspectFlags::COLOR)
         .level_count(1)
         .layer_count(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn vk_or_skip() -> Option<Arc<VkContext>> {
+        match VkContext::new() {
+            Ok(vk) => Some(vk),
+            Err(e) => {
+                eprintln!("skipping: no Vk: {e:?}");
+                None
+            }
+        }
+    }
+
+    /// Regression guard for the exact-sizing fix. A readback scratch
+    /// ensured for an 8×4 request must be sized EXACTLY 8×4 — not rounded
+    /// up. The old power-of-two/min-64 allocation left the shader (which
+    /// normalizes sample UVs by the logical extent) reading texels the
+    /// copy never wrote → undefined content, surfaced as magenta on some
+    /// drivers.
+    ///
+    /// This asserts the fix's INVARIANT via integer extents (`fits`), not
+    /// pixels, so it flips red↔green deterministically on every ICD. The
+    /// pixel-level `render_composite_self_alias` test is NOT a reliable
+    /// guard: the undefined read returns benign data on RADV, so it
+    /// passes there with or without the fix. Here, post-fix `fits` is `==`
+    /// on an 8×4 scratch so `fits(9,4)` is false; pre-fix `fits` was `>=`
+    /// on a 64×64 scratch so `fits(9,4)` was true.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn ensure_sizes_readback_scratch_exactly() {
+        let Some(vk) = vk_or_skip() else { return };
+        let fmt = vk::Format::B8G8R8A8_UNORM;
+        let mut rb = DstReadback::new(vk);
+        rb.ensure_returning_old(fmt, 8, 4).expect("ensure 8x4");
+        assert!(rb.fits(fmt, 8, 4), "exact request must fit");
+        assert!(
+            !rb.fits(fmt, 9, 4),
+            "scratch must be sized EXACTLY 8x4: a 9x4 request must NOT fit \
+             (over-allocation would report fit and sample unwritten texels)"
+        );
+        assert!(!rb.fits(fmt, 8, 5), "same for the height axis");
+    }
 }

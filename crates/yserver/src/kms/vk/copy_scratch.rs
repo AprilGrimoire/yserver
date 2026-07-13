@@ -11,7 +11,7 @@ use std::sync::Arc;
 use ash::vk;
 
 use super::{device::VkContext, ops::run_one_shot_op};
-use crate::kms::v2::batch_resource::BatchResource;
+use crate::kms::render::batch_resource::BatchResource;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CopyScratchError {

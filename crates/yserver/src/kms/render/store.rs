@@ -7,7 +7,7 @@
 //! per I5 (presentation damage with snapshot/ack semantics + protocol
 //! damage for the DAMAGE extension).
 //!
-//! Stage 2b lands the structure + tests. KmsBackendV2 wires a
+//! Stage 2b lands the structure + tests. KmsBackend wires a
 //! handful of allocation paths through; full wiring (every
 //! allocation method on the Backend trait) arrives across
 //! Stages 2c–2d as those substages need the metadata side of
@@ -721,7 +721,7 @@ pub(crate) struct DrawableStore {
     pending_retire: Vec<DrawableId>,
     /// GLX-TFP (Task 2.3): dma-buf fds for drawables that have been
     /// exported to a GL consumer, indexed by `DrawableId`. The backend
-    /// (`KmsBackendV2::exported_dmabufs`) owns the canonical lifetime
+    /// (`KmsBackend::exported_dmabufs`) owns the canonical lifetime
     /// record; this map is a parallel sync-only dup the backend keeps in
     /// lockstep so the engine's flush chokepoint (which sees `store` +
     /// `platform` but NOT the backend) can resolve fds for bidirectional
@@ -832,7 +832,7 @@ impl DrawableStore {
 
     /// Diagnostic-only: iterate every `(host_xid, DrawableId)` pair
     /// currently registered. Used by the SIGUSR2 drawables dump to
-    /// sweep pixmaps that aren't reachable through `windows_v2` /
+    /// sweep pixmaps that aren't reachable through `windows` /
     /// backings (e.g. e16's menu-item background pixmaps).
     pub(crate) fn xid_entries(&self) -> impl Iterator<Item = (u32, DrawableId)> + '_ {
         self.by_xid.iter().map(|(&xid, &id)| (xid, id))
@@ -850,7 +850,7 @@ impl DrawableStore {
     /// the FenceTicket fix). Idempotent: `Storage::destroy`
     /// nulls handles after pool-return and the direct-destroy
     /// path is null-guarded throughout, so re-calling is safe.
-    /// Caller is `KmsBackendV2::shutdown_destroy_drawables` from
+    /// Caller is `KmsBackend::shutdown_destroy_drawables` from
     /// `lib.rs`'s explicit shutdown block.
     pub(crate) fn shutdown_destroy_all(&mut self, platform: &PlatformBackend) {
         self.by_xid.clear();
@@ -947,7 +947,7 @@ impl DrawableStore {
             // expect view-first). Caller threads the closure
             // through to bridge `&mut DrawableStore` with
             // `&mut RenderEngine` (disjoint sibling fields on
-            // `KmsBackendV2`).
+            // `KmsBackend`).
             on_destroyed(id);
             self.destroy_now(platform, id);
             RetireDecision::Destroyed
@@ -1024,6 +1024,21 @@ impl DrawableStore {
         }
     }
 
+    /// True if any scene-participating drawable has undrained
+    /// presentation damage — i.e. a client painted a visible window
+    /// and the SceneCompositor has not composed it yet. `next_wakeup`
+    /// / `maybe_composite` consult this so that *content* paint arms a
+    /// compose, not only structural map/unmap/restack changes
+    /// (`scene_structure_dirty`). Without it, a window painted after
+    /// its map-compose already ran is stranded until an unrelated
+    /// event pokes the loop (the xfce submenu bug). Cheap: short-
+    /// circuits on the first match, no allocation.
+    pub(crate) fn has_pending_presentation_damage(&self) -> bool {
+        self.entries
+            .values()
+            .any(|d| d.scene_participating && !d.presentation_damage.is_empty())
+    }
+
     /// Snapshot for the SceneCompositor to ack later.
     /// Returns `None` if the drawable doesn't exist or isn't
     /// scene-participating (no presentation damage to peek).
@@ -1076,14 +1091,14 @@ impl DrawableStore {
         // W's own storage instead of B. Volume is bounded by the
         // small number of redirected windows per session, so the
         // trace is left at log::trace! and gated by the
-        // `yserver::kms::v2::store` target.
-        if log::log_enabled!(target: "yserver::kms::v2::store", log::Level::Trace) {
+        // `yserver::kms::render::store` target.
+        if log::log_enabled!(target: "yserver::kms::render::store", log::Level::Trace) {
             let old = self
                 .entries
                 .get(&window_id)
                 .and_then(|d| d.redirected_target);
             log::trace!(
-                target: "yserver::kms::v2::store",
+                target: "yserver::kms::render::store",
                 "set_redirected_target window={window_id:?} old={old:?} new={backing_id:?}",
             );
         }
@@ -1095,8 +1110,8 @@ impl DrawableStore {
     /// Stage 4a — leaf accessor returning the per-drawable
     /// `redirected_target`. Returns `None` if the drawable
     /// doesn't exist or isn't redirected. The full ancestor walk
-    /// lives on `KmsBackendV2::resolve_paint_target` because it
-    /// needs window-geometry metadata (`windows_v2`) that isn't
+    /// lives on `KmsBackend::resolve_paint_target` because it
+    /// needs window-geometry metadata (`windows`) that isn't
     /// in the store.
     pub(crate) fn redirected_target(&self, id: DrawableId) -> Option<DrawableId> {
         self.entries.get(&id)?.redirected_target
@@ -1189,7 +1204,7 @@ impl DrawableStore {
     }
 
     /// Stage-1b-era compatibility constructor (was `stub()`).
-    /// Kept so existing callers in `kms::v2::backend` continue
+    /// Kept so existing callers in `kms::render::backend` continue
     /// to compile until they're updated to call `new()`.
     pub(crate) fn stub() -> Self {
         Self::new()
@@ -1517,7 +1532,7 @@ mod tests {
     /// Stage 4a — `set_redirected_target(Some(B))` makes
     /// `redirected_target(W)` return `Some(B)`. Pure storage-side
     /// state; the full ancestor walk + paint dispatch lives on
-    /// `KmsBackendV2::resolve_paint_target`.
+    /// `KmsBackend::resolve_paint_target`.
     #[test]
     fn set_redirected_target_stores_backing_id() {
         let mut s = DrawableStore::new();
@@ -1694,7 +1709,7 @@ mod tests {
     /// `decref` invokes `on_destroyed` exactly when it actually
     /// destroys the drawable's storage (refcount→0 + ticket
     /// signaled). The callback is the bridge that lets
-    /// `KmsBackendV2` invalidate `RenderEngine::drawable_view_cache`
+    /// `KmsBackend` invalidate `RenderEngine::drawable_view_cache`
     /// entries keyed on the destroyed `DrawableId` before
     /// `Storage::destroy` runs. Pre-fix the callback parameter
     /// didn't exist; the engine's cached views accumulated for

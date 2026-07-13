@@ -52,7 +52,7 @@ Linux (with planned FreeBSD support).
 - `yserver` — backends. Contains both the nested `ynest` and the
   standalone DRM/KMS server, plus all GPU/KMS code. Vulkan
   context, libinput input thread, atomic KMS modesetting,
-  rendering model v2 (`kms/v2/`).
+  the rendering model (`kms/render/`).
 
 ## Core loop
 
@@ -85,41 +85,41 @@ The standalone backend uses **Vulkan directly** for rendering
 and dmabuf export. No EGL, no GBM, no Mesa GL. Modes are set via
 DRM atomic; pageflips drive retirement.
 
-It runs in two session modes. The preferred mode uses
-**libseat/seatd**: the seat manager opens `/dev/dri/*` and
-`/dev/input/*`, so the server runs without root and cooperates
-with VT switching. A fallback **direct** mode runs on a free VT
-with direct device access and no seat manager.
+It runs in a single **direct** session mode: the server opens
+`/dev/dri/*` and `/dev/input/*` itself, self-manages DRM master,
+and arms `VT_PROCESS` on its controlling console so it cooperates
+with VT switching (`drmDropMaster` on release, `drmSetMaster` on
+acquire). It needs direct device access — root, or a session in
+the `video`/`input` groups.
 
 Input: `libinput` posts cooked events into the core loop's
-channel — serviced on the core thread under libseat, on a
-dedicated input thread in direct mode. (`ynest` takes its input
+channel from a dedicated input thread. (`ynest` takes its input
 from the parent X server instead.)
 
 ## Target platforms
 
 **Linux** is the primary target and where all current development
-happens. KMS bring-up, libseat sessions, libinput config, hotkeys
+happens. KMS bring-up, libinput config, hotkeys
 (Ctrl-Alt-F#, Ctrl-Alt-Backspace), and VT acquisition all assume
 Linux semantics today.
 
 **FreeBSD / GhostBSD** support landed in 11d87ba. This was possible
-as FreeBSD has linux API support for DRM, udev, seatd and libinput.
+as FreeBSD has linux API support for DRM, udev and libinput.
 
 **Windows / macOS** are out of scope. They lack DRM/KMS and
 libinput; the display stack is completely different. yserver would
 not be ported there.
 
-## Rendering model (v2)
+## Rendering model
 
 The standalone backend's rendering core is split into four
-components, all under `crates/yserver/src/kms/v2/`. `KmsCore`
+components, all under `crates/yserver/src/kms/render/`. `KmsCore`
 (at `kms/core.rs`) sits alongside them and owns the X11
 protocol bookkeeping that is independent of GPU state (XID maps,
 window/pixmap metadata, COMPOSITE redirects, SHAPE regions,
 picture records, font/glyphset records, cursor records).
 
-### PlatformBackend (`v2/platform.rs`)
+### PlatformBackend (`render/platform.rs`)
 
 Hardware and OS surface. Owns the DRM device, the Vulkan
 instance/device/queue, the scanout BO pool, the page-flip
@@ -127,7 +127,7 @@ retirement state, libinput context, and the output layout.
 Provides FenceTicket allocation (recyclable VkFence wrappers with
 CPU-side lifetime semantics).
 
-### DrawableStore (`v2/store.rs`)
+### DrawableStore (`render/store.rs`)
 
 Storage and lifetime for every X11 drawable (windows, pixmaps,
 the cursor sprite). Each entry is a Vulkan image plus a layout
@@ -136,7 +136,7 @@ damage, render fence ticket, and scene-participation flag. The
 store is the single source of truth for what GPU memory exists
 and who holds references.
 
-### RenderEngine (`v2/engine.rs`)
+### RenderEngine (`render/engine.rs`)
 
 Paint operations. All X11 drawing requests — fill, put_image,
 get_image, copy_area, copy_plane, image_text, poly_*,
@@ -146,7 +146,7 @@ buffers against the destination drawable's storage. The engine
 also owns the pipeline cache, the glyph atlas, the descriptor
 pool ring, and the deferred frame builder.
 
-### SceneCompositor (`v2/scene.rs`)
+### SceneCompositor (`render/scene.rs`)
 
 The composed output pass. Walks the window tree once per
 present, builds a draw list (root → mapped descendants →
@@ -155,7 +155,7 @@ Buffer-age tracking with per-output history rings clips the
 repaint to actually-dirty regions; full redraw is the fallback
 when history is too short.
 
-### FrameBuilder (`v2/frame_builder.rs`)
+### FrameBuilder (`render/frame_builder.rs`)
 
 Per-frame coalescer (introduced in Stage 5 Phase B). Every paint
 op records into a deferred `RecordedOp` list on the open frame

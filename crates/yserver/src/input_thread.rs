@@ -175,6 +175,11 @@ impl LibinputThreadState {
                 pressed: false,
                 time: time_ms,
             },
+            // Handled in process_batch (flushes motion + resets the scroll
+            // accumulator) before map() is reached.
+            InputEvent::PointerScrollStop => {
+                unreachable!("PointerScrollStop is routed in process_batch before map()")
+            }
             // DeviceAdded/Removed are forwarded by process_batch before
             // reaching map(); reaching here is a routing bug, so fail loud.
             InputEvent::DeviceAdded(_) | InputEvent::DeviceRemoved { .. } => {
@@ -245,9 +250,8 @@ impl InputThreadCommand {
 /// Carries three kinds of message to the input thread, multiplexed on a
 /// single `eventfd` wakeup: the latched pause/resume `command` (for
 /// VT-switch suspend/resume), a queue of `configs` — client
-/// `xinput set-prop` device-config writes that, in direct mode, must be
-/// applied on the thread that owns the libinput handles (libseat mode
-/// routes these straight through the on-core context instead), and a
+/// `xinput set-prop` device-config writes that must be applied on the
+/// thread that owns the libinput handles, and a
 /// latched `pending_resize` — the latest virtual framebuffer extent to
 /// apply to the cursor accumulator (only the newest value matters, so
 /// this uses a pair of atomics rather than a queue).
@@ -505,6 +509,22 @@ pub fn process_batch(
                     sender.send(Message::HostInput(ev))?;
                 }
             }
+            continue;
+        }
+        // Fingers lifted from a two-finger scroll: discard the sub-click
+        // remainder (matches Xorg — a partial click doesn't fire on lift) and
+        // forward the stop so the backend emits a delta-0 XI2 scroll motion.
+        // GDK reads that as `scroll.is_stop`, which commits a Firefox
+        // history-swipe (bug 1539730).
+        if matches!(raw, InputEvent::PointerScrollStop) {
+            state.scroll_accum_x_v120 = 0;
+            state.scroll_accum_y_v120 = 0;
+            if let Some(m) = pending_motion.take() {
+                sender.send(Message::HostInput(m))?;
+            }
+            sender.send(Message::HostInput(HostInputEvent::PointerScrollStop {
+                time: time_ms,
+            }))?;
             continue;
         }
         let mapped = state.map(raw, time_ms);

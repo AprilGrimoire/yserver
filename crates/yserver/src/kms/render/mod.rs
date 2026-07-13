@@ -1,9 +1,9 @@
-//! Rendering-model-v2 backend (spec at
+//! KMS render backend (historical spec filename:
 //! `docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
 //!
 //! The sole rendering backend since v1 retired 2026-05-26 (Phase
 //! B.3 close). Implements the `Backend` trait directly; `lib.rs`
-//! constructs `KmsBackendV2` at startup.
+//! constructs `KmsBackend` at startup.
 
 mod backend;
 pub(crate) mod batch_resource;
@@ -25,4 +25,4 @@ pub(crate) mod submit_group;
 pub(crate) mod submit_trace;
 pub(crate) mod telemetry;
 
-pub use backend::KmsBackendV2;
+pub use backend::KmsBackend;

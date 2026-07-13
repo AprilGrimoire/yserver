@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # e16 menu-hover regression repro inside vng (run as the vng guest
-# command). Brings up yserver v2 + e16, opens the desktop menu via
+# command). Brings up yserver + e16, opens the desktop menu via
 # xdotool (XTEST), hovers items, and SIGUSR1-dumps the scanout
 # before/after hover so the composed frames can be diffed on the host.
 set -uo pipefail
 cd /home/jos/Projects/yserver
-rm -f yserver-v2-scanout-*.ppm yserver-v2-drawable-*.ppm yserver-v2-drawable-*.txt
+rm -f yserver-scanout-*.ppm yserver-drawable-*.ppm yserver-drawable-*.txt
 
 RUST_LOG="${YSERVER_VNG_RUST_LOG:-debug}" RUST_BACKTRACE=1 \
     target/debug/yserver > yserver-vng-e16.log 2>&1 &
@@ -48,5 +48,5 @@ xdotool key Escape
 sleep 1
 kill $pid 2>/dev/null
 wait $pid 2>/dev/null
-ls -la yserver-v2-scanout-* yserver-v2-drawable-* 2>/dev/null
+ls -la yserver-scanout-* yserver-drawable-* 2>/dev/null
 echo "repro done"

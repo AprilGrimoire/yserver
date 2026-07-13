@@ -181,7 +181,7 @@ pub struct RecordingBackend {
     /// Stage 4e COW: tracks whether `get_overlay_window` has
     /// materialised the COW (refcount > 0) so the override can
     /// signal the 0→1 transition to the core handler. Mirrors
-    /// `KmsBackendV2`'s `core.cow_refcount`-based logic; the
+    /// `KmsBackend`'s `core.cow_refcount`-based logic; the
     /// `RecordingBackend` doesn't own GPU storage so a plain bool
     /// suffices. Reset by `release_overlay_window` on the
     /// final-release branch (controlled by
@@ -1394,7 +1394,7 @@ impl Backend for RecordingBackend {
     /// Stage 4e COW: override to model the 0→1 transition so the
     /// core handler can drive `materialize_cow_resource`. Returns
     /// `Ok(true)` on first claim (cow_materialized was false),
-    /// `Ok(false)` on subsequent claims. Mirrors `KmsBackendV2`'s
+    /// `Ok(false)` on subsequent claims. Mirrors `KmsBackend`'s
     /// semantics — single backend hook owns the full COW lifecycle.
     fn get_overlay_window(&mut self, _origin: Option<OriginContext>) -> io::Result<bool> {
         if self.cow_materialized {

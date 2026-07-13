@@ -11,7 +11,7 @@
 //! memcpy land on A's still-pending GPU read and corrupt A's atlas
 //! slot.
 //!
-//! Concretely, `V2GlyphAtlas`:
+//! Concretely, `GlyphAtlas`:
 //!
 //! - Owns the atlas image + view + memory + cache + shelf packer,
 //!   identical to v1.
@@ -46,7 +46,7 @@ pub(crate) use crate::kms::vk::glyph::{AtlasEntry, GlyphKey};
 pub(crate) const ATLAS_SIDE: u32 = 4096;
 
 /// Pure-logic shelf packer + cache. Factored out of
-/// [`V2GlyphAtlas`] so unit tests can exercise pack / cache
+/// [`GlyphAtlas`] so unit tests can exercise pack / cache
 /// semantics without a live VkContext.
 pub(crate) struct ShelfPacker {
     extent: vk::Extent2D,
@@ -114,7 +114,7 @@ impl ShelfPacker {
         }
         self.atlas_full_logged = true;
         log::warn!(
-            "v2 glyph atlas full ({}×{} R8 exhausted); affected glyphs drop until \
+            "render glyph atlas full ({}×{} R8 exhausted); affected glyphs drop until \
              Stage 5 grow/LRU lands",
             self.extent.width,
             self.extent.height,
@@ -131,7 +131,7 @@ impl ShelfPacker {
 /// V2-side glyph atlas. Owns the atlas image; recording an upload
 /// is the caller's job (they have the per-call staging buffer and
 /// the engine-owned CB).
-pub(crate) struct V2GlyphAtlas {
+pub(crate) struct GlyphAtlas {
     vk: Arc<VkContext>,
     image: vk::Image,
     view: vk::ImageView,
@@ -164,21 +164,21 @@ struct Shelf {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum V2GlyphAtlasError {
+pub(crate) enum GlyphAtlasError {
     #[error("vulkan: {0:?}")]
     Vk(vk::Result),
     #[error("no memory type matches atlas requirements")]
     NoMemoryType,
 }
 
-impl From<vk::Result> for V2GlyphAtlasError {
+impl From<vk::Result> for GlyphAtlasError {
     fn from(r: vk::Result) -> Self {
-        V2GlyphAtlasError::Vk(r)
+        GlyphAtlasError::Vk(r)
     }
 }
 
-impl V2GlyphAtlas {
-    pub(crate) fn new(vk: Arc<VkContext>) -> Result<Self, V2GlyphAtlasError> {
+impl GlyphAtlas {
+    pub(crate) fn new(vk: Arc<VkContext>) -> Result<Self, GlyphAtlasError> {
         let extent = vk::Extent2D {
             width: ATLAS_SIDE,
             height: ATLAS_SIDE,
@@ -214,7 +214,7 @@ impl V2GlyphAtlas {
         });
         let Some(mt) = mt else {
             unsafe { vk.device.destroy_image(image, None) };
-            return Err(V2GlyphAtlasError::NoMemoryType);
+            return Err(GlyphAtlasError::NoMemoryType);
         };
         let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
         let alloc_info = vk::MemoryAllocateInfo::default()
@@ -418,7 +418,7 @@ impl V2GlyphAtlas {
     }
 }
 
-impl Drop for V2GlyphAtlas {
+impl Drop for GlyphAtlas {
     fn drop(&mut self) {
         unsafe {
             // Best-effort: wait on the device's outstanding work

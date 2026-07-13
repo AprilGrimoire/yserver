@@ -85,7 +85,7 @@ pub struct Stop {
 /// **Lifetime contract (B.3 hotfix 2):** Vk handles are destroyed in
 /// this struct's `Drop`. `GradientPicture` is an
 /// `Arc<GradientPictureResources>` newtype so the picture can be
-/// cloned onto [`super::super::v2::frame_builder::RecordedTrapSrcKind::Gradient`]
+/// cloned onto [`super::super::render::frame_builder::RecordedTrapSrcKind::Gradient`]
 /// at append time. The engine's `picture_paint` map holds one clone;
 /// each recorded deferred op holds another. Both are routed through
 /// `adopt_retired_resource_for_gpu_retirement`; Vk handles are only
@@ -298,7 +298,7 @@ impl GradientPicture {
     }
 }
 
-impl crate::kms::v2::batch_resource::BatchResource for GradientPicture {
+impl crate::kms::render::batch_resource::BatchResource for GradientPicture {
     fn release(self: Box<Self>, _vk: &VkContext) {
         // B.3 hotfix 2: dropping the Box drops this Arc clone.
         // If this was the last clone, GradientPictureResources::drop

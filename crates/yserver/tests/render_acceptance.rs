@@ -1,6 +1,6 @@
-//! v2 acceptance integration tests (Stage 2f).
+//! Render-backend acceptance integration tests (Stage 2f).
 //!
-//! Drives `KmsBackendV2` directly via its `Backend` trait and
+//! Drives `KmsBackend` directly via its `Backend` trait and
 //! asserts pixel-correctness against a CPU oracle. Functionally
 //! equivalent to the Stage 2 plan's "synthetic harness binary"
 //! that would drive PutImage / CopyArea / PolyFillRectangle /
@@ -12,7 +12,7 @@
 //!
 //! ```text
 //! VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json \
-//!   cargo test -p yserver --test v2_acceptance -- --ignored
+//!   cargo test -p yserver --test acceptance -- --ignored
 //! ```
 //!
 //! User-run hardware smoke on bee + fuji
@@ -22,7 +22,7 @@
 
 #![cfg(target_os = "linux")]
 
-use yserver::kms::v2::KmsBackendV2;
+use yserver::kms::render::KmsBackend;
 use yserver_core::backend::{AnyHandle, Backend, DrawState, FillState, GcFunction, SubwindowMode};
 use yserver_protocol::x11::ClipRectangles;
 
@@ -34,8 +34,8 @@ use yserver_protocol::x11::ClipRectangles;
 /// 5. GetImage — verifies overwrite at the rect, gradient outside
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_put_image_fill_get_image_oracle() {
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+fn put_image_fill_get_image_oracle() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -101,8 +101,8 @@ fn v2_put_image_fill_get_image_oracle() {
 /// Acceptance for `CopyArea` between disjoint pixmaps.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_copy_area_disjoint_oracle() {
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+fn copy_area_disjoint_oracle() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -157,8 +157,8 @@ fn v2_copy_area_disjoint_oracle() {
 /// `record_vk_queue_wait_idle` call).
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_telemetry_lifetime_after_sequence() {
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+fn telemetry_lifetime_after_sequence() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -209,8 +209,8 @@ fn v2_telemetry_lifetime_after_sequence() {
 /// pipeline (plan §4 cross-cutting rule).
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_render_composite_no_gc_clip_leak() {
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+fn render_composite_no_gc_clip_leak() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -300,8 +300,8 @@ fn v2_render_composite_no_gc_clip_leak() {
 /// white; right half stays blue. v1 would paint both glyphs.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_composite_glyphs_clip_intersects_picture() {
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+fn composite_glyphs_clip_intersects_picture() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -436,8 +436,8 @@ fn v2_composite_glyphs_clip_intersects_picture() {
 /// rect decomposition + fg/bg fill ordering.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_copy_plane_depth1_extracts_mask_bits() {
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+fn copy_plane_depth1_extracts_mask_bits() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -517,8 +517,8 @@ fn v2_copy_plane_depth1_extracts_mask_bits() {
 /// second draw uses GXxor and must match a solid `fg ^ bg` fill.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_fill_tiled_xor_with_reversed_tile_matches_solid_xor() {
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+fn fill_tiled_xor_with_reversed_tile_matches_solid_xor() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -613,13 +613,13 @@ fn v2_fill_tiled_xor_with_reversed_tile_matches_solid_xor() {
 /// draw had targeted the top-level directly.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_root_fill_with_include_inferiors_matches_top_level_result() {
+fn root_fill_with_include_inferiors_matches_top_level_result() {
     use yserver_core::{
         backend::WindowHandle,
         host_x11::{HostSubwindowConfig, HostSubwindowVisual},
     };
 
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -750,6 +750,227 @@ fn v2_root_fill_with_include_inferiors_matches_top_level_result() {
     assert_eq!(out, expected);
 }
 
+/// Pack one `PolyRectangle` rect into X11 wire bytes:
+/// x:i16, y:i16, w:u16, h:u16 — all little-endian.
+fn pack_rect(x: i16, y: i16, w: u16, h: u16) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8);
+    out.extend_from_slice(&x.to_le_bytes());
+    out.extend_from_slice(&y.to_le_bytes());
+    out.extend_from_slice(&w.to_le_bytes());
+    out.extend_from_slice(&h.to_le_bytes());
+    out
+}
+
+/// Import-selection regression (positive): a stroke drawn on the ROOT
+/// with `subwindow_mode = IncludeInferiors` must also paint into a
+/// redirected top-level window's own backing, so the selection
+/// rectangle is visible over the composited window (not just in
+/// root's occluded backing). ImageMagick `import` draws its XOR
+/// selection rect this way.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn stroke_on_root_include_inferiors_reaches_redirected_toplevel_backing() {
+    use yserver_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
+
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    let root = WindowHandle::from_raw(1).expect("root");
+    // Top-level W: 200×200 at screen (100, 100), depth 24.
+    let w = b
+        .create_subwindow(
+            None,
+            root,
+            100,
+            100,
+            200,
+            200,
+            0,
+            HostSubwindowVisual::Explicit {
+                depth: 24,
+                visual_xid: 0,
+                colormap_xid: 0,
+            },
+            None,
+            None,
+        )
+        .expect("top-level W");
+    let w_xid = w.as_raw();
+    b.map_subwindow(None, w_xid).expect("map W");
+
+    // Redirected backing for W. `get_image(w_xid)` now reads this.
+    let backing = b.create_pixmap(None, 24, 200, 200).expect("W backing");
+    assert!(
+        b.test_set_redirected_target(w_xid, backing.as_raw()),
+        "redirect route must be recorded"
+    );
+
+    // Clear W's routed backing.
+    b.fill_rectangle(None, w_xid, 0x0000_0000, 0, 0, 200, 200)
+        .expect("clear W backing");
+
+    // GC: IncludeInferiors + Copy, foreground red.
+    b.apply_draw_state(
+        None,
+        &DrawState {
+            subwindow_mode: SubwindowMode::IncludeInferiors,
+            function: GcFunction::Copy,
+            foreground: 0x00FF_0000,
+            ..DrawState::default()
+        },
+    )
+    .expect("apply include-inferiors copy");
+
+    // PolyRectangle on ROOT spanning W exactly: (100, 100, 200, 200).
+    let rect = pack_rect(100, 100, 200, 200);
+    b.poly_rectangle(None, root.as_raw(), 0x00FF_0000, &rect)
+        .expect("poly_rectangle on root");
+
+    // W's routed backing top row must carry the red top edge.
+    let out = b
+        .get_image_pixels_for_tests(w_xid, 2, 0, 0, 200, 1, !0)
+        .expect("get_image W")
+        .expect("Some bytes");
+    let hit = out
+        .chunks_exact(4)
+        .any(|px| u32::from_le_bytes([px[0], px[1], px[2], px[3]]) & 0x00FF_FFFF == 0x00FF_0000);
+    assert!(
+        hit,
+        "rectangle top edge (red) must land in the redirected top-level backing"
+    );
+}
+
+/// Import-selection regression (guard): a SINGLE-pass XOR/invert
+/// stroke on the ROOT with `IncludeInferiors` must invert each
+/// resolved backing EXACTLY once, even where the stroke also crosses a
+/// non-redirected child that routes into the same backing. The naive
+/// recursion (emit per visited window) would invert those overlap
+/// pixels twice → cancel → a gap. A draw+erase round-trip cannot catch
+/// this (it is symmetric), so we assert uniform single-pass coverage.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn stroke_root_xor_include_inferiors_no_gap_over_subwindow() {
+    use yserver_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
+
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    let root = WindowHandle::from_raw(1).expect("root");
+    // Redirected top-level W: 200×200 at screen (100, 100), depth 24.
+    let w = b
+        .create_subwindow(
+            None,
+            root,
+            100,
+            100,
+            200,
+            200,
+            0,
+            HostSubwindowVisual::Explicit {
+                depth: 24,
+                visual_xid: 0,
+                colormap_xid: 0,
+            },
+            None,
+            None,
+        )
+        .expect("top-level W");
+    let w_xid = w.as_raw();
+    b.map_subwindow(None, w_xid).expect("map W");
+
+    let backing = b.create_pixmap(None, 24, 200, 200).expect("W backing");
+    assert!(
+        b.test_set_redirected_target(w_xid, backing.as_raw()),
+        "redirect route must be recorded"
+    );
+
+    // Clear W's routed backing to 0.
+    b.fill_rectangle(None, w_xid, 0x0000_0000, 0, 0, 200, 200)
+        .expect("clear W backing");
+
+    // Non-redirected child C at W-local (0, 50), size 40×40. The
+    // rectangle's LEFT edge (screen x=100 → W-local x=0) runs down
+    // through C's rows, so C and W both route into `backing` there.
+    let c = b
+        .create_subwindow(
+            None,
+            w,
+            0,
+            50,
+            40,
+            40,
+            0,
+            HostSubwindowVisual::Explicit {
+                depth: 24,
+                visual_xid: 0,
+                colormap_xid: 0,
+            },
+            None,
+            None,
+        )
+        .expect("child C");
+    b.map_subwindow(None, c.as_raw()).expect("map C");
+
+    // GC: IncludeInferiors + Invert.
+    b.apply_draw_state(
+        None,
+        &DrawState {
+            subwindow_mode: SubwindowMode::IncludeInferiors,
+            function: GcFunction::Invert,
+            foreground: 0x00FF_FFFF,
+            ..DrawState::default()
+        },
+    )
+    .expect("apply include-inferiors invert");
+
+    // ONE PolyRectangle on root spanning W.
+    let rect = pack_rect(100, 100, 200, 200);
+    b.poly_rectangle(None, root.as_raw(), 0x00FF_FFFF, &rect)
+        .expect("poly_rectangle on root");
+
+    // Left-edge column of W's backing: every interior pixel inverted
+    // 0 → white for the full height, INCLUDING the rows overlapping C
+    // (W-local y 50..90). Under the naive per-child recursion those
+    // overlap pixels would be inverted twice → 0 → a gap. Under the
+    // shipped dedup they are inverted exactly once → white.
+    //
+    // The two extreme rows (y=0 top-left, y=199 bottom-left) are the
+    // rectangle-outline CORNERS: each corner pixel is emitted by two
+    // adjacent edge segments, so under XOR/Invert it self-cancels to 0.
+    // That is inherent to an XOR rectangle outline (same on Xorg) and
+    // is orthogonal to the inferior-dedup this test guards, so the two
+    // corner rows are excluded. Every non-corner row — the whole C
+    // band included — must be uniformly inverted.
+    let out = b
+        .get_image_pixels_for_tests(w_xid, 2, 0, 0, 1, 200, !0)
+        .expect("get_image W column")
+        .expect("Some bytes");
+    let rows: Vec<u32> = out
+        .chunks_exact(4)
+        .map(|px| u32::from_le_bytes([px[0], px[1], px[2], px[3]]) & 0x00FF_FFFF)
+        .collect();
+    assert_eq!(rows.len(), 200, "expected 200-pixel column");
+    for (row, &v) in rows.iter().enumerate() {
+        if row == 0 || row == 199 {
+            continue; // outline corner: XOR self-cancels (see above)
+        }
+        assert_eq!(
+            v, 0x00FF_FFFF,
+            "row {row}: expected single-pass invert (no double-invert gap over sub-window)"
+        );
+    }
+}
+
 /// Stage 3e.2 acceptance: a 4×4 axis-aligned trapezoid (= filled
 /// rect) painted via `render_trapezoids` must produce full coverage
 /// in the trap interior. Validates the entire GPU pipeline: trap
@@ -758,8 +979,8 @@ fn v2_root_fill_with_include_inferiors_matches_top_level_result() {
 /// in-tree oracle.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_render_trapezoids_renders_filled_rect() {
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+fn render_trapezoids_renders_filled_rect() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -864,8 +1085,8 @@ fn v2_render_trapezoids_renders_filled_rect() {
 /// `solid_src_image`), the centre will read white or undefined.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_back_to_back_trapezoids_different_solidfill_colors() {
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+fn back_to_back_trapezoids_different_solidfill_colors() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -1007,8 +1228,8 @@ fn v2_back_to_back_trapezoids_different_solidfill_colors() {
 /// row (y=4) should read fully opaque white.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_adjacent_trapezoids_share_horizontal_boundary_cleanly() {
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+fn adjacent_trapezoids_share_horizontal_boundary_cleanly() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -1118,12 +1339,12 @@ fn v2_adjacent_trapezoids_share_horizontal_boundary_cleanly() {
 /// (transparent black), not red.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_subwindow_resize_clears_old_paint() {
+fn subwindow_resize_clears_old_paint() {
     use yserver_core::{
         backend::WindowHandle,
         host_x11::{HostSubwindowConfig, HostSubwindowVisual},
     };
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -1231,8 +1452,8 @@ fn v2_subwindow_resize_clears_old_paint() {
 /// create.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_fresh_pixmap_reads_back_zero() {
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+fn fresh_pixmap_reads_back_zero() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -1273,7 +1494,7 @@ fn v2_fresh_pixmap_reads_back_zero() {
 }
 
 /// Diagnostic: same trap geometry shape as
-/// v2_render_trapezoids_renders_filled_rect but with a LARGE bbox
+/// render_trapezoids_renders_filled_rect but with a LARGE bbox
 /// (covering most of mask_scratch's 256×256 default extent). If
 /// this passes while the 4×4 variant fails, the bug is
 /// bbox-size-vs-mask-extent ratio — Intel rasterizer culls tiny
@@ -1281,8 +1502,8 @@ fn v2_fresh_pixmap_reads_back_zero() {
 /// to the bbox, not the full mask.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_render_trapezoids_large_bbox_repro() {
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+fn render_trapezoids_large_bbox_repro() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -1357,8 +1578,8 @@ fn v2_render_trapezoids_large_bbox_repro() {
 /// depends on this exact shape.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_tiled_fill_replicates_tile_pixmap() {
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+fn tiled_fill_replicates_tile_pixmap() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -1435,12 +1656,12 @@ fn v2_tiled_fill_replicates_tile_pixmap() {
 /// [0, 800) × [0, 600) hits a tiled tile.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_set_container_background_pixmap_tiles_across_root() {
+fn set_container_background_pixmap_tiles_across_root() {
     // Root GetImage reads the on-screen *scanout* (matching Xorg's
     // root = framebuffer), so this needs the scanout-capable fixture and
     // a real compose to blit the tiled root storage onto the scanout —
     // `for_tests_with_vk` has no scanout pool and would read nothing.
-    let mut b = match KmsBackendV2::for_tests_with_vk_live_scene() {
+    let mut b = match KmsBackend::for_tests_with_vk_live_scene() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk/live scene: {e}");
@@ -1486,10 +1707,10 @@ fn v2_set_container_background_pixmap_tiles_across_root() {
 /// same `(x, y)` source offset. fvwm3 frame/panel clears rely on this.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_clear_area_with_bg_pixmap_tiles_window_background() {
+fn clear_area_with_bg_pixmap_tiles_window_background() {
     use yserver_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
 
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -1570,13 +1791,13 @@ fn v2_clear_area_with_bg_pixmap_tiles_window_background() {
 /// column.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_resize_with_bg_pixmap_reseeds_new_storage_from_background_pixmap() {
+fn resize_with_bg_pixmap_reseeds_new_storage_from_background_pixmap() {
     use yserver_core::{
         backend::WindowHandle,
         host_x11::{HostSubwindowConfig, HostSubwindowVisual},
     };
 
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -1655,9 +1876,9 @@ fn v2_resize_with_bg_pixmap_reseeds_new_storage_from_background_pixmap() {
 /// garbage — driver-dependent. The fill makes it explicit.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_window_storage_no_bg_pixel_inits_to_safe_default() {
+fn window_storage_no_bg_pixel_inits_to_safe_default() {
     use yserver_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -1719,8 +1940,8 @@ fn v2_window_storage_no_bg_pixel_inits_to_safe_default() {
 /// exactly 1.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_poly_segment_coalesces_to_one_submit() {
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+fn poly_segment_coalesces_to_one_submit() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -1783,8 +2004,8 @@ fn v2_poly_segment_coalesces_to_one_submit() {
 /// resolved) and B (raw lookup); the same buffer in both cases.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_set_redirected_target_routes_fill_to_backing() {
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+fn set_redirected_target_routes_fill_to_backing() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -1847,10 +2068,10 @@ fn v2_set_redirected_target_routes_fill_to_backing() {
 /// path end-to-end through the Backend trait.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_set_redirected_target_descendant_fill_lands_at_offset() {
+fn set_redirected_target_descendant_fill_lands_at_offset() {
     use yserver_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
 
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -1969,10 +2190,10 @@ fn v2_set_redirected_target_descendant_fill_lands_at_offset() {
 /// subsequent call (with incremented refcount).
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_allocate_redirected_backing_seeds_refcount_and_map() {
+fn allocate_redirected_backing_seeds_refcount_and_map() {
     use yserver_core::backend::WindowHandle;
 
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -1984,7 +2205,7 @@ fn v2_allocate_redirected_backing_seeds_refcount_and_map() {
     // path; what matters is the xid resolves in the store so the
     // `set_redirected_target` step succeeds. (In 4c real-app paths
     // W is a top-level Window-kind drawable; the seed-copy path
-    // tested separately in `v2_redirect_seed_copies_window_content`
+    // tested separately in `redirect_seed_copies_window_content`
     // exercises that shape.)
     let w_xid = b.create_pixmap(None, 32, 16, 16).expect("W").as_raw();
     let w_handle = WindowHandle::from_raw(w_xid).expect("WindowHandle");
@@ -2020,10 +2241,10 @@ fn v2_allocate_redirected_backing_seeds_refcount_and_map() {
 /// idempotency path at `kms/backend.rs:9581-9588`.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_allocate_redirected_backing_is_idempotent() {
+fn allocate_redirected_backing_is_idempotent() {
     use yserver_core::backend::WindowHandle;
 
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -2050,10 +2271,10 @@ fn v2_allocate_redirected_backing_is_idempotent() {
 /// existing backing and increments refcount (Reason-2 alias hold).
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_name_window_pixmap_returns_existing_backing() {
+fn name_window_pixmap_returns_existing_backing() {
     use yserver_core::backend::WindowHandle;
 
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -2081,10 +2302,10 @@ fn v2_name_window_pixmap_returns_existing_backing() {
 /// v1 uses `io::ErrorKind::NotFound` at `kms/backend.rs:9534`.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_name_window_pixmap_without_redirect_errors_not_found() {
+fn name_window_pixmap_without_redirect_errors_not_found() {
     use yserver_core::backend::WindowHandle;
 
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -2107,10 +2328,10 @@ fn v2_name_window_pixmap_without_redirect_errors_not_found() {
 /// hold; with no aliases held, the backing storage is destroyed.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_release_redirected_backing_drops_storage_when_no_aliases() {
+fn release_redirected_backing_drops_storage_when_no_aliases() {
     use yserver_core::backend::WindowHandle;
 
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -2151,10 +2372,10 @@ fn v2_release_redirected_backing_drops_storage_when_no_aliases() {
 /// NOT W's default-init colour.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_redirect_seed_uses_parent_content_at_w_position() {
+fn redirect_seed_uses_parent_content_at_w_position() {
     use yserver_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
 
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -2228,10 +2449,10 @@ fn v2_redirect_seed_uses_parent_content_at_w_position() {
 /// is what eventually drops the storage.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_release_redirected_backing_survives_named_alias() {
+fn release_redirected_backing_survives_named_alias() {
     use yserver_core::backend::WindowHandle;
 
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -2266,8 +2487,8 @@ fn v2_release_redirected_backing_survives_named_alias() {
 
 // ───── Stage 4c.5 — Vk-backed participation + mode-flip oracles ────
 //
-// Test #5 (`v2_redirected_paint_lands_in_backing`) from the task spec
-// is already covered by `v2_set_redirected_target_routes_fill_to_backing`
+// Test #5 (`redirected_paint_lands_in_backing`) from the task spec
+// is already covered by `set_redirected_target_routes_fill_to_backing`
 // above — that test pre-fills B blue, installs the redirect, paints
 // green through W's xid, and asserts B reads green. Skipped here to
 // keep the suite mean (single-purpose oracles).
@@ -2281,10 +2502,10 @@ fn v2_release_redirected_backing_survives_named_alias() {
 /// `!scene_participating`).
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_automatic_redirect_backing_is_scene_participating() {
+fn automatic_redirect_backing_is_scene_participating() {
     use yserver_core::backend::{PixmapHandle, WindowHandle};
 
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -2374,15 +2595,15 @@ fn v2_automatic_redirect_backing_is_scene_participating() {
 ///
 /// Note (per task spec): the protocol-handler `flip_redirect_target_mode`
 /// path in `yserver-core/src/core_loop/process_request.rs` isn't
-/// drivable from `tests/v2_acceptance.rs` without protocol scaffolding
+/// drivable from `tests/acceptance.rs` without protocol scaffolding
 /// (see TODO comments below). The participation-toggle dance covers
 /// the same backend-trait invariants the protocol handler exercises.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_mode_flip_preserves_backing_and_aliases() {
+fn mode_flip_preserves_backing_and_aliases() {
     use yserver_core::backend::{PixmapHandle, WindowHandle};
 
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -2483,25 +2704,25 @@ fn v2_mode_flip_preserves_backing_and_aliases() {
 // scaffolding lands.
 //
 // TODO(4c.7 or post-4c): needs `handle_composite_request` test scaffolding
-// - v2_map_window_after_redirect_subwindows_keeps_manual_participation
+// - map_window_after_redirect_subwindows_keeps_manual_participation
 //     RedirectSubwindows(parent, Manual) → MapWindow(child) — child's
 //     participation must stay Manual (off-scene); the post-map hook
 //     must not flip it back on.
 //
 // TODO(4c.7 or post-4c): needs `handle_composite_request` test scaffolding
-// - v2_map_subwindows_redirects_each_child
+// - map_subwindows_redirects_each_child
 //     RedirectSubwindows(parent, Manual) → MapSubwindows(parent) —
 //     every child gets its own `allocate_redirected_backing` call
 //     via the per-child redirect hook.
 //
 // TODO(4c.7 or post-4c): needs `handle_composite_request` test scaffolding
-// - v2_name_window_pixmap_on_unviewable_returns_bad_match
+// - name_window_pixmap_on_unviewable_returns_bad_match
 //     NameWindowPixmap(W) on an unmapped (unviewable) window must
 //     return `BadMatch` per the X11 COMPOSITE spec, not silently
 //     succeed with an alias to whatever backing exists.
 //
 // TODO(4c.7 or post-4c): needs `handle_composite_request` test scaffolding
-// - v2_existing_alias_survives_window_unmap
+// - existing_alias_survives_window_unmap
 //     A held NameWindowPixmap alias must keep the backing alive past
 //     a subsequent UnmapWindow(W) (no race that drops the storage
 //     when the redirect map clears).
@@ -2523,8 +2744,8 @@ fn v2_mode_flip_preserves_backing_and_aliases() {
 /// accumulated presentation damage that a scene tick would consume.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_cow_paint_appears_on_scanout() {
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+fn cow_paint_appears_on_scanout() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -2604,8 +2825,8 @@ fn v2_cow_paint_appears_on_scanout() {
 /// minimal-blend op is the cleanest gate.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_render_composite_depth24_src_samples_opaque_alpha() {
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+fn render_composite_depth24_src_samples_opaque_alpha() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -2692,7 +2913,7 @@ fn v2_render_composite_depth24_src_samples_opaque_alpha() {
 }
 
 /// Scene-path α-leak fix — sibling to
-/// `v2_render_composite_depth24_src_samples_opaque_alpha` above,
+/// `render_composite_depth24_src_samples_opaque_alpha` above,
 /// covering the scene compositor side instead of the engine RENDER
 /// side.
 ///
@@ -2723,10 +2944,10 @@ fn v2_render_composite_depth24_src_samples_opaque_alpha() {
 /// engine-side composite tests.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_storage_depth24_has_distinct_sample_view() {
+fn storage_depth24_has_distinct_sample_view() {
     use ash::vk;
 
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -2783,8 +3004,8 @@ fn v2_storage_depth24_has_distinct_sample_view() {
 /// ring's lifetime counter increments but Telemetry stays at zero.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_render_composite_bumps_pool_create_telemetry() {
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+fn render_composite_bumps_pool_create_telemetry() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -2835,7 +3056,7 @@ fn v2_render_composite_bumps_pool_create_telemetry() {
 /// Spec § 'Integration tests'.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_render_composite_pool_creates_bounded_after_warmup() {
+fn render_composite_pool_creates_bounded_after_warmup() {
     const N: u32 = 2000;
     // 256 sets per pool inside the ring (mirrors SETS_PER_POOL).
     const SETS_PER_POOL: u32 = 256;
@@ -2843,7 +3064,7 @@ fn v2_render_composite_pool_creates_bounded_after_warmup() {
     let expected_creates_upper = u64::from(N / SETS_PER_POOL) + WARMUP_SLACK;
     let expected_resets_lower = u64::from(N / SETS_PER_POOL).saturating_sub(WARMUP_SLACK);
 
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -2926,14 +3147,14 @@ fn v2_render_composite_pool_creates_bounded_after_warmup() {
 /// the ring acquire helper.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_render_traps_pool_creates_bounded_after_warmup() {
+fn render_traps_pool_creates_bounded_after_warmup() {
     const N: u32 = 2000;
     const SETS_PER_POOL: u32 = 256;
     const WARMUP_SLACK: u64 = 4;
     let expected_creates_upper = u64::from(N / SETS_PER_POOL) + WARMUP_SLACK;
     let expected_resets_lower = u64::from(N / SETS_PER_POOL).saturating_sub(WARMUP_SLACK);
 
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -2954,7 +3175,7 @@ fn v2_render_traps_pool_creates_bounded_after_warmup() {
         .expect("Some");
 
     // Same axis-aligned 4×4 trap used by
-    // v2_render_trapezoids_renders_filled_rect.
+    // render_trapezoids_renders_filled_rect.
     let mut traps: Vec<u8> = Vec::with_capacity(40);
     let fields: [i32; 10] = [
         2 << 16,
@@ -3034,8 +3255,8 @@ fn v2_render_traps_pool_creates_bounded_after_warmup() {
 ///      (rows 4..8) must remain blue.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_clip_pixmap_mask_gates_poly_fill_to_mask_shape() {
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+fn clip_pixmap_mask_gates_poly_fill_to_mask_shape() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -3126,8 +3347,8 @@ fn v2_clip_pixmap_mask_gates_poly_fill_to_mask_shape() {
 /// the X11 PRESENT serial bookkeeping doesn't pile up at the loop.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_drain_force_fires_all_pending_on_renderer_failed() {
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+fn drain_force_fires_all_pending_on_renderer_failed() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -3181,9 +3402,9 @@ fn v2_drain_force_fires_all_pending_on_renderer_failed() {
 /// must hand control back to the main loop without blocking.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_present_pixmap_enqueues_pending_and_defers_emission() {
+fn present_pixmap_enqueues_pending_and_defers_emission() {
     use yserver_core::backend::{CompletedPresentEvent, PresentWake};
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -3221,9 +3442,9 @@ fn v2_present_pixmap_enqueues_pending_and_defers_emission() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_present_pixmap_synced_enqueues_with_release_syncobj_wake() {
+fn present_pixmap_synced_enqueues_with_release_syncobj_wake() {
     use yserver_core::backend::{CompletedPresentEvent, PresentWake};
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -3260,9 +3481,9 @@ fn v2_present_pixmap_synced_enqueues_with_release_syncobj_wake() {
 /// them out to clients before the socket is torn down.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_disable_output_flushes_pending_batches_before_drain_all() {
+fn disable_output_flushes_pending_batches_before_drain_all() {
     use yserver_core::backend::{CompletedPresentEvent, PresentWake};
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -3329,7 +3550,7 @@ fn v2_disable_output_flushes_pending_batches_before_drain_all() {
 fn submit_group_flushes_before_non_cow_present_completion_signal() {
     use yserver_core::backend::{Backend, CompletedPresentEvent, PresentWake};
 
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -3426,7 +3647,7 @@ fn submit_group_flushes_before_non_cow_present_completion_signal() {
 fn submit_group_max_size_caps_growth_at_seventeen_paint_ops() {
     use yserver_core::backend::Backend;
 
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -3453,7 +3674,7 @@ fn submit_group_max_size_caps_growth_at_seventeen_paint_ops() {
 
     // Force the cap to 16 explicitly so the test doesn't drift if
     // someone tunes the default (production runs max_size=1 during
-    // B.1–B.4; see v2_platform_open_pins_submit_group_max_size_to_one).
+    // B.1–B.4; see platform_open_pins_submit_group_max_size_to_one).
     b.platform_submit_group_set_max_size_for_tests(16);
 
     // Since B.3, fill_rectangle records into the frame builder, so a
@@ -3505,7 +3726,7 @@ fn submit_group_max_size_caps_growth_at_seventeen_paint_ops() {
 #[test]
 #[ignore = "lavapipe vk"]
 fn submit_group_failure_drops_pending_ops_and_short_circuits() {
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -3592,7 +3813,7 @@ fn submit_group_failure_drops_pending_ops_and_short_circuits() {
 /// and one SyncBoundary for the readback CB itself.
 ///
 /// Note: maybe_composite is not driven (no public wrapper available on
-/// KmsBackendV2 that ticks the scene/compose loop); the covered surface
+/// KmsBackend that ticks the scene/compose loop); the covered surface
 /// is: cow_batch path, fill_rect, render_composite, glyph upload, and
 /// the two get_image flush-trigger sites.
 ///
@@ -3602,7 +3823,7 @@ fn submit_group_failure_drops_pending_ops_and_short_circuits() {
 #[test]
 #[ignore = "lavapipe vk"]
 fn submit_group_mixed_sequence_smoke_exact_submit_count() {
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -3759,8 +3980,8 @@ fn submit_group_mixed_sequence_smoke_exact_submit_count() {
 /// of the default is caught before it reaches a review.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_platform_open_pins_submit_group_max_size_to_one() {
-    let backend = match KmsBackendV2::for_tests_with_vk() {
+fn platform_open_pins_submit_group_max_size_to_one() {
+    let backend = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -3796,8 +4017,8 @@ fn v2_platform_open_pins_submit_group_max_size_to_one() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 #[allow(clippy::similar_names)]
-fn v2_frame_builder_composite_glyphs_one_submit() {
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+fn frame_builder_composite_glyphs_one_submit() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -3811,7 +4032,7 @@ fn v2_frame_builder_composite_glyphs_one_submit() {
 
     // Build a small dst pixmap + SolidFill source + glyphset with one
     // 4×4 A8 glyph, mirroring the structure used by
-    // `v2_composite_glyphs_clip_intersects_picture`.
+    // `composite_glyphs_clip_intersects_picture`.
     let dst_pix = b.create_pixmap(None, 32, 8, 4).expect("create_pixmap");
     let dst_xid = dst_pix.as_raw();
     let src_pic = b
@@ -3920,7 +4141,7 @@ fn v2_frame_builder_composite_glyphs_one_submit() {
 /// infrastructure catches up.
 #[test]
 #[ignore = "scaffold — needs test-side glyph fabrication + helpers"]
-fn v2_frame_builder_renderer_failed_on_submit_failure() {
+fn frame_builder_renderer_failed_on_submit_failure() {
     // TODO: implement once composite_glyphs_for_tests is fully wired.
 }
 
@@ -3942,7 +4163,7 @@ fn v2_frame_builder_renderer_failed_on_submit_failure() {
 /// M2 wiring at 10 entry points + Task 13's M3 wiring.
 #[test]
 #[ignore = "scaffold — needs test-side glyph + fill_rect helpers"]
-fn v2_frame_builder_mixed_sequence_smoke() {
+fn frame_builder_mixed_sequence_smoke() {
     // TODO: implement once composite_glyphs_for_tests is fully wired.
 }
 
@@ -3964,7 +4185,7 @@ fn v2_frame_builder_mixed_sequence_smoke() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn acquire_descriptor_uses_frame_generation_when_open() {
-    let mut be = match KmsBackendV2::for_tests_with_vk() {
+    let mut be = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -4054,8 +4275,8 @@ fn acquire_descriptor_uses_frame_generation_when_open() {
 /// init / open-for-paint, this test catches it.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_frame_builder_render_composite_via_fb_opens_frame() {
-    let mut be = match KmsBackendV2::for_tests_with_vk() {
+fn frame_builder_render_composite_via_fb_opens_frame() {
+    let mut be = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -4105,8 +4326,8 @@ fn v2_frame_builder_render_composite_via_fb_opens_frame() {
 /// ops.push + overlay write into a single critical section.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_frame_builder_render_composite_via_fb_second_op_dst_old_layout_is_shader_read_only() {
-    let mut be = match KmsBackendV2::for_tests_with_vk() {
+fn frame_builder_render_composite_via_fb_second_op_dst_old_layout_is_shader_read_only() {
+    let mut be = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -4175,8 +4396,8 @@ fn v2_frame_builder_render_composite_via_fb_second_op_dst_old_layout_is_shader_r
 /// target).
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_frame_builder_render_composite_collapses_two_in_one_frame() {
-    let mut be = match KmsBackendV2::for_tests_with_vk() {
+fn frame_builder_render_composite_collapses_two_in_one_frame() {
+    let mut be = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -4249,8 +4470,8 @@ fn v2_frame_builder_render_composite_collapses_two_in_one_frame() {
 /// keeps the assertion parallel-safe across the test binary.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_frame_builder_mixed_render_and_glyphs_one_submit() {
-    let mut be = match KmsBackendV2::for_tests_with_vk() {
+fn frame_builder_mixed_render_and_glyphs_one_submit() {
+    let mut be = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -4278,7 +4499,7 @@ fn v2_frame_builder_mixed_render_and_glyphs_one_submit() {
         .expect("Some");
 
     // Register one 4×4 opaque-A8 glyph (id=1) on the glyphset. Mirrors
-    // the existing `v2_frame_builder_composite_glyphs_one_submit`
+    // the existing `frame_builder_composite_glyphs_one_submit`
     // fixture shape — smallest plausible run that exercises the
     // atlas-intern → upload → text-draw path under the frame builder.
     let mut add_body: Vec<u8> = Vec::new();
@@ -4374,8 +4595,8 @@ fn v2_frame_builder_mixed_render_and_glyphs_one_submit() {
 /// share one open frame and collapse into a single `vkQueueSubmit2`.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_frame_builder_render_fill_rectangles_via_frame_builder() {
-    let mut be = match KmsBackendV2::for_tests_with_vk() {
+fn frame_builder_render_fill_rectangles_via_frame_builder() {
+    let mut be = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -4488,8 +4709,8 @@ fn v2_frame_builder_render_fill_rectangles_via_frame_builder() {
 /// value, and rollback writes it back to storage.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_frame_builder_render_composite_renderer_failed_on_submit_failure() {
-    let mut be = match KmsBackendV2::for_tests_with_vk() {
+fn frame_builder_render_composite_renderer_failed_on_submit_failure() {
+    let mut be = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -4556,7 +4777,7 @@ fn v2_frame_builder_render_composite_renderer_failed_on_submit_failure() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn b3_close_path_scratch_walk_yields_empty_for_no_copy_area_frames() {
-    let mut be = match KmsBackendV2::for_tests_with_vk() {
+    let mut be = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -4623,8 +4844,8 @@ fn b3_close_path_scratch_walk_yields_empty_for_no_copy_area_frames() {
 /// for the one forced-close flush — parallel-safe).
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_frame_builder_copy_area_collapses_two_in_one_frame() {
-    let mut be = match KmsBackendV2::for_tests_with_vk() {
+fn frame_builder_copy_area_collapses_two_in_one_frame() {
+    let mut be = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -4706,8 +4927,8 @@ fn v2_frame_builder_copy_area_collapses_two_in_one_frame() {
 /// via the timeout helper, and asserts submit_group_flushes delta == 1.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_frame_builder_cow_copy_area_collapses_two_in_one_frame() {
-    let mut be = match KmsBackendV2::for_tests_with_vk() {
+fn frame_builder_cow_copy_area_collapses_two_in_one_frame() {
+    let mut be = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -4776,8 +4997,8 @@ fn v2_frame_builder_cow_copy_area_collapses_two_in_one_frame() {
 /// inject a fake completion entry without a real X PRESENT client.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_frame_builder_cow_copy_area_delivers_present_completion() {
-    let mut be = match KmsBackendV2::for_tests_with_vk() {
+fn frame_builder_cow_copy_area_delivers_present_completion() {
+    let mut be = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -4861,8 +5082,8 @@ fn v2_frame_builder_cow_copy_area_delivers_present_completion() {
 ///   fires CloseReason::NonPortedPaintOp).
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_frame_builder_put_image_collapses_two_in_one_frame() {
-    let mut be = match KmsBackendV2::for_tests_with_vk() {
+fn frame_builder_put_image_collapses_two_in_one_frame() {
+    let mut be = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -4950,9 +5171,9 @@ fn v2_frame_builder_put_image_collapses_two_in_one_frame() {
 /// fired — fill_rect_batch now extends the open frame rather than
 /// closing it via `close_open_frame_for_non_ported_op`.
 #[test]
-#[ignore = "requires Vk fixture — gated to v2_acceptance harness"]
-fn v2_frame_builder_fill_rect_batch_collapses_two_in_one_frame() {
-    let mut be = match KmsBackendV2::for_tests_with_vk() {
+#[ignore = "requires Vk fixture — gated to acceptance harness"]
+fn frame_builder_fill_rect_batch_collapses_two_in_one_frame() {
+    let mut be = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -5033,8 +5254,8 @@ fn v2_frame_builder_fill_rect_batch_collapses_two_in_one_frame() {
 /// `close_open_frame_for_non_ported_op`.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_frame_builder_logic_fill_collapses_two_in_one_frame() {
-    let mut be = match KmsBackendV2::for_tests_with_vk() {
+fn frame_builder_logic_fill_collapses_two_in_one_frame() {
+    let mut be = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -5127,8 +5348,8 @@ fn v2_frame_builder_logic_fill_collapses_two_in_one_frame() {
 ///   fires `CloseReason::NonPortedPaintOp`).
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_frame_builder_image_text_collapses_two_in_one_frame() {
-    let mut be = match KmsBackendV2::for_tests_with_vk() {
+fn frame_builder_image_text_collapses_two_in_one_frame() {
+    let mut be = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -5193,8 +5414,8 @@ fn v2_frame_builder_image_text_collapses_two_in_one_frame() {
 /// - The frame is closed after the failure path runs.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_frame_builder_image_text_close_failure_rolls_back_atlas() {
-    let mut be = match KmsBackendV2::for_tests_with_vk() {
+fn frame_builder_image_text_close_failure_rolls_back_atlas() {
+    let mut be = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -5250,9 +5471,9 @@ fn v2_frame_builder_image_text_close_failure_rolls_back_atlas() {
 /// - `submit_group_flushes` delta must be 0 (no submit happened).
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_frame_builder_image_text_non_bgra8_target_drops_run() {
-    use yserver::kms::v2::KmsBackendV2;
-    let mut be = match KmsBackendV2::for_tests_with_vk() {
+fn frame_builder_image_text_non_bgra8_target_drops_run() {
+    use yserver::kms::render::KmsBackend;
+    let mut be = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -5314,13 +5535,13 @@ fn v2_frame_builder_image_text_non_bgra8_target_drops_run() {
 /// attach a synthetic PRESENT completion, force-close, drain, and assert
 /// that the `CompletedPresentEvent` is delivered.
 ///
-/// Mirrors `v2_frame_builder_cow_copy_area_delivers_present_completion`
+/// Mirrors `frame_builder_cow_copy_area_delivers_present_completion`
 /// but uses `image_text` as the op and `attach_synthetic_present_completion_for_tests`
 /// (the generic variant that works on any drawable, not just the COW).
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_frame_builder_image_text_delivers_present_completion() {
-    let mut be = match KmsBackendV2::for_tests_with_vk() {
+fn frame_builder_image_text_delivers_present_completion() {
+    let mut be = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -5380,8 +5601,8 @@ fn v2_frame_builder_image_text_delivers_present_completion() {
 /// triggers a mask-scratch grow.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_frame_builder_render_traps_or_tris_collapses_two_in_one_frame() {
-    let mut be = match yserver::kms::v2::KmsBackendV2::for_tests_with_vk() {
+fn frame_builder_render_traps_or_tris_collapses_two_in_one_frame() {
+    let mut be = match yserver::kms::render::KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -5445,8 +5666,8 @@ fn v2_frame_builder_render_traps_or_tris_collapses_two_in_one_frame() {
 /// Asserts flushes delta = 2 and scratch_grow lifetime counter delta = 1.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_frame_builder_render_traps_or_tris_cross_frame_mask_grow() {
-    let mut be = match yserver::kms::v2::KmsBackendV2::for_tests_with_vk() {
+fn frame_builder_render_traps_or_tris_cross_frame_mask_grow() {
+    let mut be = match yserver::kms::render::KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -5520,8 +5741,8 @@ fn v2_frame_builder_render_traps_or_tris_cross_frame_mask_grow() {
 /// (catches the stale-solid-src replay bug from codex round-7).
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_frame_builder_render_traps_or_tris_solid_source_replays_color() {
-    let mut be = match yserver::kms::v2::KmsBackendV2::for_tests_with_vk() {
+fn frame_builder_render_traps_or_tris_solid_source_replays_color() {
+    let mut be = match yserver::kms::render::KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -5571,8 +5792,8 @@ fn v2_frame_builder_render_traps_or_tris_solid_source_replays_color() {
 /// no panic and no renderer failure.  "Didn't panic" IS the assertion.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_frame_builder_render_traps_or_tris_close_frame_does_not_panic_on_frame_generation_lookup() {
-    let mut be = match yserver::kms::v2::KmsBackendV2::for_tests_with_vk() {
+fn frame_builder_render_traps_or_tris_close_frame_does_not_panic_on_frame_generation_lookup() {
+    let mut be = match yserver::kms::render::KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -5630,8 +5851,8 @@ fn v2_frame_builder_render_traps_or_tris_close_frame_does_not_panic_on_frame_gen
 /// without the abort-on-None defensive path firing.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_frame_builder_render_traps_or_tris_gradient_picture_freed_mid_frame_still_emits() {
-    let mut be = match yserver::kms::v2::KmsBackendV2::for_tests_with_vk() {
+fn frame_builder_render_traps_or_tris_gradient_picture_freed_mid_frame_still_emits() {
+    let mut be = match yserver::kms::render::KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -5712,8 +5933,8 @@ fn v2_frame_builder_render_traps_or_tris_gradient_picture_freed_mid_frame_still_
 /// emit path so any future revert of the fix is structurally caught.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_frame_builder_render_traps_or_tris_after_prior_dst_paint_uses_recorded_old_layout() {
-    let mut be = match yserver::kms::v2::KmsBackendV2::for_tests_with_vk() {
+fn frame_builder_render_traps_or_tris_after_prior_dst_paint_uses_recorded_old_layout() {
+    let mut be = match yserver::kms::render::KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -5802,8 +6023,8 @@ fn v2_frame_builder_render_traps_or_tris_after_prior_dst_paint_uses_recorded_old
 /// chain and asserts the cache drops accordingly.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_free_pixmap_invalidates_engine_view_cache() {
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+fn free_pixmap_invalidates_engine_view_cache() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -5905,8 +6126,8 @@ fn v2_free_pixmap_invalidates_engine_view_cache() {
 /// every ShapeMask degrades to a bounding-box rect.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_read_depth1_pixmap_returns_mask_bytes() {
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+fn read_depth1_pixmap_returns_mask_bytes() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -5934,7 +6155,7 @@ fn v2_read_depth1_pixmap_returns_mask_bytes() {
         .read_depth1_pixmap(None, xid)
         .expect("read_depth1_pixmap")
         .expect(
-            "v2 must introspect depth-1 pixmaps (trait default None = ShapeMask degrades to bbox)",
+            "render must introspect depth-1 pixmaps (trait default None = ShapeMask degrades to bbox)",
         );
     assert_eq!(
         (w, h),
@@ -5959,8 +6180,8 @@ fn v2_read_depth1_pixmap_returns_mask_bytes() {
 /// coverage.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_read_depth1_pixmap_declines_depth32() {
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+fn read_depth1_pixmap_declines_depth32() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -5989,9 +6210,9 @@ fn v2_read_depth1_pixmap_declines_depth32() {
 /// against `cargo test` instead of a 20s vng cycle.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_two_fills_then_get_image_returns_second_fill() {
+fn two_fills_then_get_image_returns_second_fill() {
     use yserver_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -6080,10 +6301,10 @@ fn v2_two_fills_then_get_image_returns_second_fill() {
 /// retirement between the two composes.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_compose_then_fill_then_get_image_returns_second_fill() {
+fn compose_then_fill_then_get_image_returns_second_fill() {
     use yserver_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
 
-    let mut b = match KmsBackendV2::for_tests_with_vk_live_scene() {
+    let mut b = match KmsBackend::for_tests_with_vk_live_scene() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk/live scene: {e}");
@@ -6177,7 +6398,7 @@ fn v2_compose_then_fill_then_get_image_returns_second_fill() {
 #[test]
 #[ignore = "needs Vulkan ICD (lavapipe)"]
 fn content_version_bumps_on_fill_rect_batch() {
-    let mut be = match KmsBackendV2::for_tests_with_vk() {
+    let mut be = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -6217,7 +6438,7 @@ fn content_version_bumps_on_fill_rect_batch() {
 #[test]
 #[ignore = "needs Vulkan ICD (lavapipe)"]
 fn content_version_bumps_on_copy_area() {
-    let mut be = match KmsBackendV2::for_tests_with_vk() {
+    let mut be = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -6270,7 +6491,7 @@ fn content_version_bumps_on_copy_area() {
 #[test]
 #[ignore = "needs Vulkan ICD (lavapipe)"]
 fn content_version_bumps_on_put_image() {
-    let mut be = match KmsBackendV2::for_tests_with_vk() {
+    let mut be = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -6313,7 +6534,7 @@ fn content_version_bumps_on_put_image() {
 #[test]
 #[ignore = "needs Vulkan ICD (lavapipe)"]
 fn content_version_bumps_on_render_composite() {
-    let mut be = match KmsBackendV2::for_tests_with_vk() {
+    let mut be = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -6346,7 +6567,7 @@ fn content_version_bumps_on_render_composite() {
 #[test]
 #[ignore = "needs Vulkan ICD (lavapipe)"]
 fn content_version_bumps_on_render_traps_or_tris() {
-    let mut be = match yserver::kms::v2::KmsBackendV2::for_tests_with_vk() {
+    let mut be = match yserver::kms::render::KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -6390,8 +6611,8 @@ fn content_version_bumps_on_render_traps_or_tris() {
 /// path is pixel-identical to the CPU path.
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-fn v2_depth1_gxcopy_fill_matches_cpu_reference() {
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+fn depth1_gxcopy_fill_matches_cpu_reference() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -6460,8 +6681,8 @@ fn v2_depth1_gxcopy_fill_matches_cpu_reference() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_masked_copyarea_matches_cmd_copy_image_depth32() {
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+fn masked_copyarea_matches_cmd_copy_image_depth32() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -6529,8 +6750,8 @@ fn v2_masked_copyarea_matches_cmd_copy_image_depth32() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_masked_copyarea_matches_cmd_copy_image_depth24() {
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+fn masked_copyarea_matches_cmd_copy_image_depth24() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -6596,8 +6817,8 @@ fn v2_masked_copyarea_matches_cmd_copy_image_depth24() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_masked_copyarea_matches_cmd_copy_image_r8() {
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+fn masked_copyarea_matches_cmd_copy_image_r8() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -6726,8 +6947,8 @@ fn task10_src_gradient_bgra() -> Vec<u8> {
 // at mask_texel.x 0..5 (SET) -> copied.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_masked_copyarea_honors_clip_origin() {
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+fn masked_copyarea_honors_clip_origin() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -6847,8 +7068,8 @@ fn v2_masked_copyarea_honors_clip_origin() {
 // sampled-zero write — the shader discards OOB-src texels).
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_masked_copyarea_clamps_negative_dst_and_oob_src() {
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+fn masked_copyarea_clamps_negative_dst_and_oob_src() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -6922,8 +7143,8 @@ fn v2_masked_copyarea_clamps_negative_dst_and_oob_src() {
 // the result must be byte-identical to `copy_area(None, dst, dst, ...)`.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_masked_copyarea_self_overlap() {
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+fn masked_copyarea_self_overlap() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -6979,8 +7200,8 @@ fn v2_masked_copyarea_self_overlap() {
 //     gap cols 4..6 retain sentinel — proving the per-rect draws don't bleed.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_masked_copyarea_scissor_composes_with_gc_rects() {
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+fn masked_copyarea_scissor_composes_with_gc_rects() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -7092,7 +7313,7 @@ fn v2_masked_copyarea_scissor_composes_with_gc_rects() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn clip_snapshot_create_and_retire() {
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -7131,7 +7352,7 @@ fn clip_snapshot_create_and_retire() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn masked_copyarea_snapshot_rollback_on_close_failure() {
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -7236,7 +7457,7 @@ fn masked_copyarea_snapshot_rollback_on_close_failure() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn clip_snapshot_refresh_rollback_on_close_failure() {
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -7348,7 +7569,7 @@ fn clip_snapshot_refresh_rollback_on_close_failure() {
 fn masked_copyarea_routes_to_draw_not_transfer() {
     use yserver_core::backend::{ClipState, PixmapHandle as ApplyPixmapHandle};
 
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -7448,7 +7669,7 @@ fn masked_copyarea_no_clip_get_image() {
 
     const CLIP_MASK_SITE: usize = 0; // GetImageSite::ClipMask
 
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -7518,7 +7739,7 @@ fn noncopy_or_partial_planemask_copy_still_uses_old_path() {
         ClipState, DrawState, GcFunction, PixmapHandle as ApplyPixmapHandle,
     };
 
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -7603,10 +7824,10 @@ fn noncopy_or_partial_planemask_copy_still_uses_old_path() {
 /// `masked_copy_area_for_tests` shim — the point is the snapshot lifecycle.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_masked_copyarea_retains_clip_after_pixmap_freed() {
+fn masked_copyarea_retains_clip_after_pixmap_freed() {
     use yserver_core::backend::{ClipState, PixmapHandle as ApplyPixmapHandle};
 
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -7694,10 +7915,10 @@ fn v2_masked_copyarea_retains_clip_after_pixmap_freed() {
 /// gate the fill.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_clip_pixmap_fill_retains_clip_after_pixmap_freed() {
+fn clip_pixmap_fill_retains_clip_after_pixmap_freed() {
     use yserver_core::backend::{ClipState, PixmapHandle as ApplyPixmapHandle};
 
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -7800,10 +8021,10 @@ fn v2_clip_pixmap_fill_retains_clip_after_pixmap_freed() {
 /// Drives the REAL `copy_area` production path, NOT the test shim.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_masked_copyarea_mask_written_same_frame() {
+fn masked_copyarea_mask_written_same_frame() {
     use yserver_core::backend::{ClipState, PixmapHandle as ApplyPixmapHandle};
 
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");

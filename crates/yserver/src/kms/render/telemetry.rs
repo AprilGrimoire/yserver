@@ -21,7 +21,7 @@
 
 use std::time::Instant;
 
-use crate::kms::v2::submit_trace::{SubmitEvent, SubmitTrace};
+use crate::kms::render::submit_trace::{SubmitEvent, SubmitTrace};
 
 /// Call-site attribution for `engine.get_image` (the only production
 /// `flush_submit_group(SyncBoundary)` emitter besides
@@ -224,6 +224,7 @@ pub struct Bucket {
     /// sample. Expected to stay low (most paints don't grow); a
     /// rising rate indicates oversized scratches or workload churn.
     pub(crate) frame_builder_close_reason_scratch_grow: u64,
+    pub(crate) frame_builder_close_reason_redirect_source_boundary: u64,
     /// Sum of `ops_in_frame` across all closes in the window.
     pub(crate) frame_builder_ops_per_frame_total: u64,
     /// Max `ops_in_frame` seen in the current bucket window.
@@ -243,7 +244,7 @@ pub struct Bucket {
     /// `RecordedOp::RenderComposite` ops) across all closes in the
     /// window. Mirrors the `glyph_uploads_per_frame_total` shape;
     /// divide by `frame_builder_closes` for the per-frame average
-    /// rendered in the `v2_telemetry:` log line.
+    /// rendered in the `render_telemetry:` log line.
     pub(crate) frame_builder_renders_per_frame_total: u64,
     /// Phase B.2 Task 14: max `renders_in_frame` seen in the current
     /// bucket window. Mirrors `glyph_uploads_per_frame_max_in_window`.
@@ -292,7 +293,7 @@ pub struct Bucket {
     pub cursor_move_ebusy: u64,
 }
 
-/// v2 telemetry state. One per `KmsBackendV2`. Counter sites
+/// v2 telemetry state. One per `KmsBackend`. Counter sites
 /// call `record_*` directly; the emitter ticks once per second
 /// from the core loop (driven through `maybe_emit`).
 pub struct Telemetry {
@@ -418,7 +419,7 @@ impl Telemetry {
             0.0
         };
         log::info!(
-            "v2_telemetry: paint_submits/s={} composite_submits/s={} \
+            "render_telemetry: paint_submits/s={} composite_submits/s={} \
              one_shot_submits/s={} queue_submit2/s={} \
              vk_queue_wait_idle/s={} cpu_fence_wait_ns/s={} \
              cpu_fence_wait_count/s={} damage_fraction={damage_fraction:.3} \
@@ -541,13 +542,13 @@ impl Telemetry {
         let fb_renders_avg =
             b.frame_builder_renders_per_frame_total as f64 / b.frame_builder_closes.max(1) as f64;
         log::info!(
-            "v2_telemetry: frame_builder_opens={} closes={} aborts={} \
+            "render_telemetry: frame_builder_opens={} closes={} aborts={} \
              ops/frame_avg={fb_ops_avg:.1} max={} hist={:?} \
              glyph_uploads/frame_avg={fb_glyph_avg:.1} max={} \
              renders/frame_avg={fb_renders_avg:.1} max={} active_pins_hw={} \
              close_reasons[scene_compose={} non_ported={} legacy_sc={} \
              present_completion={} sync_wait={} timeout={} shutdown={} pin_ceiling={} \
-             scratch_grow={}]",
+             scratch_grow={} redirect_source_boundary={}]",
             b.frame_builder_opens,
             b.frame_builder_closes,
             b.frame_builder_aborts,
@@ -565,6 +566,7 @@ impl Telemetry {
             b.frame_builder_close_reason_shutdown,
             b.frame_builder_close_reason_pin_ceiling,
             b.frame_builder_close_reason_scratch_grow,
+            b.frame_builder_close_reason_redirect_source_boundary,
         );
         self.bucket = Bucket::default();
         self.last_emit = now;
@@ -577,7 +579,7 @@ impl Telemetry {
     }
 
     /// Explicit flush of the active [`SubmitTrace`]. Called from
-    /// `KmsBackendV2::disable_output` before any potentially-
+    /// `KmsBackend::disable_output` before any potentially-
     /// blocking teardown (VkDevice destroy on the platform side
     /// can hang on some drivers) so the trace's `BufWriter`
     /// commits its buffered tail to disk while we still control
@@ -852,7 +854,7 @@ impl Telemetry {
     // ── Phase B.1 Task 21: frame builder recording sites ─────────
 
     /// Bumped once per `FrameBuilder::open_for_paint` (delta-tracked
-    /// via `KmsBackendV2::drain_frame_builder_telemetry`).
+    /// via `KmsBackend::drain_frame_builder_telemetry`).
     pub(crate) fn record_frame_builder_open(&mut self) {
         self.bucket.frame_builder_opens += 1;
         self.lifetime.frame_builder_opens += 1;
@@ -971,6 +973,14 @@ impl Telemetry {
                 &mut self.bucket.frame_builder_close_reason_scratch_grow,
                 &mut self.lifetime.frame_builder_close_reason_scratch_grow,
             ),
+            R::RedirectSourceBoundary => (
+                &mut self
+                    .bucket
+                    .frame_builder_close_reason_redirect_source_boundary,
+                &mut self
+                    .lifetime
+                    .frame_builder_close_reason_redirect_source_boundary,
+            ),
         };
         *b += 1;
         *l += 1;
@@ -978,7 +988,7 @@ impl Telemetry {
 
     /// Bumped when a frame close followed a Vk error (abort path). In
     /// B.1 the abort signal is inferred from the drain caller; see
-    /// `KmsBackendV2::drain_frame_builder_telemetry`.
+    /// `KmsBackend::drain_frame_builder_telemetry`.
     pub(crate) fn record_frame_builder_abort(&mut self) {
         self.bucket.frame_builder_aborts += 1;
         self.lifetime.frame_builder_aborts += 1;
@@ -1281,10 +1291,10 @@ mod tests {
     /// lockstep with `CloseReason::ScratchGrow` going forward, so the
     /// telemetry log line never silently drops a close reason.
     #[test]
-    fn v2_telemetry_record_frame_builder_close_counts_scratch_grow() {
+    fn telemetry_record_frame_builder_close_counts_scratch_grow() {
         let mut t = Telemetry::new();
         t.record_frame_builder_close(
-            crate::kms::v2::frame_builder::CloseReason::ScratchGrow,
+            crate::kms::render::frame_builder::CloseReason::ScratchGrow,
             /* ops_in_frame = */ 0,
             /* glyph_uploads_in_frame = */ 0,
             /* renders_in_frame = */ 0,
@@ -1298,9 +1308,9 @@ mod tests {
     /// max-in-window gauge in both the bucket and lifetime aggregates.
     /// Pure telemetry test — no Vk needed.
     #[test]
-    fn v2_telemetry_record_frame_builder_close_accumulates_renders_per_frame() {
+    fn telemetry_record_frame_builder_close_accumulates_renders_per_frame() {
         let mut t = Telemetry::new();
-        use crate::kms::v2::frame_builder::CloseReason as R;
+        use crate::kms::render::frame_builder::CloseReason as R;
         t.record_frame_builder_close(R::SceneCompose, 0, 0, 3);
         t.record_frame_builder_close(R::SceneCompose, 0, 0, 7);
         t.record_frame_builder_close(R::SceneCompose, 0, 0, 1);
@@ -1329,7 +1339,7 @@ mod tests {
     #[test]
     fn telemetry_submit_group_hist_buckets_correctly() {
         let mut t = Telemetry::new();
-        use crate::kms::v2::submit_group::FlushReason;
+        use crate::kms::render::submit_group::FlushReason;
         for size in [1, 2, 4, 8, 12, 16, 32] {
             t.record_submit_group_flush(size, FlushReason::SceneCompose);
         }

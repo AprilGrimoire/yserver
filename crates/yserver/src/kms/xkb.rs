@@ -1109,7 +1109,7 @@ pub(super) fn reply_minimal(minor: u8) -> Vec<u8> {
 /// `recompile_keymap`), so the shapes match RMLVO's `layout`/`variant`
 /// convention: `layouts = "us,de,us"`, `variants = ",,"`.
 // Consumed by the XkbGetKbdByName layout-switch path
-// (`KmsBackendV2::load_keymap_by_components`).
+// (`KmsBackend::load_keymap_by_components`).
 pub(super) struct SymbolsLayouts {
     /// Comma-joined layout codes in group order (e.g. `"us,de,us"`).
     pub layouts: String,

@@ -8,8 +8,7 @@
 //! [`InputEvent`].
 
 use std::{
-    cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{File, OpenOptions},
     io,
     os::{
@@ -17,10 +16,7 @@ use std::{
         unix::fs::OpenOptionsExt,
     },
     path::Path,
-    rc::Rc,
 };
-
-use crate::seat::{DeviceKind, LibseatInner};
 
 use input::{
     Device, DeviceCapability, Event, Led, Libinput, LibinputInterface,
@@ -75,8 +71,8 @@ pub struct Context {
     /// Live libinput device handles keyed by evdev devnode (e.g.
     /// `/dev/input/event4`). Populated at `DeviceAdded` for touchpads
     /// (`is_touchpad == true`); cleared at `DeviceRemoved`. Consumed
-    /// by [`Context::apply_device_config`] so the libseat-mode backend
-    /// can route a decoded `xinput set-prop` write through to the
+    /// by [`Context::apply_device_config`] so decoded `xinput set-prop`
+    /// writes can be routed through to the
     /// matching `config_*_set_*` setter on the live device.
     ///
     /// `input::Device` is refcounted at the C level (`libinput_device_ref`)
@@ -96,6 +92,13 @@ pub struct Context {
     /// later (hotplug, VT-switch re-acquire re-adds devices with their
     /// LEDs reset).
     last_leds: Led,
+    /// Device nodes of currently-open **keyboard- or pointer-capable**
+    /// devices. The startup guard requires this to be non-empty: a session
+    /// whose only opened device is non-usable (e.g. a lone HID "System
+    /// Control" collection that opened while the real keyboard/mouse were
+    /// seat-denied) is dead on arrival and can't even be zapped. Add/remove
+    /// tracked so the count stays accurate across hotplug.
+    usable_input_nodes: HashSet<String>,
 }
 
 /// Newtype wrapper around `Context` that implements `Send`.
@@ -117,6 +120,11 @@ impl SendContext {
         self.0.dispatch()
     }
 
+    /// Number of open keyboard/pointer-capable devices (startup guard).
+    pub fn usable_input_device_count(&self) -> usize {
+        self.0.usable_input_device_count()
+    }
+
     pub fn update_leds(&mut self, leds: Led) {
         self.0.update_leds(leds);
     }
@@ -130,9 +138,8 @@ impl SendContext {
     }
 
     /// Route a `xinput set-prop` write to the wrapped libinput context.
-    /// Direct-mode counterpart of the libseat path: the input thread
-    /// owns the live device map here, so client device-config writes
-    /// (forwarded over `InputThreadControl`) land via this forward.
+    /// The input thread owns the live device map, so client device-config
+    /// writes (forwarded over `InputThreadControl`) land via this forward.
     ///
     /// # Errors
     ///
@@ -155,7 +162,21 @@ impl AsFd for SendContext {
 
 impl Context {
     pub fn new() -> io::Result<Self> {
-        log_input_devnodes();
+        // Access check (always-Direct: no libseat to grant device access).
+        // If input nodes exist but any is permission-denied, yserver lacks
+        // input access — the real keyboard/mouse won't open even if an odd
+        // node does. Fail here so startup refuses (routed via the no-input
+        // abort) instead of coming up with a dead, un-zappable session.
+        let (present, permission_denied) = probe_input_devnodes();
+        if present > 0 && permission_denied > 0 {
+            return Err(io::Error::other(format!(
+                "cannot open input devices: {permission_denied} of {present} \
+                 /dev/input/event* nodes are permission-denied.\n\
+                 yserver has no seat/libseat; it needs direct access to input \
+                 devices — add the user to the 'input' group (or grant the \
+                 seat ACL) and run from the console, not over SSH."
+            )));
+        }
         let mut libinput = Libinput::new_with_udev(Interface);
         libinput.udev_assign_seat("seat0").map_err(|()| {
             io::Error::other(
@@ -168,11 +189,20 @@ impl Context {
             touchpad_devices: HashMap::new(),
             keyboard_devices: HashMap::new(),
             last_leds: Led::empty(),
+            usable_input_nodes: HashSet::new(),
         })
     }
 
     pub fn fd(&self) -> RawFd {
         self.libinput.as_raw_fd()
+    }
+
+    /// Count of currently-open **keyboard- or pointer-capable** devices.
+    /// The startup guard requires this to be ≥1 — a session with input
+    /// devices that are none of keyboard/pointer (e.g. only a HID "System
+    /// Control" node) is unusable. See [`usable_input_nodes`](Self).
+    pub fn usable_input_device_count(&self) -> usize {
+        self.usable_input_nodes.len()
     }
 
     pub fn dispatch(&mut self) -> io::Result<Vec<InputEvent>> {
@@ -249,6 +279,16 @@ impl Context {
                         self.keyboard_devices
                             .insert(device_node.clone(), dev.clone());
                     }
+                    // Track keyboard/pointer-capable devices for the startup
+                    // usable-input guard (`usable_input_device_count`). A lone
+                    // non-usable device (e.g. a HID "System Control" collection
+                    // that opens while the real keyboard/mouse are seat-denied)
+                    // must NOT count as usable input.
+                    if dev.has_capability(DeviceCapability::Keyboard)
+                        || dev.has_capability(DeviceCapability::Pointer)
+                    {
+                        self.usable_input_nodes.insert(device_node.clone());
+                    }
                     let info = DeviceInfo {
                         name,
                         device_node,
@@ -274,6 +314,7 @@ impl Context {
                     // No-op if the device wasn't a touchpad (never inserted).
                     self.touchpad_devices.remove(&device_node);
                     self.keyboard_devices.remove(&device_node);
+                    self.usable_input_nodes.remove(&device_node);
                     out.push(InputEvent::DeviceRemoved { device_node });
                 }
                 _ => {}
@@ -285,12 +326,10 @@ impl Context {
         Ok(out)
     }
 
-    /// Push the X-side lock-LED state (Caps/Num/Scroll) to every
-    /// keyboard device. Called on lock-state transitions — directly by
-    /// the libseat-mode backend (context lives on the core thread), or
-    /// from the input thread after a [`crate::input::LedRelay`] wakeup
-    /// in Direct mode. Also remembered for keyboards that appear later
-    /// (see the DeviceAdded arm).
+    /// Push the X-side lock-LED state (Caps/Num/Scroll) to every keyboard
+    /// device. Called from the input thread after a [`crate::input::LedRelay`]
+    /// wakeup. Also remembered for keyboards that appear later (see the
+    /// DeviceAdded arm).
     pub fn update_leds(&mut self, leds: Led) {
         self.last_leds = leds;
         for dev in self.keyboard_devices.values_mut() {
@@ -299,8 +338,7 @@ impl Context {
     }
 
     /// Route a decoded `xinput set-prop` write through to the live
-    /// libinput device. Called from the libseat-mode KMS v2 backend's
-    /// `apply_device_config` override. Returns `Ok(())` when no
+    /// libinput device. Returns `Ok(())` when no
     /// matching device is stashed for `device_node` (a property write
     /// on a non-touchpad / unplugged device is a no-op from the user's
     /// perspective; the property registry stays writable and the X11
@@ -360,63 +398,9 @@ fn configure_touchpad(dev: &mut Device, name: &str) {
     }
 }
 
-/// libinput interface that opens evdev devices through libseat (wlroots'
-/// `libinput_open_restricted` → `wlr_session_open_file`). Used only in
-/// libseat mode, only on the core thread — the `Rc` never crosses a
-/// thread boundary.
-///
-/// Task 8 is the caller; suppressing `dead_code` until then.
-#[allow(dead_code)]
-struct LibseatInterface {
-    seat: Rc<RefCell<LibseatInner>>,
-}
-
-impl LibinputInterface for LibseatInterface {
-    fn open_restricted(&mut self, path: &Path, _flags: i32) -> Result<OwnedFd, i32> {
-        // libseat decides read/write; we ignore `flags` like wlroots does
-        // (backend.c:18). open_device hands back an OwnedFd dup of
-        // libseat's fd; libseat keeps its own handle, released later by
-        // close_restricted → close_device_by_fd.
-        self.seat
-            .borrow_mut()
-            .open_device(path, DeviceKind::Input)
-            .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))
-    }
-
-    fn close_restricted(&mut self, fd: OwnedFd) {
-        // libinput hands back the exact OwnedFd we returned; its raw
-        // number is our `handed_fd` key. Release libseat's side, then drop
-        // libinput's dup. Mirrors wlroots' libinput_close_restricted
-        // (backend.c:28).
-        self.seat.borrow_mut().close_device_by_fd(fd.as_raw_fd());
-        drop(fd);
-    }
-}
-
 impl Context {
-    /// Build a libinput context whose device opens route through libseat.
-    /// Caller owns this on the core thread (NOT wrapped in `SendContext`).
-    ///
-    /// Task 8 is the caller; suppressing `dead_code` until then.
-    #[allow(dead_code)]
-    pub fn new_libseat(seat: Rc<RefCell<LibseatInner>>) -> io::Result<Self> {
-        log_input_devnodes();
-        let mut libinput = Libinput::new_with_udev(LibseatInterface { seat });
-        libinput.udev_assign_seat("seat0").map_err(|()| {
-            io::Error::other("libinput: udev_assign_seat(\"seat0\") failed under libseat")
-        })?;
-        Ok(Self {
-            libinput,
-            touchpad_devices: HashMap::new(),
-            keyboard_devices: HashMap::new(),
-            last_leds: Led::empty(),
-        })
-    }
-
-    /// Suspend libinput: closes all open input device fds and calls
-    /// `close_restricted` for each, releasing them through libseat.
-    /// The context remains valid and can be resumed with [`Context::resume`].
-    /// Task 11 `run_suspend` calls this.
+    /// Suspend libinput: closes all open input device fds. The context remains
+    /// valid and can be resumed with [`Context::resume`].
     ///
     /// `touchpad_devices` is intentionally left as-is — the stashed
     /// handles point at devices whose fds are now closed, but
@@ -429,9 +413,8 @@ impl Context {
         self.libinput.suspend();
     }
 
-    /// Resume a suspended libinput context. Re-enables device monitoring
-    /// and re-opens devices via `open_restricted` (→ `seat.open_device`).
-    /// Task 12 `run_resume` calls this.
+    /// Resume a suspended libinput context. Re-enables device monitoring and
+    /// re-opens devices via `open_restricted`.
     ///
     /// # Errors
     ///
@@ -448,16 +431,27 @@ impl Context {
 /// process can stat / open them. udev rules from logind grant ACL on
 /// `event*` to the active session; if we see `open: ok` here but
 /// libinput's `open_restricted` fails, the seat is the wrong one.
-fn log_input_devnodes() {
+/// Probe every `/dev/input/event*` node with an `O_RDONLY` open, logging
+/// each result, and return `(present, permission_denied)`.
+///
+/// This is the access check that matters now that yserver is always Direct
+/// (no libseat): a session with input access (in the `input` group / holding
+/// the seat's ACL) can open every input node. Any `EACCES`/`EPERM` here means
+/// yserver does NOT have input access — the real keyboard/mouse won't work even
+/// if some odd node (e.g. a HID "System Control" collection, which libinput
+/// still reports as keyboard-capable) happens to open.
+fn probe_input_devnodes() -> (usize, usize) {
     let dir = match std::fs::read_dir("/dev/input") {
         Ok(d) => d,
         Err(err) => {
             log::warn!("/dev/input: read_dir failed: {err}");
-            return;
+            return (0, 0);
         }
     };
     let mut nodes: Vec<_> = dir.flatten().collect();
     nodes.sort_by_key(std::fs::DirEntry::file_name);
+    let mut present = 0usize;
+    let mut permission_denied = 0usize;
     for entry in nodes {
         let name = entry.file_name();
         let Some(name_str) = name.to_str() else {
@@ -466,12 +460,19 @@ fn log_input_devnodes() {
         if !name_str.starts_with("event") {
             continue;
         }
+        present += 1;
         let path = entry.path();
         match OpenOptions::new().read(true).open(&path) {
             Ok(_f) => log::debug!("/dev/input/{name_str}: open(O_RDONLY) ok"),
-            Err(err) => log::warn!("/dev/input/{name_str}: open(O_RDONLY) failed: {err}"),
+            Err(err) => {
+                if matches!(err.raw_os_error(), Some(libc::EACCES | libc::EPERM)) {
+                    permission_denied += 1;
+                }
+                log::warn!("/dev/input/{name_str}: open(O_RDONLY) failed: {err}");
+            }
         }
     }
+    (present, permission_denied)
 }
 
 /// Finger/continuous scroll → `PointerScroll` v120 quantization.
@@ -551,7 +552,13 @@ fn translate(event: &Event) -> Option<InputEvent> {
             }
             Some(InputEvent::PointerScroll { dx_v120, dy_v120 })
         }
-        Event::Pointer(PointerEvent::ScrollFinger(ev)) => finger_or_continuous_to_event(ev),
+        // ScrollFinger: a zero-delta event is libinput's fingers-lifted stop
+        // (`finger_or_continuous_to_event` returns None only for all-zero
+        // deltas), which we surface as PointerScrollStop. ScrollContinuous has
+        // no finger-lift, so its zero deltas stay dropped.
+        Event::Pointer(PointerEvent::ScrollFinger(ev)) => {
+            Some(finger_or_continuous_to_event(ev).unwrap_or(InputEvent::PointerScrollStop))
+        }
         Event::Pointer(PointerEvent::ScrollContinuous(ev)) => finger_or_continuous_to_event(ev),
         _ => None,
     }

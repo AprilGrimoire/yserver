@@ -247,7 +247,7 @@ from.
       button release it briefly shows the correct, clean rectangle**
       before the band clears.
       Evidence (captured drawable dump
-      `yserver-v2-drawable-0-present-src-0-*.ppm`, this is the
+      `yserver-drawable-0-present-src-0-*.ppm`, this is the
       composited scanout source): the staircase is in the composited
       output itself.
       Diagnosis: NOT geometry and NOT the client's output. nemo
@@ -257,7 +257,8 @@ from.
       `dst=(7,0) 627x496`), so nemo's source is a clean rectangle. The
       "correct on release" behaviour proves the backing is correct and a
       **full** repaint renders it right; only the **incremental** repaint
-      during the drag is wrong. This points at v2's Stage 2e buffer-age
+      during the drag is wrong. This points at the render backend's
+      Stage 2e buffer-age
       clipped repaint: with 2-3 scanout buffers, each buffer must repaint
       the damage accumulated since *it* was last drawn, not just the
       latest frame's sliver. If the moving band's window-content damage
@@ -270,7 +271,8 @@ from.
       is opaque/XOR rather than a translucent overlay, so stale pixels
       don't read as a visible step. Worth confirming caja doesn't
       staircase under close inspection.
-      Next step: trace the v2 damage path for a moving sub-region —
+      Next step: trace the render-backend damage path for a moving
+      sub-region —
       confirm whether window-content damage from `CopyArea` / RENDER
       fills is accumulated across buffer generations in
       `pick_repaint_region` / the `BufferAgeRing`, or only applied to the
@@ -333,7 +335,7 @@ from.
       before the 4c hardware smoke gate (mate + marco) or risk
       stretched window content on resize.
 
-- [ ] **xeyes resize-DOWN artefact on v2 + mate + marco
+- [ ] **xeyes resize-DOWN artefact on render backend + mate + marco
       (2026-05-17, open).** Continuous-drag-shrink leaves xeyes
       with eye geometry sized for a *wider* window than what's
       now displayed — eye 2 visibly cut off at the right edge.
@@ -345,17 +347,18 @@ from.
          by stopping the drag and waiting 2-3 seconds before
          dumping the scanout; if the eyes settle to correct
          smaller shape, it's an xeyes-side race.
-      2. v2 scene compositor blits the wrong storage — perhaps
+      2. render scene compositor blits the wrong storage — perhaps
          a pending-ack carrying an old DrawableId. Less likely
          given the test coverage, but worth re-checking the
          `pending_acks` capture path.
       Also visible (orthogonal): many `render_composite gap:
       host_src 0x40xxxx not resolvable` lines from marco's
       decoration compositing, depending on `name_window_pixmap`
-      stubbed `Err` on v2 (Stage 4). Real fix is Stage 4 — the
-      gaps aren't a v2 regression, but the noise complicates
+      stubbed `Err` on the render backend (Stage 4). Real fix is
+      Stage 4 — the gaps aren't a render-backend regression, but the
+      noise complicates
       diagnosis here.
-- [~] **MATE panel flicker on v2 (2026-05-17).** Reported with the
+- [~] **MATE panel flicker on render backend (2026-05-17).** Reported with the
       resize-down session above. **Likely resolved 2026-06-01** by the
       systray ClipByChildren fix below — the speculated "rapid panel
       applet activity" cause matches the notification-area damage storm
@@ -374,7 +377,8 @@ from.
       panel's Clear is correctly a no-op (`clipped=[]`). The icon is blank
       because the plug's paint doesn't land in the socket's redirect
       backing *that the panel reads*. The initial paint-routing-race
-      hypothesis was **refuted** by probe (`yserver::kms::v2::paint=trace`:
+      hypothesis was **refuted** by a historical
+      `yserver::kms::v2::paint=trace` probe:
       `NO_REDIRECT_FOUND=0`, `REDIRECT_FOUND=116` — plug paints DO route to
       a backing). So capture works; the bug is **downstream in the
       read/composite of the backing**. Leading candidates: (1) **source-read
@@ -747,8 +751,8 @@ that the host hides for us.
       certainly the debug terminal spawned after the bug — not
       alacritty.
       Captured artefacts (saved 2026-05-30 ~00:09 local):
-      `yserver-hw-mate.log`, `yserver-v2-drawable-0-windows.txt`,
-      `yserver-v2-scanout-0-out0.ppm`, the 32 `present-src-*.ppm`
+      `yserver-hw-mate.log`, `yserver-drawable-0-windows.txt`,
+      `yserver-scanout-0-out0.ppm`, the 32 `present-src-*.ppm`
       ring dumps, and `scanout-0.png`.
       Next-time setup: `Justfile:466` now defaults the
       `yserver-mate-hw` recipe's `RUST_LOG` to include
@@ -879,7 +883,10 @@ that the host hides for us.
 Runtime layout switching shipped (issue #58 — `GetKbdByName` load, group
 switch via applet + `grp:` keyboard shortcut, AltGr/4-level, `setxkbmap`).
 These three reply pieces were intentionally deferred; golden vectors and
-root-cause notes live in `docs/superpowers/findings/2026-06-25-*.md`.
+root-cause notes live in:
+`docs/superpowers/findings/2026-06-25-altgr-4level-golden-vector.md`,
+`docs/superpowers/findings/2026-06-25-xkb-indicator-compat-golden-vector.md`,
+and `docs/superpowers/findings/2026-06-25-xkb-request-coverage-audit.md`.
 
 - [ ] **CompatMap sym-interpretations (124 entries) not emitted.** The
       `GetKbdByName`/`GetCompatMap` reply now carries the **group-compat**

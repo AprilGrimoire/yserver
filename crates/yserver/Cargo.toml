@@ -27,7 +27,6 @@ freetype-rs.workspace = true
 gpu-allocator.workspace = true
 input.workspace = true
 libc.workspace = true
-libseat = "0.2.4"
 log.workspace = true
 nix.workspace = true
 signal-hook.workspace = true

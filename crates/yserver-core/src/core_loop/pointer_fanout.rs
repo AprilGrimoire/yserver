@@ -497,7 +497,7 @@ pub fn pointer_event_fanout_to_state(
             .map_or_else(|| "<none>".to_string(), |id| state.debug_window_label(*id));
         let grab_label = active_grab_target(state).map_or_else(
             || "<none>".to_string(),
-            |(win, client, _, _, owner_events, via_xi2)| {
+            |(win, client, _, _, owner_events, via_xi2, _)| {
                 format!(
                     "redirect_to={} {} owner_events={owner_events} via_xi2={via_xi2}",
                     state.debug_window_label(win),
@@ -540,7 +540,7 @@ pub fn pointer_event_fanout_to_state(
 
     // Step 2 — active-grab redirection (core events only).
     if handle_grabs
-        && let Some((grab_window, grab_client, gx, gy, owner_events, via_xi2)) =
+        && let Some((grab_window, grab_client, gx, gy, owner_events, via_xi2, grab_event_mask)) =
             active_grab_target(state)
     {
         // Xorg DeliverGrabbedEvent's owner_events=true rule is NOT
@@ -611,7 +611,22 @@ pub fn pointer_event_fanout_to_state(
             // DeliverGrabbedEvent delivering one form per grab protocol.
             // handled_core_via_grab is set regardless so the core event
             // is never ALSO leaked to the natural target in step 4.
-            if !via_xi2 {
+            //
+            // Gate the actual DELIVERY on the grab's event_mask, exactly
+            // as the passive-grab activation path (step 3) does. An active
+            // pointer grab CAPTURES every pointer event, but Xorg
+            // `DeliverGrabbedEvent` only reports the ones the grab's mask
+            // selected — a MotionNotify with no button held carries the
+            // `PointerMotion` (0x40) bit only, so a grab that selected
+            // `ButtonMotion` (0x2000) but not `PointerMotion` must NOT
+            // receive it. ImageMagick `import` grabs with
+            // ButtonPress|ButtonRelease|ButtonMotion|OwnerGrabButton and
+            // was wrongly fed no-button motion, drawing its selection
+            // rectangle from the origin before any button was pressed
+            // (#90). Events the mask did not select are still captured
+            // (handled_core_via_grab below) — never leaked to the natural
+            // target.
+            if !via_xi2 && grab_event_mask & mask_bit != 0 {
                 let extras = fanout_event_to_clients(state, &[grab_client], |buf, seq, order| {
                     encode_pointer_event(
                         buf,
@@ -1083,7 +1098,7 @@ pub fn pointer_event_fanout_to_state(
             event.kind,
             PointerEventKind::EnterNotify | PointerEventKind::LeaveNotify
         )
-        && let Some((grab_window, grab_client, gx, gy, owner_events, via_xi2)) =
+        && let Some((grab_window, grab_client, gx, gy, owner_events, via_xi2, _)) =
             active_grab_target(state)
     {
         // Same ownership-aware natural-delivery test as the Step-2
@@ -1240,9 +1255,25 @@ pub fn pointer_event_fanout_to_state(
         }
     }
 
+    // Emit the SLAVE-stamped form BEFORE the master-stamped form, matching
+    // Xorg's `mieqProcessDeviceEvent` (mi/mieq.c: "process slave first, then
+    // master" — the slave device's `processInputProc` runs before the master
+    // copy's). This ordering is load-bearing for clients that both (a) select
+    // `XIAllDevices(0)` — so they receive BOTH the slave and master forms of
+    // every event — and (b) compress consecutive XI_Motion events keeping only
+    // the last, while dropping the slave-deviceid copy. Qt/Telegram does
+    // exactly this: `qxcbconnection.cpp` compresses an XI_Motion whenever
+    // another XI_Motion follows it in the queue, and `qxcbconnection_xi2.cpp`
+    // drops events whose deviceid is a slave pointer. With master-first
+    // ordering the master copy is always trailed by its slave copy → compressed
+    // away → and the surviving slave copy is then dropped, so ZERO motion (and
+    // thus zero smooth-scroll, which rides XI_Motion) reaches the widget while
+    // clicks (not motion-compressed) still work. Slave-first leaves the
+    // master copy — the one Qt keeps — as the trailing event, so it survives.
+    // Verified against mate.xtrace vs mate-xorg.xtrace 2026-07-10.
     for (deviceid, group) in [
-        (XI2_MASTER_POINTER_DEVICE_ID, &master_dev_targets),
         (XI2_SLAVE_POINTER_DEVICE_ID, &slave_dev_targets),
+        (XI2_MASTER_POINTER_DEVICE_ID, &master_dev_targets),
     ] {
         if group.is_empty() {
             continue;
@@ -1335,6 +1366,105 @@ pub fn pointer_event_fanout_to_state(
     }
 
     dropped
+}
+
+/// Emit an XI2 scroll **stop**: a delta-0 `XI_Motion` carrying the current,
+/// unchanged scroll valuator for both scroll axes, so GDK's XI2 backend sets
+/// `scroll.is_stop = TRUE` — its condition is literally `delta_x == 0.0 &&
+/// delta_y == 0.0` on a present scroll valuator (gdkdevicemanager-xi2.c). This
+/// is libinput's fingers-lifted signal for two-finger scrolling; Firefox's
+/// SwipeTracker uses the stop to *commit* a horizontal-swipe history navigation
+/// (bug 1539730) — without it the back/forward arrow tracks but never fires.
+///
+/// XI2 smooth-scroll selectors only: no core event, no button, and none of the
+/// grab / crossing / barrier machinery in [`pointer_event_fanout_to_state`] — a
+/// stop carries no position change and must not perturb pointer state. The
+/// target window is resolved exactly as a motion would (deepest window under
+/// the cursor) so the stop reaches the client already receiving the scroll.
+pub fn emit_scroll_stop_to_state(
+    state: &mut ServerState,
+    xid_map: &HostXidMap,
+    pointer_host_xid: u32,
+    root_x: i16,
+    root_y: i16,
+    state_mask: u16,
+    time: u32,
+) {
+    const XI_MOTION: u16 = 6;
+    let probe = HostPointerEvent {
+        kind: PointerEventKind::MotionNotify,
+        host_xid: pointer_host_xid,
+        detail: 0,
+        time,
+        root_x,
+        root_y,
+        event_x: root_x,
+        event_y: root_y,
+        state: state_mask,
+        crossing_mode: 0,
+        child: 0,
+    };
+    let root_hit = resolve_pointer_hit(state, xid_map, &probe);
+    let top_level_id = root_hit
+        .map(|(t, _, _)| state.top_level_for_target(t))
+        .or_else(|| xid_map.get(&pointer_host_xid).copied())
+        .unwrap_or(ROOT_WINDOW);
+    let (target, event_x, event_y) = root_hit.unwrap_or((top_level_id, root_x, root_y));
+
+    let (xi2_targets, _) = compute_xi2_targets(state, target, top_level_id, XI_MOTION, None);
+    if xi2_targets.is_empty() {
+        return;
+    }
+    let mut master_dev_targets: Vec<ClientId> = Vec::new();
+    let mut slave_dev_targets: Vec<ClientId> = Vec::new();
+    for cid in &xi2_targets {
+        let (wants_master, wants_slave) =
+            xi2_pointer_forms(state, *cid, target, top_level_id, XI_MOTION);
+        if wants_slave {
+            slave_dev_targets.push(*cid);
+        }
+        if wants_master || !wants_slave {
+            master_dev_targets.push(*cid);
+        }
+    }
+    // Current cumulative valuator per axis (unchanged → delta 0 → is_stop).
+    // Index 0 = vertical (scroll axis 2), 1 = horizontal (axis 3); mirrors the
+    // click path's `scroll_axis_num` mapping.
+    let axes: [(u8, i32); 2] = [
+        (2, state.scroll_axis_value[0]),
+        (3, state.scroll_axis_value[1]),
+    ];
+    // Slave form before master (see the ordering note in the main fanout).
+    for (deviceid, group) in [
+        (XI2_SLAVE_POINTER_DEVICE_ID, &slave_dev_targets),
+        (XI2_MASTER_POINTER_DEVICE_ID, &master_dev_targets),
+    ] {
+        if group.is_empty() {
+            continue;
+        }
+        let _ = fanout_event_to_clients(state, group, |buf, seq, order| {
+            for (axis, value) in axes {
+                x11::encode_xi2_motion_with_scroll(
+                    buf,
+                    order,
+                    seq,
+                    XI2_MAJOR_OPCODE,
+                    deviceid,
+                    time,
+                    ROOT_WINDOW,
+                    target,
+                    root_x,
+                    root_y,
+                    event_x,
+                    event_y,
+                    state_mask,
+                    XI2_SLAVE_POINTER_DEVICE_ID,
+                    axis,
+                    value,
+                );
+            }
+        });
+    }
 }
 
 /// Route one XI 1.x device input event through grab + freeze + selection
@@ -1960,30 +2090,44 @@ fn active_grab_target(
     i32,
     bool,
     bool,
+    u32,
 )> {
     let (client_id, grab_window) = state.pointer_grab?;
     let target = client_target_id(state, client_id)?;
     let (gx, gy) = state.resources.window_absolute_position(grab_window);
-    // `owner_events` / `via_xi2` from the active grab record. Passive
-    // button-grabs (activated via try_match_passive_grab) do not
-    // populate `active_pointer_grab`, so look up the matching passive
-    // grab and preserve its flags; otherwise default to false (X11
-    // implicit grab semantics — events report against the grab
-    // window, core protocol).
-    let (owner_events, via_xi2) = if state.pointer_grab_is_passive {
+    // `owner_events` / `via_xi2` / `event_mask` from the active grab
+    // record. Passive button-grabs (activated via try_match_passive_grab)
+    // do not populate `active_pointer_grab`, so look up the matching
+    // passive grab and preserve its flags; otherwise default to
+    // owner_events=false / via_xi2=false. The event_mask defaults to 0
+    // (deliver nothing) when no record is found, which matches "an active
+    // grab captures the event but delivers only what its mask selected".
+    let (owner_events, via_xi2, event_mask) = if state.pointer_grab_is_passive {
         state
             .button_grabs
             .iter()
             .rev()
             .find(|g| g.owner == client_id && g.grab_window == grab_window)
-            .map_or((false, false), |g| (g.owner_events, g.via_xi2))
+            .map_or((false, false, 0), |g| {
+                (g.owner_events, g.via_xi2, g.event_mask)
+            })
     } else {
         state
             .active_pointer_grab
             .filter(|g| g.owner == client_id)
-            .map_or((false, false), |g| (g.owner_events, g.via_xi2))
+            .map_or((false, false, 0), |g| {
+                (g.owner_events, g.via_xi2, u32::from(g.event_mask))
+            })
     };
-    Some((grab_window, target, gx, gy, owner_events, via_xi2))
+    Some((
+        grab_window,
+        target,
+        gx,
+        gy,
+        owner_events,
+        via_xi2,
+        event_mask,
+    ))
 }
 
 /// Xorg `DeliverGrabbedEvent`'s `owner_events=true` natural-delivery
@@ -2447,7 +2591,7 @@ pub(crate) fn emit_barrier_event(
     }
 
     let grabbed_targets =
-        active_grab_target(state).and_then(|(grab_window, grab_client, _, _, _, _)| {
+        active_grab_target(state).and_then(|(grab_window, grab_client, _, _, _, _, _)| {
             (grab_client == barrier_owner && grab_window == barrier_window)
                 .then_some(vec![grab_client])
         });
@@ -2720,6 +2864,68 @@ mod tests {
             crossing_mode: 0,
             child: 0,
         }
+    }
+
+    /// Regression (HW-confirmed 2026-07-10, Telegram/Qt on silence):
+    /// a client selecting `XIAllDevices(0)` receives every pointer event
+    /// in BOTH slave- and master-stamped forms, and the SLAVE form MUST be
+    /// emitted first — matching Xorg's `mieqProcessDeviceEvent`
+    /// ("process slave first, then master", mi/mieq.c). Qt compresses
+    /// consecutive XI_Motion keeping only the last (qxcbconnection.cpp) and
+    /// drops the slave-deviceid copy (qxcbconnection_xi2.cpp:689). With the
+    /// old master-first order every master copy was trailed by its slave
+    /// copy → compressed away → and the surviving slave copy dropped, so
+    /// ZERO motion (and thus zero smooth-scroll, which rides XI_Motion)
+    /// reached the widget: hover-scrollbars + wheel dead while clicks
+    /// (not motion-compressed) worked. Slave-first leaves the master copy
+    /// — the one Qt keeps — trailing, so it survives compression.
+    #[test]
+    fn xi2_motion_emits_slave_form_before_master_form() {
+        let mut state = ServerState::new();
+        let mut backend = crate::backend::recording::RecordingBackend::new();
+        let mut peer = install_client(&mut state, 1);
+        // XIAllDevices(0), XI_Motion (evtype 6), on the root — where a
+        // windowless motion lands. device 0 yields BOTH forms (issue #72).
+        state
+            .clients
+            .get_mut(&1)
+            .expect("client")
+            .xi2_masks
+            .insert((ROOT_WINDOW, 0), 1 << 6);
+        let dropped = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &HostXidMap::new(),
+            motion_event(),
+            true,
+            false,
+        );
+        assert!(dropped.is_empty());
+        let bytes = read_all_available(&mut peer);
+        // Walk the GenericEvent stream, collecting each XI_Motion(6)'s
+        // deviceid. Layout: [0]=35 GenericEvent, [4..8]=length (extra
+        // 4-byte units past the 32-byte base), [8..10]=evtype,
+        // [10..12]=deviceid.
+        let mut motion_deviceids: Vec<u16> = Vec::new();
+        let mut off = 0usize;
+        while off + 32 <= bytes.len() {
+            assert_eq!(bytes[off], 35, "GenericEvent");
+            let length = u32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap()) as usize;
+            let evtype = u16::from_le_bytes(bytes[off + 8..off + 10].try_into().unwrap());
+            let deviceid = u16::from_le_bytes(bytes[off + 10..off + 12].try_into().unwrap());
+            if evtype == 6 {
+                motion_deviceids.push(deviceid);
+            }
+            off += 32 + length * 4;
+        }
+        assert_eq!(off, bytes.len(), "event stream fully consumed");
+        assert_eq!(
+            motion_deviceids,
+            vec![XI2_SLAVE_POINTER_DEVICE_ID, XI2_MASTER_POINTER_DEVICE_ID],
+            "XIAllDevices(0) motion selector must receive the slave-stamped \
+             form BEFORE the master-stamped form (Xorg mi/mieq.c order); \
+             master-first silently breaks Qt smooth-scroll + hover"
+        );
     }
 
     #[test]
@@ -3785,6 +3991,198 @@ mod tests {
             i16::from_le_bytes([buf[26], buf[27]]),
             45,
             "event_y must stay frame-relative",
+        );
+    }
+
+    /// Regression (#90, ImageMagick `import` on real HW): an active core
+    /// pointer grab that selected `ButtonMotion` but NOT `PointerMotion`
+    /// must not be fed no-button motion. `import` does
+    /// `XGrabPointer(owner_events=false,
+    /// ButtonPress|ButtonRelease|ButtonMotion|OwnerGrabButton)`; pre-fix
+    /// yserver delivered every MotionNotify (incl. state=0), so `import`
+    /// drew its selection rectangle from the origin before any button was
+    /// pressed. Xorg `DeliverGrabbedEvent` only reports events the grab's
+    /// mask selected — but still CAPTURES the rest (never propagates them
+    /// to the natural target).
+    #[test]
+    fn active_grab_buttonmotion_mask_suppresses_no_button_motion() {
+        use crate::{backend::Backend, resources::ROOT_VISUAL, server::ActivePointerGrab};
+
+        const WM_CLIENT_ID: u32 = 1;
+        const APP_CLIENT_ID: u32 = 2;
+        const GRAB_WIN: u32 = 0x0010_0090;
+        const APP_WIN: u32 = 0x0020_0091;
+        const HOST_APP_XID: u32 = 0xCAFE_0091;
+        // ButtonPress | ButtonRelease | ButtonMotion (import's mask minus
+        // OwnerGrabButton, which is not a delivery-selection bit). Note it
+        // deliberately does NOT include PointerMotion (0x40).
+        const IMPORT_MASK: u32 = 0x0000_0004 | 0x0000_0008 | 0x0000_2000;
+
+        let mut state = ServerState::new();
+        let mut wm_peer = install_client(&mut state, WM_CLIENT_ID);
+        let mut app_peer = install_client(&mut state, APP_CLIENT_ID);
+        let mut backend = RecordingBackend::new();
+
+        // Tiny offscreen helper window owned by the grab client (import's
+        // grab is on the root, but any grab window exercises the same
+        // owner_events=false redirect path).
+        state.resources.create_window(
+            ClientId(WM_CLIENT_ID),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(GRAB_WIN),
+                parent: ROOT_WINDOW,
+                x: -100,
+                y: -100,
+                width: 1,
+                height: 1,
+                border_width: 0,
+                class: 1,
+                visual: ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        // A foreign app window the pointer is actually over; it selects
+        // PointerMotion so we can prove the grab CAPTURES the suppressed
+        // motion rather than leaking it to the natural target.
+        state.resources.create_window(
+            ClientId(APP_CLIENT_ID),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(APP_WIN),
+                parent: ROOT_WINDOW,
+                x: 400,
+                y: 300,
+                width: 300,
+                height: 200,
+                border_width: 0,
+                class: 1,
+                visual: ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(ResourceId(GRAB_WIN));
+        let _ = state.resources.map_window(ResourceId(APP_WIN));
+
+        state
+            .clients
+            .get_mut(&APP_CLIENT_ID)
+            .expect("app client")
+            .event_masks
+            .insert(ResourceId(APP_WIN), 0x0000_0040); // PointerMotion
+
+        Backend::register_top_level(&mut backend, None, ResourceId(APP_WIN), HOST_APP_XID)
+            .expect("register app host xid");
+
+        state.pointer_grab = Some((ClientId(WM_CLIENT_ID), ResourceId(GRAB_WIN)));
+        state.active_pointer_grab = Some(ActivePointerGrab {
+            owner: ClientId(WM_CLIENT_ID),
+            grab_window: ResourceId(GRAB_WIN),
+            event_mask: IMPORT_MASK as u16,
+            cursor: ResourceId(0),
+            time: 0,
+            owner_events: false,
+            via_xi2: false,
+        });
+
+        let xid_map = backend.xid_map().clone();
+
+        // (1) No-button motion (state=0): ButtonMotion mask must suppress
+        //     delivery to the grab client, AND the grab must capture it so
+        //     it never reaches the app's PointerMotion selection.
+        let no_button_motion = HostPointerEvent {
+            kind: PointerEventKind::MotionNotify,
+            host_xid: HOST_APP_XID,
+            detail: 0,
+            time: 0x1000,
+            root_x: 450,
+            root_y: 350,
+            event_x: 50,
+            event_y: 50,
+            state: 0,
+            crossing_mode: 0,
+            child: 0,
+        };
+        let dropped = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &xid_map,
+            no_button_motion,
+            true,
+            false,
+        );
+        assert!(dropped.is_empty());
+        assert!(
+            read_all_available(&mut wm_peer).is_empty(),
+            "grab client selected ButtonMotion (not PointerMotion) — no-button motion must NOT be delivered",
+        );
+        assert!(
+            read_all_available(&mut app_peer).is_empty(),
+            "active grab must CAPTURE the suppressed motion, not leak it to the app's natural PointerMotion selection",
+        );
+
+        // (2) Motion with Button1 held (state=0x100): now the event
+        //     carries the ButtonMotion bit → the grab client receives it,
+        //     reported against the grab window (owner_events=false).
+        let button_motion = HostPointerEvent {
+            kind: PointerEventKind::MotionNotify,
+            host_xid: HOST_APP_XID,
+            detail: 0,
+            time: 0x1001,
+            root_x: 451,
+            root_y: 351,
+            event_x: 51,
+            event_y: 51,
+            state: 0x0100,
+            crossing_mode: 0,
+            child: 0,
+        };
+        let dropped = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &xid_map,
+            button_motion,
+            true,
+            false,
+        );
+        assert!(dropped.is_empty());
+        let wm_bytes = read_all_available(&mut wm_peer);
+        assert_eq!(wm_bytes.len(), 32, "expected exactly one core MotionNotify");
+        assert_eq!(wm_bytes[0], 6, "event type should be MotionNotify");
+        assert_eq!(
+            &wm_bytes[12..16],
+            &GRAB_WIN.to_le_bytes(),
+            "owner_events=false: motion reported against the grab window",
+        );
+        assert!(
+            read_all_available(&mut app_peer).is_empty(),
+            "button-held motion is still captured by the grab, not sent to the app",
+        );
+
+        // (3) ButtonPress (mask includes ButtonPress) is still delivered.
+        let press = HostPointerEvent {
+            kind: PointerEventKind::ButtonPress,
+            host_xid: HOST_APP_XID,
+            detail: 1,
+            time: 0x1002,
+            root_x: 451,
+            root_y: 351,
+            event_x: 51,
+            event_y: 51,
+            state: 0,
+            crossing_mode: 0,
+            child: 0,
+        };
+        let dropped =
+            pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);
+        assert!(dropped.is_empty());
+        let wm_bytes = read_all_available(&mut wm_peer);
+        assert_eq!(wm_bytes.len(), 32, "expected exactly one core ButtonPress");
+        assert_eq!(wm_bytes[0], 4, "event type should be ButtonPress");
+        assert_eq!(
+            &wm_bytes[12..16],
+            &GRAB_WIN.to_le_bytes(),
+            "owner_events=false: press reported against the grab window",
         );
     }
 

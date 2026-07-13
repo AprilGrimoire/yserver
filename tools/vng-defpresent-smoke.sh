@@ -23,7 +23,7 @@ YSERVER_LOOP_TELEMETRY=1 \
     YSERVER_SUBMIT_TRACE=yserver-vng.submit.tsv \
     MESA_LOADER_DRIVER_OVERRIDE=zink \
     XDG_RUNTIME_DIR="$xdg_rd" \
-    RUST_LOG=info,yserver_core::core_loop::process_request=debug,yserver::kms::v2::backend=debug RUST_BACKTRACE=1 \
+    RUST_LOG=info,yserver_core::core_loop::process_request=debug,yserver::kms::render::backend=debug RUST_BACKTRACE=1 \
     target/release/yserver > yserver-vng.log 2>&1 &
 ys_pid=$!
 
@@ -62,7 +62,7 @@ head -20 glxgears-vng.log
 echo "..."
 grep -E "FPS|frames in" glxgears-vng.log | tail -5
 
-echo "=== TELEMETRY ROLLUPS (last 30 v2_telemetry lines) ==="
-grep "v2_telemetry" yserver-vng.log | tail -30
+echo "=== TELEMETRY ROLLUPS (last 30 render_telemetry lines) ==="
+grep "render_telemetry" yserver-vng.log | tail -30
 echo "=== END ==="
 echo "Full log: yserver-vng.log ($(wc -l < yserver-vng.log) lines)"

@@ -1,4 +1,4 @@
-//! Shared helpers used by `kms::v2` (the rendering backend).
+//! Shared helpers used by `kms::render` (the rendering backend).
 //!
 //! Historical note: this module was originally the home of `KmsBackend`
 //! (the v1 rendering path) plus its supporting types. The v1 path was
@@ -53,7 +53,7 @@ pub(crate) struct ClipMaskCache {
     /// Live drawable identity captured at read time. `pixmap_xid` is the
     /// installed-GC handle (survives free); `drawable_id` distinguishes a
     /// re-allocated pixmap at a recycled xid.
-    pub(crate) drawable_id: crate::kms::v2::store::DrawableId,
+    pub(crate) drawable_id: crate::kms::render::store::DrawableId,
     /// `Drawable.content_version` at the moment the bytes were read. While a
     /// live drawable still exists, reuse requires this to still match.
     pub(crate) content_version: u64,
@@ -549,24 +549,14 @@ pub(crate) struct PlatformInitDevice {
     pub(crate) render_node: Option<crate::kms::render_node::OpenedRenderNode>,
 }
 
-/// Seat-provided primary-node fd paired with the path it represents.
-///
-/// Libseat mode opens DRM nodes outside `drm::Device::open`, but the
-/// rest of platform bring-up still needs the path for logging and for
-/// `drm::Device::from_owned_fd`'s identity/debug state.
-pub(crate) struct PlatformInitFd {
-    pub(crate) path: PathBuf,
-    pub(crate) card_fd: std::os::fd::OwnedFd,
-}
-
 /// Transient handoff from platform bring-up to the long-lived KMS backend.
 ///
-/// Stage 1 (`platform_init` / `platform_init_with_fds`) opens or wraps KMS
-/// devices, derives each stable device key, discovers connected outputs,
-/// commits initial scanout buffers, and lays those outputs out in the
-/// virtual screen. Stage 2 (`PlatformBackend::from_platform_init`) consumes
-/// this value, moves the device/output records into `PlatformBackend`, and
-/// allocates the runtime Vulkan/KMS resources.
+/// Stage 1 (`platform_init`) opens KMS devices, derives each stable device
+/// key, discovers connected outputs, commits initial scanout buffers, and
+/// lays those outputs out in the virtual screen. Stage 2
+/// (`PlatformBackend::from_platform_init`) consumes this value, moves the
+/// device/output records into `PlatformBackend`, and allocates the runtime
+/// Vulkan/KMS resources.
 ///
 /// Startup receives an ordered device vector and attempts to open each entry.
 /// The current runtime still activates initial scanout only on the first
@@ -668,7 +658,7 @@ fn activate_initial_scanout_outputs(
 
 /// Shared DRM / outputs / libinput bring-up for the v1 and v2
 /// backends. Extracted in Stage 1b so both `KmsBackend::open_with_commit`
-/// and `KmsBackendV2::open` use the same code path.
+/// and `KmsBackend::open` use the same code path.
 ///
 /// **Vulkan / pipelines / scanout pools / scheduler / pixmap pool**
 /// stay in the v1-specific portion of `open_with_commit` for now —
@@ -756,7 +746,9 @@ pub(crate) fn platform_init(
     let input_ctx = match crate::input::SendContext::new() {
         Ok(ctx) => Some(ctx),
         Err(err) => {
-            log::warn!("libinput unavailable, continuing without input: {err}");
+            // Note: not a decision point. `run()` treats a missing context as
+            // fatal and refuses to start (see `input_startup_action`).
+            log::warn!("libinput SendContext unavailable: {err}");
             None
         }
     };
@@ -767,84 +759,6 @@ pub(crate) fn platform_init(
         fb_w,
         fb_h,
         input_ctx,
-    })
-}
-
-/// Seat-aware variant of [`platform_init`]. Uses seat-provided DRM card fds
-/// (from `libseat::Seat::open_device`) instead of opening paths directly.
-///
-/// The only difference from `platform_init` is how `device` is constructed:
-/// we call `drm::Device::from_owned_fd` (which does NOT call `drmSetMaster`
-/// because libseat/logind already owns master — Deviation #5 from the plan)
-/// instead of `drm::Device::open`. Everything else — render-node discovery,
-/// output enumeration, swapchain init, libinput setup — is identical.
-///
-/// In libseat mode libinput is created on the core thread via
-/// `Context::new_libseat` rather than `SendContext::new`, so this function
-/// returns `input_ctx: None` — the caller builds the `Context` separately.
-///
-/// # Errors
-///
-/// Returns the same errors as [`platform_init`] except that device opens are
-/// replaced by ioctls on already-open fds.
-pub(crate) fn platform_init_with_fds(
-    device_fds: Vec<PlatformInitFd>,
-    commit: fn(
-        &crate::drm::Device,
-        &crate::platform::drm::Output,
-        ::drm::control::framebuffer::Handle,
-    ) -> io::Result<()>,
-) -> io::Result<PlatformInit> {
-    let mut devices: Vec<PlatformInitDevice> = Vec::with_capacity(device_fds.len());
-    let mut active_outputs: Vec<ActiveOutput> = Vec::new();
-    let mut next_x: i32 = 0;
-    for init_fd in device_fds {
-        let device_path_str = init_fd.path.to_string_lossy().into_owned();
-        // Wrap the seat-provided fd. No path open, no drmSetMaster.
-        let device = Rc::new(drm::Device::from_owned_fd(
-            init_fd.card_fd,
-            &device_path_str,
-        )?);
-        let primary_node =
-            crate::platform::drm::primary_node_from_fd(std::os::fd::AsFd::as_fd(&*device))?;
-        let device_key = primary_node.key;
-        let render_node = render_node_for_device(&device_path_str, &device);
-        if devices.is_empty() {
-            active_outputs =
-                activate_initial_scanout_outputs(device_key, &device, &mut next_x, commit)?;
-        } else {
-            log::info!(
-                "yserver: opened secondary KMS device {} via seat as provider/topology data; \
-                 initial scanout remains on the first opened device",
-                init_fd.path.display()
-            );
-        }
-        devices.push(PlatformInitDevice {
-            key: device_key,
-            device,
-            render_node,
-        });
-    }
-
-    let fb_w: u16 = active_outputs
-        .iter()
-        .map(|l| u16::try_from(l.x.saturating_add(i32::from(l.width))).unwrap_or(u16::MAX))
-        .max()
-        .unwrap_or(0);
-    let fb_h: u16 = active_outputs
-        .iter()
-        .map(|l| u16::try_from(l.y.saturating_add(i32::from(l.height))).unwrap_or(u16::MAX))
-        .max()
-        .unwrap_or(0);
-
-    // In libseat mode, libinput is built on the core thread via
-    // Context::new_libseat (caller's responsibility). No SendContext here.
-    Ok(PlatformInit {
-        devices,
-        active_outputs,
-        fb_w,
-        fb_h,
-        input_ctx: None,
     })
 }
 

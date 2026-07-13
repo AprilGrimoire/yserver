@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use ash::vk;
 use yserver::kms::{
-    v2::KmsBackendV2,
+    render::KmsBackend,
     vk::{device::VkContext, dri3::DmabufExport},
 };
 use yserver_core::backend::Backend;
@@ -62,13 +62,13 @@ fn allocate_exportable_yields_valid_dmabuf_fd() {
 // ───────────────────────────────────────────────────────────────────
 
 /// Minimal engine/store/platform harness built atop the production
-/// `KmsBackendV2` (the only construction path that wires a real
+/// `KmsBackend` (the only construction path that wires a real
 /// engine + store + platform with a live VkContext). All drawable
 /// manipulation goes through the public `Backend` trait + the
 /// `*_for_tests` shims, so this harness never reaches into the
 /// crate-private engine internals directly.
 struct PromoteHarness {
-    backend: KmsBackendV2,
+    backend: KmsBackend,
     vk: Arc<VkContext>,
 }
 
@@ -114,7 +114,7 @@ impl PromoteHarness {
 
 /// Build the harness, or `None` if no Vulkan device is present.
 fn test_engine_harness() -> Option<PromoteHarness> {
-    let backend = match KmsBackendV2::for_tests_with_vk() {
+    let backend = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -453,7 +453,7 @@ fn dri3_export_promotes_server_owned_pixmap() {
     use std::os::fd::AsRawFd;
     use yserver_core::backend::Backend;
 
-    let mut backend = match KmsBackendV2::for_tests_with_vk() {
+    let mut backend = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -544,7 +544,7 @@ fn import_sync_file_accepts_a_signaled_fence() {
 fn exported_backing_retained_until_glx_ref_released_then_torn_down() {
     use std::os::fd::AsFd;
 
-    let mut backend = match KmsBackendV2::for_tests_with_vk() {
+    let mut backend = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -608,7 +608,7 @@ fn exported_backing_retained_until_glx_ref_released_then_torn_down() {
 #[test]
 #[ignore = "requires a Vulkan device"]
 fn export_only_entry_is_cleaned_up_at_free_pixmap() {
-    let mut backend = match KmsBackendV2::for_tests_with_vk() {
+    let mut backend = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -646,7 +646,7 @@ fn export_only_entry_is_cleaned_up_at_free_pixmap() {
 fn exported_drawable_write_then_flush_runs_sync_publish() {
     use yserver_core::backend::Backend;
 
-    let mut backend = match KmsBackendV2::for_tests_with_vk() {
+    let mut backend = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");

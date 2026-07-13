@@ -434,7 +434,7 @@ pub fn run_core(
     // a no-op here. The input thread already dispatches the initial
     // enumeration and sends the `DeviceAdded` burst on the channel as
     // its very first action (input_thread::run, before its epoll loop),
-    // which shrinks the race versus the old libseat gap. Fully closing
+    // which shrinks the startup probe race. Fully closing
     // it would mean draining already-queued `Message::HostInput` device
     // events from `rx` here before the serve loop — left out for now to
     // avoid reordering/duplicating the loop's own message handling for a
@@ -558,8 +558,8 @@ pub fn run_core(
                         backend.on_display_hotplug(state);
                     }
                     BackendFdKind::Libinput => {
-                        // Libseat mode owns libinput on the core thread.
-                        // Direct mode's input thread owns this fd instead.
+                        // Optional core-owned libinput path. Direct KMS owns
+                        // libinput on the dedicated input thread instead.
                         backend.on_libinput_ready(state);
                     }
                     BackendFdKind::HostX11 => {
@@ -580,9 +580,6 @@ pub fn run_core(
                     }
                     BackendFdKind::PresentCompletion => {
                         drain_present_completions(state, backend);
-                    }
-                    BackendFdKind::Seat => {
-                        backend.on_seat_ready(state);
                     }
                 }
                 continue;
@@ -729,7 +726,36 @@ pub fn run_core(
                     }
                 }
                 tok => {
-                    warn!("core_loop::run: unhandled poll token {tok:?}");
+                    let Some(client_id) = token_to_client(tok) else {
+                        warn!("core_loop::run: unhandled poll token {tok:?}");
+                        continue;
+                    };
+
+                    // I3: WRITABLE-readiness on a client writer fd.
+                    // Drain the outbound buffer; if it empties, the
+                    // post-loop interest reconciliation drops
+                    // WRITABLE. If the peer disappeared, mark the
+                    // client for disconnect.
+                    if !ev.is_writable() {
+                        // mio always reports both READABLE+WRITABLE
+                        // as readiness even when only one was asked
+                        // for; the writer fd's READABLE wakeups are
+                        // ignored — the reader thread owns reads.
+                        continue;
+                    }
+                    let Some(client) = state.clients.get_mut(&client_id.0) else {
+                        // Already removed by a prior disconnect; the
+                        // poller will be deregistered after.
+                        continue;
+                    };
+                    match client_io::drain_outbound(client) {
+                        Ok(WriteOutcome::Done | WriteOutcome::WouldBlock) => {}
+                        Ok(WriteOutcome::Disconnect) | Err(_) => {
+                            crate::core_loop::process_disconnect::process_disconnect(
+                                state, backend, client_id,
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -796,12 +822,8 @@ pub fn run_core(
             crate::core_loop::process_disconnect::process_disconnect(state, backend, disc_id);
         }
 
-        // Service time-based input work that isn't tied to an fd edge —
-        // specifically, retry a libseat device open that a lagging udev ACL
-        // deferred after a monitor-hub hot-add (the "mouse stuck after monitor
-        // off→on until a keypress" bug). No-op unless a retry window is armed;
-        // the backend reports its retry cadence via `next_wakeup`.
-        // project_mouse_hotplug_lost_wakeup.
+        // Service time-based backend work that is not tied to an fd edge. The
+        // backend reports its cadence via `next_wakeup`.
         backend.poll_deferred_input(state);
 
         // Wake the composite path back up if the backend went dormant
@@ -1250,9 +1272,9 @@ fn handle_setup_allocate(
 /// the synthetic release doesn't re-enter [`update_repeat_state`] and
 /// clear the armed key.
 ///
-/// Reachable from the backend's on-core libinput dispatch in libseat
-/// mode (the backend owns libinput on the core thread there), hence
-/// `pub`.
+/// Public so backend-owned input dispatch paths can route through the
+/// repeat-state wrapper instead of calling `backend.on_host_input`
+/// directly.
 pub fn handle_host_input(state: &mut ServerState, backend: &mut dyn Backend, ev: HostInputEvent) {
     update_repeat_state(state, &ev);
     backend.on_host_input(state, ev);
@@ -1784,9 +1806,9 @@ mod tests {
 
     /// `handle_host_input` arms the auto-repeat timer on a real
     /// KeyPress, replaces it on a different KeyPress, and clears it
-    /// on the matching KeyRelease. Regression: when on-core libinput
-    /// dispatch (libseat mode) called `backend.on_host_input` directly
-    /// it bypassed this wrapper and keys never repeated.
+    /// on the matching KeyRelease. Regression coverage for backend-owned input
+    /// dispatch paths that must not call `backend.on_host_input` directly,
+    /// bypassing this wrapper.
     #[test]
     fn handle_host_input_arms_repeat_state() {
         use crate::{backend::recording::RecordingBackend, host_x11::HostKeyEvent};

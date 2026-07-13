@@ -343,6 +343,9 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
         .is_some_and(|g| g.owner == client_id)
     {
         state.active_pointer_grab = None;
+        // Xorg DeactivatePointerGrab on client teardown reverts the
+        // sprite from the grab cursor back to the window/default cursor.
+        let _ = backend.set_grab_cursor(None, None);
     }
     if state
         .active_keyboard_grab

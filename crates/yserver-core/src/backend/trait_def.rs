@@ -55,9 +55,6 @@ pub enum BackendFdKind {
     /// `Backend::drain_completed_present_events`. Spec
     /// `2026-05-23-deferred-present-completion-design.md`.
     PresentCompletion,
-    /// libseat connection fd (KMS + libseat mode only). Readiness
-    /// drives `Backend::on_seat_ready` → `seat.dispatch()`.
-    Seat,
     /// udev monitor fd for DRM hotplug (KMS/Linux). Readiness drives
     /// `Backend::on_display_hotplug`.
     DrmHotplug,
@@ -278,7 +275,7 @@ pub trait XshmfenceHandle: std::fmt::Debug + Send + Sync {
 }
 
 /// Stage 5 Task 6.1: opaque handle to a DRI3 syncobj's underlying
-/// VkSemaphore. Concrete impl in `yserver::kms::v2::owned_semaphore::
+/// VkSemaphore. Concrete impl in `yserver::kms::render::owned_semaphore::
 /// OwnedSemaphore`. Held as `Arc<dyn SyncobjHandle>` by the deferred
 /// PRESENT completion path so the underlying semaphore can be
 /// lifetime-pinned past `FreeSyncobj`.
@@ -370,12 +367,6 @@ pub trait Backend {
     /// composite/flip. The fd is one returned by [`Backend::poll_fds`]
     /// with [`BackendFdKind::Drm`].
     fn on_page_flip_ready(&mut self, state: &mut ServerState, drm_fd: std::os::fd::RawFd);
-
-    /// The libseat connection fd is readable. The KMS backend dispatches
-    /// libseat (which may fire enable/disable callbacks synchronously)
-    /// and runs any resulting suspend/resume sequence. Default: no-op
-    /// (ynest, host-X11, recording have no seat).
-    fn on_seat_ready(&mut self, _state: &mut ServerState) {}
 
     /// The DRM hotplug monitor is readable. Default: no-op.
     fn on_display_hotplug(&mut self, _state: &mut ServerState) {}
@@ -492,19 +483,15 @@ pub trait Backend {
     /// `VT_ACTIVATE`. Default no-op (only direct-mode KMS acts on it).
     fn request_vt_switch(&mut self, _vt: u32) {}
 
-    /// The libinput fd is readable AND libinput is owned by the core
-    /// loop (libseat mode). Dispatch libinput inline. Default: no-op —
-    /// in Direct mode the dedicated input thread owns the fd and this is
-    /// never registered.
+    /// The libinput fd is readable and libinput is owned by the core loop.
+    /// Dispatch libinput inline. Default: no-op; direct KMS uses a dedicated
+    /// input thread and never registers this fd.
     fn on_libinput_ready(&mut self, _state: &mut ServerState) {}
 
     /// Called once per core-loop iteration (with `state`) so a backend can
-    /// service time-based input work that isn't tied to an fd readiness edge —
-    /// specifically, retry a libseat device open that was DEFERRED by a lagging
-    /// udev ACL on a freshly re-enumerated device (the "mouse stuck after
-    /// monitor off→on" bug). The backend gates its own work on a retry deadline
-    /// (and reports that deadline via [`Backend::next_wakeup`] so the loop wakes
-    /// for it). Default: no-op. project_mouse_hotplug_lost_wakeup.
+    /// service time-based backend work that isn't tied to an fd readiness
+    /// edge. The backend reports any deadline via [`Backend::next_wakeup`] so
+    /// the loop wakes for it. Default: no-op.
     fn poll_deferred_input(&mut self, _state: &mut ServerState) {}
 
     /// Called once per core-loop iteration, immediately before the loop
@@ -537,11 +524,8 @@ pub trait Backend {
     /// device 4).
     ///
     /// Implementations MUST be bounded and non-blocking: if libinput has
-    /// nothing yet, return immediately rather than waiting. Only backends
-    /// that own a libinput context on the core thread (libseat mode) do
-    /// any work; every other backend (Direct mode — the context was moved
-    /// to the input thread; host-X11/nested — no libinput) is a clean
-    /// no-op via this default.
+    /// nothing yet, return immediately rather than waiting. Backends without
+    /// core-owned libinput use this default.
     ///
     /// Returns the number of devices seeded so the caller can log that
     /// the probe ran before clients connected.
@@ -570,10 +554,9 @@ pub trait Backend {
         Ok(())
     }
 
-    /// Hand the backend a core-channel sender so that, when it owns
-    /// input on the core thread (libseat mode), it can emit the same
-    /// control Messages the input thread would (Shutdown, DumpScanout,
-    /// DumpDrawables). Default: no-op.
+    /// Hand the backend a core-channel sender so backend-originated shutdowns
+    /// or diagnostics can use the same message path as input hotkeys.
+    /// Default: no-op.
     fn set_input_sender(&mut self, _sender: crate::core_loop::CoreSender) {}
 
     /// Tell the backend that something that could affect on-screen
@@ -963,7 +946,7 @@ pub trait Backend {
     /// way commit `92a2a83` did before being reverted at `3751c11`.
     ///
     /// Default `false` covers v1 + the host-X11 test backends.
-    /// v2 (`KmsBackendV2`) overrides to `true`.
+    /// v2 (`KmsBackend`) overrides to `true`.
     fn supports_redirect_activation(&self) -> bool {
         false
     }
@@ -972,7 +955,7 @@ pub trait Backend {
     /// the Vulkan external-memory path.  When `true`, the GLX extension
     /// string includes `GLX_EXT_texture_from_pixmap`.
     ///
-    /// **Cached at construction** (real probe in `KmsBackendV2::new`);
+    /// **Cached at construction** (real probe in `KmsBackend::new`);
     /// this getter is a trivial field read — no Vulkan calls.
     /// Default `false` covers all non-KMS backends.
     fn supports_dmabuf_export(&self) -> bool {
@@ -1056,7 +1039,7 @@ pub trait Backend {
     /// Stage 4d — Composite Overlay Window allocation + materialization.
     /// On the 0→1 refcount transition (first claim), allocate backing
     /// storage AND populate the backend's window-tree projection: a
-    /// `windows_v2` entry sized to full screen extent (mapped=true,
+    /// `windows` entry sized to full screen extent (mapped=true,
     /// depth=24, parent=root) and a slot at the top of
     /// `top_level_order`. Returns `Ok(true)` on first claim, `Ok(false)`
     /// on subsequent claims (refcount bump only — no new
@@ -1076,7 +1059,7 @@ pub trait Backend {
     ///
     /// Default no-op covers v1 (uses its own per-window mirror
     /// model and never reaches this trait) plus the test
-    /// `RecordingBackend` / ynest. v2 (`KmsBackendV2`) overrides.
+    /// `RecordingBackend` / ynest. v2 (`KmsBackend`) overrides.
     ///
     /// # Errors
     ///
@@ -1109,8 +1092,8 @@ pub trait Backend {
     /// `GetOverlayWindow` re-materializes the whole thing fresh
     /// via `materialize_cow_resource()`.
     ///
-    /// The v2 impl (`KmsBackendV2`) also tears down its
-    /// `windows_v2` entry and the COW's slot in
+    /// The v2 impl (`KmsBackend`) also tears down its
+    /// `windows` entry and the COW's slot in
     /// `top_level_order` on the final release — the mirror of
     /// the materialization that `get_overlay_window`'s 0→1
     /// branch installs. `RecordingBackend` similarly tracks
@@ -1260,6 +1243,25 @@ pub trait Backend {
         host_window_xid: u32,
         cursor_host_xid: u32,
     ) -> io::Result<()>;
+
+    /// Install (or clear) the active-grab cursor override on the
+    /// displayed sprite. Mirrors Xorg `ActivatePointerGrab`, which
+    /// forces the sprite to the grab's cursor for the grab's duration
+    /// and reverts on `DeactivatePointerGrab`. The override wins over
+    /// the per-window cursor chain and the sticky/default fallback.
+    ///
+    /// `cursor_host_xid = Some(h)` sets the override to host cursor
+    /// handle `h`; `None` clears it (X11 `None` cursor on grab, or the
+    /// grab ending). Default no-op: only the KMS backend drives a real
+    /// sprite; the recording and nested-host backends have nothing to
+    /// show.
+    fn set_grab_cursor(
+        &mut self,
+        _origin: Option<OriginContext>,
+        _cursor_host_xid: Option<u32>,
+    ) -> io::Result<()> {
+        Ok(())
+    }
 
     // ──────────────────────────────────────────────────────────────
     // Container background (root-mapped helpers)
@@ -1998,7 +2000,7 @@ pub trait Backend {
     /// Increment the GLX-consumer refcount on the exported backing for
     /// `host_xid`. Called when `glXCreatePixmap` (CREATE_PIXMAP) records
     /// a new `GlxDrawable` that wraps an X pixmap. The KMS backend
-    /// (`KmsBackendV2`) routes this to `acquire_glx_pixmap_export` which
+    /// (`KmsBackend`) routes this to `acquire_glx_pixmap_export` which
     /// calls `ensure_exported_entry` (takes the one-time lifetime ref)
     /// and increments `glx_refs`. Non-KMS backends (host-X11,
     /// `RecordingBackend`) keep the default no-op.
@@ -2029,7 +2031,7 @@ pub trait Backend {
     /// rebind), so coupling it to `glx_refs` would leak the backing.
     ///
     /// Returns `true` if the backing is exportable after the call. The KMS
-    /// backend (`KmsBackendV2`) routes this to the engine's idempotent
+    /// backend (`KmsBackend`) routes this to the engine's idempotent
     /// `promote_drawable_exportable` (its `is_exportable()` check
     /// short-circuits a no-op rebind). Non-KMS / `RecordingBackend` default
     /// to `false`.
@@ -2206,15 +2208,10 @@ mod tests {
         assert_ne!(BackendFdKind::PresentCompletion, BackendFdKind::Libinput);
         assert_ne!(BackendFdKind::PresentCompletion, BackendFdKind::Drm);
         assert_ne!(BackendFdKind::PresentCompletion, BackendFdKind::HostX11);
-        assert_ne!(BackendFdKind::Seat, BackendFdKind::Libinput);
-        assert_ne!(BackendFdKind::Seat, BackendFdKind::Drm);
-        assert_ne!(BackendFdKind::Seat, BackendFdKind::HostX11);
-        assert_ne!(BackendFdKind::Seat, BackendFdKind::PresentCompletion);
         assert_ne!(BackendFdKind::DrmHotplug, BackendFdKind::Drm);
         assert_ne!(BackendFdKind::DrmHotplug, BackendFdKind::Libinput);
         assert_ne!(BackendFdKind::DrmHotplug, BackendFdKind::HostX11);
         assert_ne!(BackendFdKind::DrmHotplug, BackendFdKind::PresentCompletion);
-        assert_ne!(BackendFdKind::DrmHotplug, BackendFdKind::Seat);
     }
 }
 
