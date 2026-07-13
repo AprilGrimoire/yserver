@@ -97,7 +97,7 @@ impl VkContext {
     }
 
     pub fn new() -> Result<Arc<Self>, VkInitError> {
-        Self::new_with_drm_selection(None)
+        Self::new_with_drm_selection(None, true)
     }
 
     /// Build the rendering context on the Vulkan physical device belonging to
@@ -110,11 +110,22 @@ impl VkContext {
         primary: DrmDeviceKey,
         render: Option<DrmDeviceKey>,
     ) -> Result<Arc<Self>, VkInitError> {
-        Self::new_with_drm_selection(Some(DrmDeviceSelection { primary, render }))
+        Self::new_with_drm_selection(Some(DrmDeviceSelection { primary, render }), true)
+    }
+
+    /// Build the minimal sink-side context used by copied scanout. It needs
+    /// external memory/semaphores and synchronization2, but no compositor
+    /// shaders, dynamic rendering, logic operations, or dual-source blending.
+    pub(crate) fn new_transfer_for_drm(
+        primary: DrmDeviceKey,
+        render: Option<DrmDeviceKey>,
+    ) -> Result<Arc<Self>, VkInitError> {
+        Self::new_with_drm_selection(Some(DrmDeviceSelection { primary, render }), false)
     }
 
     fn new_with_drm_selection(
         requested_drm: Option<DrmDeviceSelection>,
+        compositor_features: bool,
     ) -> Result<Arc<Self>, VkInitError> {
         let entry = unsafe { ash::Entry::load()? };
         let app_info = vk::ApplicationInfo::default()
@@ -263,7 +274,7 @@ impl VkContext {
             .queue_priorities(&priorities)];
 
         let mut features13 = vk::PhysicalDeviceVulkan13Features::default()
-            .dynamic_rendering(true)
+            .dynamic_rendering(compositor_features)
             .synchronization2(true);
 
         // `scalarBlockLayout` lets push-constant (and uniform/storage)
@@ -284,8 +295,8 @@ impl VkContext {
         // Harmless when the syncobj cap is false because the dispatcher
         // gate rejects requests before they reach the import call.
         let mut features12 = vk::PhysicalDeviceVulkan12Features::default()
-            .scalar_block_layout(true)
-            .timeline_semaphore(true);
+            .scalar_block_layout(compositor_features)
+            .timeline_semaphore(compositor_features);
 
         // `logicOp` enables the per-attachment logical-op state used
         // by the Phase 4.1.5 GC-function fill path (Xor / And / Or
@@ -296,8 +307,8 @@ impl VkContext {
         // fragment-shader output). Both are core Vulkan 1.0 and
         // universally supported on conformant drivers.
         let enabled_features = vk::PhysicalDeviceFeatures::default()
-            .logic_op(true)
-            .dual_src_blend(true);
+            .logic_op(compositor_features)
+            .dual_src_blend(compositor_features);
 
         let device_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_info)

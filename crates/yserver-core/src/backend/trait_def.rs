@@ -58,6 +58,10 @@ pub enum BackendFdKind {
     /// udev monitor fd for DRM hotplug (KMS/Linux). Readiness drives
     /// `Backend::on_display_hotplug`.
     DrmHotplug,
+    /// Backend-internal readiness aggregator for renderer-completion
+    /// `sync_file` fds which gate a copied scanout path. Readiness means a
+    /// frame rendered on the source GPU may advance to the sink-GPU copy.
+    ScanoutRenderCompletion,
 }
 
 /// Outcome of a single `Backend::drain_host_socket` pass. Re-exported
@@ -370,6 +374,11 @@ pub trait Backend {
 
     /// The DRM hotplug monitor is readable. Default: no-op.
     fn on_display_hotplug(&mut self, _state: &mut ServerState) {}
+
+    /// One or more source-GPU render completions are ready. Backends drain the
+    /// stable completion aggregator, submit the corresponding sink-GPU copies,
+    /// and arm KMS presentation. Default: no-op.
+    fn on_scanout_render_completion(&mut self, _state: &mut ServerState) {}
 
     /// Force a connector re-probe (RANDR `GetScreenResources`,
     /// `force_query=TRUE` in Xorg `RRGetInfo`). Re-reads connection
@@ -2202,7 +2211,7 @@ mod tests {
     use super::BackendFdKind;
 
     #[test]
-    fn present_completion_kind_distinct_from_existing_kinds() {
+    fn completion_kinds_are_distinct_from_existing_kinds() {
         // Sanity: the new variant exists and isn't accidentally
         // aliased to an existing one.
         assert_ne!(BackendFdKind::PresentCompletion, BackendFdKind::Libinput);
@@ -2212,6 +2221,15 @@ mod tests {
         assert_ne!(BackendFdKind::DrmHotplug, BackendFdKind::Libinput);
         assert_ne!(BackendFdKind::DrmHotplug, BackendFdKind::HostX11);
         assert_ne!(BackendFdKind::DrmHotplug, BackendFdKind::PresentCompletion);
+        assert_ne!(
+            BackendFdKind::ScanoutRenderCompletion,
+            BackendFdKind::PresentCompletion
+        );
+        assert_ne!(BackendFdKind::ScanoutRenderCompletion, BackendFdKind::Drm);
+        assert_ne!(
+            BackendFdKind::ScanoutRenderCompletion,
+            BackendFdKind::DrmHotplug
+        );
     }
 }
 

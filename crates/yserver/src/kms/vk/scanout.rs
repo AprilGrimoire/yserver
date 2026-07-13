@@ -300,6 +300,545 @@ pub(crate) enum ScanoutOwnership {
     Output,
 }
 
+/// One output's installed presentation mechanism. Shared scanout keeps the
+/// historical single allocation written by Vulkan and scanned by KMS. Copied
+/// scanout pairs an A-side render source with an independent B-local scanout
+/// destination.
+pub(crate) enum OutputScanout {
+    Shared(ScanoutBoPool),
+    Copied(CopiedScanoutPool),
+}
+
+impl OutputScanout {
+    pub(crate) fn display_pool(&self) -> &ScanoutBoPool {
+        match self {
+            Self::Shared(pool) => pool,
+            Self::Copied(pool) => &pool.destinations,
+        }
+    }
+
+    pub(crate) fn display_pool_mut(&mut self) -> &mut ScanoutBoPool {
+        match self {
+            Self::Shared(pool) => pool,
+            Self::Copied(pool) => &mut pool.destinations,
+        }
+    }
+
+    pub(crate) fn copied_mut(&mut self) -> Option<&mut CopiedScanoutPool> {
+        match self {
+            Self::Shared(_) => None,
+            Self::Copied(pool) => Some(pool),
+        }
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        for bo in &mut self.display_pool_mut().bos {
+            bo.disarm();
+        }
+    }
+
+    pub(crate) fn drain_all_pending(&mut self, render_vk: &VkContext) {
+        match self {
+            Self::Shared(pool) => pool.drain_all_pending(render_vk),
+            Self::Copied(pool) => pool.drain_all_pending(),
+        }
+    }
+}
+
+/// A renderer-owned source image on GPU A together with GPU B's imported
+/// transfer-source alias. Field order keeps the B alias alive no longer than
+/// the A allocation it references.
+pub(crate) struct CopiedRenderSource {
+    imported_on_sink: DrawableImage,
+    exportable_on_renderer: super::target::ExportableImage,
+    pub(crate) image_view: vk::ImageView,
+    pub(crate) completion_semaphore: vk::Semaphore,
+    pub(crate) transfer: TransferResources,
+    render_vk: Arc<VkContext>,
+    sink_vk: Arc<VkContext>,
+    sink_wait_semaphore: Option<vk::Semaphore>,
+}
+
+impl CopiedRenderSource {
+    fn allocate(
+        render_vk: Arc<VkContext>,
+        sink_vk: Arc<VkContext>,
+        width: u32,
+        height: u32,
+    ) -> io::Result<Self> {
+        let exportable_on_renderer = super::target::allocate_exportable(
+            &render_vk,
+            width,
+            height,
+            vk::Format::B8G8R8A8_UNORM,
+        )
+        .map_err(|err| io::Error::other(format!("copy source allocation: {err:?}")))?;
+        let exported = super::dri3::export_backing(&render_vk, &exportable_on_renderer)
+            .map_err(|err| io::Error::other(format!("copy source DMA-BUF export: {err:?}")))?;
+        let imported_on_sink = DrawableImage::from_dmabuf_with_usage(
+            Arc::clone(&sink_vk),
+            exported.fd,
+            width,
+            height,
+            vk::Format::B8G8R8A8_UNORM,
+            exported.modifier,
+            &[u64::from(exported.offset)],
+            &[exported.stride],
+            vk::ImageUsageFlags::TRANSFER_SRC,
+        )
+        .map_err(|err| io::Error::other(format!("copy source sink import: {err:?}")))?;
+
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(exportable_on_renderer.image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(vk::Format::B8G8R8A8_UNORM)
+            .subresource_range(
+                vk::ImageSubresourceRange::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .level_count(1)
+                    .layer_count(1),
+            );
+        let image_view = unsafe { render_vk.device.create_image_view(&view_info, None) }
+            .map_err(|err| io::Error::other(format!("copy source image view: {err:?}")))?;
+        let completion_semaphore = match create_export_semaphore(&render_vk) {
+            Ok(semaphore) => semaphore,
+            Err(err) => {
+                unsafe { render_vk.device.destroy_image_view(image_view, None) };
+                return Err(io::Error::other(format!(
+                    "copy source completion semaphore: {err:?}"
+                )));
+            }
+        };
+        let transfer = match allocate_transfer_resources(&render_vk, width, height) {
+            Ok(transfer) => transfer,
+            Err(err) => {
+                unsafe {
+                    render_vk
+                        .device
+                        .destroy_semaphore(completion_semaphore, None);
+                    render_vk.device.destroy_image_view(image_view, None);
+                }
+                return Err(io::Error::other(format!(
+                    "copy source command resources: {err:?}"
+                )));
+            }
+        };
+
+        Ok(Self {
+            imported_on_sink,
+            exportable_on_renderer,
+            image_view,
+            completion_semaphore,
+            transfer,
+            render_vk,
+            sink_vk,
+            sink_wait_semaphore: None,
+        })
+    }
+
+    pub(crate) fn image(&self) -> vk::Image {
+        self.exportable_on_renderer.image
+    }
+
+    pub(crate) fn width(&self) -> u32 {
+        self.exportable_on_renderer.extent.width
+    }
+
+    pub(crate) fn height(&self) -> u32 {
+        self.exportable_on_renderer.extent.height
+    }
+
+    pub(crate) fn export_render_completion(&self) -> Result<OwnedFd, vk::Result> {
+        super::sync::export_sync_file(&self.render_vk, self.completion_semaphore)
+    }
+
+    fn release_sink_wait_semaphore(&mut self) {
+        if let Some(semaphore) = self.sink_wait_semaphore.take() {
+            unsafe { self.sink_vk.device.destroy_semaphore(semaphore, None) };
+        }
+    }
+}
+
+impl Drop for CopiedRenderSource {
+    fn drop(&mut self) {
+        self.release_sink_wait_semaphore();
+        unsafe {
+            destroy_transfer_resources(&self.render_vk, &mut self.transfer);
+            self.render_vk
+                .device
+                .destroy_semaphore(self.completion_semaphore, None);
+            self.render_vk
+                .device
+                .destroy_image_view(self.image_view, None);
+        }
+    }
+}
+
+/// Paired A-source/B-destination pool for the copied compatibility path.
+pub(crate) struct CopiedScanoutPool {
+    pub(crate) sources: Vec<CopiedRenderSource>,
+    pub(crate) destinations: ScanoutBoPool,
+    sink_vk: Arc<VkContext>,
+    destination_initialized: Vec<bool>,
+}
+
+impl CopiedScanoutPool {
+    pub(crate) fn allocate(
+        render_vk: Arc<VkContext>,
+        sink_vk: Arc<VkContext>,
+        scanout_device: Rc<crate::drm::Device>,
+        route: ScanoutRoute,
+        width: u32,
+        height: u32,
+        depth: usize,
+        scanout_modifiers: &[u64],
+    ) -> io::Result<Self> {
+        debug_assert!(route.is_cross_device());
+        let destinations = ScanoutBoPool::allocate_output_owned(
+            Arc::clone(&sink_vk),
+            Rc::clone(&scanout_device),
+            ScanoutRoute::local(route.kms_device_key),
+            width,
+            height,
+            depth,
+        )
+        .or_else(|output_err| {
+            ScanoutBoPool::allocate_renderer_owned(
+                Arc::clone(&sink_vk),
+                scanout_device,
+                ScanoutRoute::local(route.kms_device_key),
+                width,
+                height,
+                depth,
+                scanout_modifiers,
+            )
+            .map_err(|renderer_err| {
+                io::Error::other(format!(
+                    "copy destination allocation failed: output-owned: {output_err}; \
+                     renderer-owned on sink: {renderer_err}"
+                ))
+            })
+        })?;
+
+        let mut sources = Vec::with_capacity(depth);
+        for index in 0..depth {
+            sources.push(
+                CopiedRenderSource::allocate(
+                    Arc::clone(&render_vk),
+                    Arc::clone(&sink_vk),
+                    width,
+                    height,
+                )
+                .map_err(|err| io::Error::new(err.kind(), format!("copy source {index}: {err}")))?,
+            );
+        }
+
+        Ok(Self {
+            sources,
+            destinations,
+            sink_vk,
+            destination_initialized: vec![false; depth],
+        })
+    }
+
+    /// Submit B's copy after A's render-completion fd became readable. The
+    /// completion fd is still imported and waited by B so polling is not
+    /// mistaken for a Vulkan external-memory dependency.
+    pub(crate) fn submit_copy(
+        &mut self,
+        bo_idx: usize,
+        render_completion: OwnedFd,
+    ) -> io::Result<OwnedFd> {
+        let source = self
+            .sources
+            .get_mut(bo_idx)
+            .ok_or_else(|| io::Error::other("copied scanout source index out of range"))?;
+        let destination = self
+            .destinations
+            .bos
+            .get_mut(bo_idx)
+            .ok_or_else(|| io::Error::other("copied scanout destination index out of range"))?;
+        source.release_sink_wait_semaphore();
+        let wait_semaphore = super::sync::import_sync_file(&self.sink_vk, render_completion)
+            .map_err(|err| io::Error::other(format!("sink import render completion: {err:?}")))?;
+        source.sink_wait_semaphore = Some(wait_semaphore);
+
+        let command_buffer = destination.vk_transfer.command_buffer;
+        let destination_was_initialized = self.destination_initialized[bo_idx];
+        unsafe {
+            self.sink_vk
+                .device
+                .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
+                .map_err(|err| io::Error::other(format!("reset copy command buffer: {err:?}")))?;
+            self.sink_vk
+                .device
+                .begin_command_buffer(
+                    command_buffer,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )
+                .map_err(|err| io::Error::other(format!("begin copy command buffer: {err:?}")))?;
+
+            let before = [
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                    .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+                    .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
+                    .old_layout(vk::ImageLayout::GENERAL)
+                    .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .image(source.imported_on_sink.vk_image)
+                    .subresource_range(color_subresource_range()),
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                    .src_access_mask(vk::AccessFlags2::MEMORY_READ)
+                    .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+                    .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                    .old_layout(if destination_was_initialized {
+                        vk::ImageLayout::GENERAL
+                    } else {
+                        vk::ImageLayout::UNDEFINED
+                    })
+                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .image(destination.vk_image)
+                    .subresource_range(color_subresource_range()),
+            ];
+            self.sink_vk.device.cmd_pipeline_barrier2(
+                command_buffer,
+                &vk::DependencyInfo::default().image_memory_barriers(&before),
+            );
+            let region = [vk::ImageCopy2::default()
+                .src_subresource(color_subresource_layers())
+                .dst_subresource(color_subresource_layers())
+                .extent(vk::Extent3D {
+                    width: source.width(),
+                    height: source.height(),
+                    depth: 1,
+                })];
+            self.sink_vk.device.cmd_copy_image2(
+                command_buffer,
+                &vk::CopyImageInfo2::default()
+                    .src_image(source.imported_on_sink.vk_image)
+                    .src_image_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .dst_image(destination.vk_image)
+                    .dst_image_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .regions(&region),
+            );
+            let after = [
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                    .src_access_mask(vk::AccessFlags2::TRANSFER_READ)
+                    .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                    .dst_access_mask(vk::AccessFlags2::empty())
+                    .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .image(source.imported_on_sink.vk_image)
+                    .subresource_range(color_subresource_range()),
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                    .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                    .dst_access_mask(vk::AccessFlags2::MEMORY_READ)
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .image(destination.vk_image)
+                    .subresource_range(color_subresource_range()),
+            ];
+            self.sink_vk.device.cmd_pipeline_barrier2(
+                command_buffer,
+                &vk::DependencyInfo::default().image_memory_barriers(&after),
+            );
+            self.sink_vk
+                .device
+                .end_command_buffer(command_buffer)
+                .map_err(|err| io::Error::other(format!("end copy command buffer: {err:?}")))?;
+
+            let waits = [vk::SemaphoreSubmitInfo::default()
+                .semaphore(wait_semaphore)
+                .stage_mask(vk::PipelineStageFlags2::COPY)];
+            let commands = [vk::CommandBufferSubmitInfo::default().command_buffer(command_buffer)];
+            let signals = [vk::SemaphoreSubmitInfo::default()
+                .semaphore(destination.vk_semaphore)
+                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
+            let submits = [vk::SubmitInfo2::default()
+                .wait_semaphore_infos(&waits)
+                .command_buffer_infos(&commands)
+                .signal_semaphore_infos(&signals)];
+            self.sink_vk
+                .device
+                .queue_submit2(self.sink_vk.graphics_queue, &submits, vk::Fence::null())
+                .map_err(|err| io::Error::other(format!("submit sink copy: {err:?}")))?;
+        }
+        self.destination_initialized[bo_idx] = true;
+        destination
+            .export_signaled_fd()
+            .map_err(|err| io::Error::other(format!("export sink copy completion: {err:?}")))?
+            .ok_or_else(|| io::Error::other("sink copy completion exported no sync_file"))
+    }
+
+    /// Probe the actual cross-device handoff for every slot: A clears its
+    /// exportable source, exports completion, and B imports that completion
+    /// while copying into the local scanout destination.
+    pub(crate) fn probe_copy_all(&mut self) -> io::Result<()> {
+        for bo_idx in 0..self.sources.len() {
+            let render_completion = {
+                let source = &self.sources[bo_idx];
+                let command_buffer = source.transfer.command_buffer;
+                unsafe {
+                    source
+                        .render_vk
+                        .device
+                        .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
+                        .map_err(|err| {
+                            io::Error::other(format!("reset probe render command buffer: {err:?}"))
+                        })?;
+                    source
+                        .render_vk
+                        .device
+                        .begin_command_buffer(
+                            command_buffer,
+                            &vk::CommandBufferBeginInfo::default()
+                                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                        )
+                        .map_err(|err| {
+                            io::Error::other(format!("begin probe render command buffer: {err:?}"))
+                        })?;
+                    let to_color = [vk::ImageMemoryBarrier2::default()
+                        .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
+                        .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                        .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                        .old_layout(vk::ImageLayout::UNDEFINED)
+                        .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                        .image(source.image())
+                        .subresource_range(color_subresource_range())];
+                    source.render_vk.device.cmd_pipeline_barrier2(
+                        command_buffer,
+                        &vk::DependencyInfo::default().image_memory_barriers(&to_color),
+                    );
+                    let color_attachment = [vk::RenderingAttachmentInfo::default()
+                        .image_view(source.image_view)
+                        .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                        .load_op(vk::AttachmentLoadOp::CLEAR)
+                        .store_op(vk::AttachmentStoreOp::STORE)
+                        .clear_value(vk::ClearValue {
+                            color: vk::ClearColorValue {
+                                float32: [0.125, 0.25, 0.5, 1.0],
+                            },
+                        })];
+                    source.render_vk.device.cmd_begin_rendering(
+                        command_buffer,
+                        &vk::RenderingInfo::default()
+                            .render_area(vk::Rect2D {
+                                offset: vk::Offset2D::default(),
+                                extent: vk::Extent2D {
+                                    width: source.width(),
+                                    height: source.height(),
+                                },
+                            })
+                            .layer_count(1)
+                            .color_attachments(&color_attachment),
+                    );
+                    source.render_vk.device.cmd_end_rendering(command_buffer);
+                    let to_general = [vk::ImageMemoryBarrier2::default()
+                        .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                        .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                        .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                        .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                        .new_layout(vk::ImageLayout::GENERAL)
+                        .image(source.image())
+                        .subresource_range(color_subresource_range())];
+                    source.render_vk.device.cmd_pipeline_barrier2(
+                        command_buffer,
+                        &vk::DependencyInfo::default().image_memory_barriers(&to_general),
+                    );
+                    source
+                        .render_vk
+                        .device
+                        .end_command_buffer(command_buffer)
+                        .map_err(|err| {
+                            io::Error::other(format!("end probe render command buffer: {err:?}"))
+                        })?;
+                    let commands =
+                        [vk::CommandBufferSubmitInfo::default().command_buffer(command_buffer)];
+                    let signals = [vk::SemaphoreSubmitInfo::default()
+                        .semaphore(source.completion_semaphore)
+                        .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
+                    let submits = [vk::SubmitInfo2::default()
+                        .command_buffer_infos(&commands)
+                        .signal_semaphore_infos(&signals)];
+                    source
+                        .render_vk
+                        .device
+                        .queue_submit2(source.render_vk.graphics_queue, &submits, vk::Fence::null())
+                        .map_err(|err| io::Error::other(format!("submit probe render: {err:?}")))?;
+                }
+                source.export_render_completion().map_err(|err| {
+                    io::Error::other(format!("export probe render completion: {err:?}"))
+                })?
+            };
+            let _copy_completion = self.submit_copy(bo_idx, render_completion)?;
+        }
+        if let Err(err) = unsafe { self.sink_vk.device.device_wait_idle() } {
+            return Err(io::Error::other(format!(
+                "wait for copied scanout probe: {err:?}"
+            )));
+        }
+        for source in &mut self.sources {
+            source.release_sink_wait_semaphore();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn release_completed_source(&mut self, bo_idx: usize) {
+        if let Some(source) = self.sources.get_mut(bo_idx) {
+            source.release_sink_wait_semaphore();
+        }
+    }
+
+    /// Quiesce a failed B submission before returning its source/destination
+    /// pair to the free list. Other slots, including the one currently scanned
+    /// out, retain their state.
+    pub(crate) fn recover_copy_failure(&mut self, bo_idx: usize) {
+        if let Err(err) = unsafe { self.sink_vk.device.device_wait_idle() } {
+            log::warn!("copied scanout failure device_wait_idle failed: {err:?}");
+        }
+        self.release_completed_source(bo_idx);
+        if let Some(destination) = self.destinations.bos.get_mut(bo_idx) {
+            let released = destination.state.transition_to_free_after_modeset_reset();
+            if let Some(fd) = released.in_fence {
+                drop(unsafe { OwnedFd::from_raw_fd(fd) });
+            }
+            if let Some(fd) = released.release_fence {
+                drop(unsafe { OwnedFd::from_raw_fd(fd) });
+            }
+        }
+    }
+
+    pub(crate) fn drain_all_pending(&mut self) {
+        if let Err(err) = unsafe { self.sink_vk.device.device_wait_idle() } {
+            log::warn!("copied scanout sink device_wait_idle failed: {err:?}");
+        }
+        if let Some(render_vk) = self
+            .sources
+            .first()
+            .map(|source| Arc::clone(&source.render_vk))
+            && let Err(err) = unsafe { render_vk.device.device_wait_idle() }
+        {
+            log::warn!("copied scanout renderer device_wait_idle failed: {err:?}");
+        }
+        self.destinations.drain_all_pending(&self.sink_vk);
+        for source in &mut self.sources {
+            source.release_sink_wait_semaphore();
+        }
+    }
+}
+
+impl Drop for CopiedScanoutPool {
+    fn drop(&mut self) {
+        self.drain_all_pending();
+    }
+}
+
 /// Fence owned by one renderer-access probe submission.
 ///
 /// Successful probes destroy the fence after observing it signaled. On every
@@ -1660,6 +2199,42 @@ fn allocate_transfer_resources(
         staging_mapped,
         staging_size,
     })
+}
+
+fn destroy_transfer_resources(vk: &VkContext, transfer: &mut TransferResources) {
+    let transfer = std::mem::replace(
+        transfer,
+        TransferResources {
+            command_pool: vk::CommandPool::null(),
+            command_buffer: vk::CommandBuffer::null(),
+            staging_buffer: vk::Buffer::null(),
+            staging_memory: vk::DeviceMemory::null(),
+            staging_mapped: std::ptr::NonNull::dangling(),
+            staging_size: 0,
+        },
+    );
+    if transfer.command_pool == vk::CommandPool::null() {
+        return;
+    }
+    unsafe {
+        vk.device.unmap_memory(transfer.staging_memory);
+        vk.device.destroy_buffer(transfer.staging_buffer, None);
+        vk.device.free_memory(transfer.staging_memory, None);
+        vk.device.destroy_command_pool(transfer.command_pool, None);
+    }
+}
+
+fn color_subresource_range() -> vk::ImageSubresourceRange {
+    vk::ImageSubresourceRange::default()
+        .aspect_mask(vk::ImageAspectFlags::COLOR)
+        .level_count(1)
+        .layer_count(1)
+}
+
+fn color_subresource_layers() -> vk::ImageSubresourceLayers {
+    vk::ImageSubresourceLayers::default()
+        .aspect_mask(vk::ImageAspectFlags::COLOR)
+        .layer_count(1)
 }
 
 fn pick_memory_type(

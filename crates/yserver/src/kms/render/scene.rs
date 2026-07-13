@@ -66,7 +66,7 @@ use ash::vk;
 use yserver_protocol::x11::xfixes;
 
 use super::{
-    platform::{FenceTicket, PlatformBackend},
+    platform::{FenceTicket, PlatformBackend, ReadyScanoutRenderCompletion},
     store::{DamageSnapshot, DrawableKind, DrawableStore, RegionSet},
     telemetry::Telemetry,
 };
@@ -76,7 +76,7 @@ use crate::kms::{
     vk::{
         compositor::{CompositeDraw, CompositeScene, PresentError},
         pipeline::{CompositePushConsts, CompositorPipeline, MAX_DESCRIPTOR_SETS_PER_FRAME},
-        scanout::{BoPhase, ScanoutBo},
+        scanout::{BoPhase, BoState, CopiedRenderSource, OutputScanout, ScanoutBo},
     },
 };
 
@@ -86,9 +86,16 @@ use crate::kms::{
 
 /// Per-output pending-ack ledger. Each entry corresponds to one
 /// in-flight compose; popped front on page-flip-complete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InFlightStage {
+    WaitingForRenderCompletion { job_id: u64 },
+    KmsFlipPending,
+}
+
 struct PendingAck {
     bo_idx: usize,
     generation: u64,
+    stage: InFlightStage,
     /// Snapshots taken at tick entry, one per source drawable
     /// that contributed to the compose. Ack'd against the
     /// store's live presentation damage on flip retirement.
@@ -591,7 +598,7 @@ impl SceneCompositor {
         let bo_depth = platform
             .scanout_pools
             .get(i)
-            .and_then(|p| p.as_ref().map(|pp| pp.bos.len()))
+            .and_then(|p| p.as_ref().map(|pp| pp.display_pool().bos.len()))
             .unwrap_or(3);
         Ok(OutputSceneState {
             output_idx: i,
@@ -1059,6 +1066,89 @@ impl SceneCompositor {
                  with no pending ack — startup flush or spurious event",
             );
             false
+        }
+    }
+
+    /// Continue a copied frame at the main-loop scheduling boundary between
+    /// A's render and B's copy. The completion token is matched against both
+    /// stable output identity and the per-frame monotonic job id.
+    pub(crate) fn handle_scanout_render_completion(
+        &mut self,
+        completion: ReadyScanoutRenderCompletion,
+        platform: &mut PlatformBackend,
+    ) -> bool {
+        let Some(output_idx) = platform
+            .outputs
+            .iter()
+            .position(|output| output.key == completion.output_key)
+        else {
+            log::debug!(
+                "render copied scanout: completion job {} targeted removed output {:?}",
+                completion.job_id,
+                completion.output_key,
+            );
+            return false;
+        };
+        let Some(inner) = self.inner.as_mut() else {
+            return false;
+        };
+        let expected = inner
+            .outputs
+            .get(output_idx)
+            .and_then(|state| state.pending_acks.front())
+            .is_some_and(|ack| {
+                ack.bo_idx == completion.bo_idx
+                    && ack.stage
+                        == InFlightStage::WaitingForRenderCompletion {
+                            job_id: completion.job_id,
+                        }
+            });
+        if !expected {
+            log::warn!(
+                "render copied scanout: stale completion job {} for output {output_idx} bo {}",
+                completion.job_id,
+                completion.bo_idx,
+            );
+            return false;
+        }
+
+        match platform.submit_copied_scanout(output_idx, completion.bo_idx, completion.fd) {
+            Ok(()) => {
+                if let Some(ack) = inner.outputs[output_idx].pending_acks.front_mut() {
+                    ack.stage = InFlightStage::KmsFlipPending;
+                }
+                true
+            }
+            Err(err) => {
+                log::warn!(
+                    "render copied scanout: B copy/KMS submit failed for output {output_idx} \
+                     bo {}: {err}",
+                    completion.bo_idx,
+                );
+                platform.invalidate_bo(output_idx, completion.bo_idx);
+                platform.recycle_failed_submit_bo(output_idx, completion.bo_idx);
+                let state = &mut inner.outputs[output_idx];
+                if let Some(ack) = state.pending_acks.pop_front() {
+                    state.current_generation = ack.generation.saturating_sub(1);
+                    if let Some(rect) = ack.submitted_output_damage.bounding_rect() {
+                        state.pending_repaint_after_failed_submit.add(rect);
+                    }
+                    if let Some(slot) = state.pool_slots.pop_front() {
+                        match ack.ticket {
+                            None => state.pool_ring.release(slot),
+                            Some(ticket) if ticket.poll_signaled(&inner.vk) => {
+                                state.pool_ring.release(slot);
+                            }
+                            Some(ticket) => {
+                                state.pending_pool_releases.push_back((slot, ticket));
+                            }
+                        }
+                    }
+                }
+                state.next_submit_retry_at =
+                    Some(std::time::Instant::now() + std::time::Duration::from_millis(100));
+                false
+            }
         }
     }
 }
@@ -1614,7 +1704,8 @@ fn tick_one_output(
     let compose_ticket = platform
         .acquire_fence_ticket()
         .map_err(|e| SceneError::Present(PresentError::Vk(e)))?;
-    let output_device_key = platform.outputs[output_idx].key.device_key;
+    let output_key = platform.outputs[output_idx].key.clone();
+    let output_device_key = output_key.device_key;
     let device = platform
         .devices
         .iter()
@@ -1626,21 +1717,55 @@ fn tick_one_output(
         .and_then(|p| p.as_mut())
         .ok_or(SceneError::NoVk)?;
     let layout = &platform.outputs[output_idx];
-    let bo = pool.bos.get_mut(token.bo_idx).ok_or(SceneError::NoVk)?;
     let mut gpu_submitted = false;
     let record_start = std::time::Instant::now();
-    let compose_result = record_compose(
-        &inner.vk,
-        &device.device,
-        &layout.output,
-        bo,
-        &inner.pipeline,
-        descriptor_pool,
-        &built.scene,
-        repaint,
-        compose_ticket.fence(),
-        &mut gpu_submitted,
-    );
+    let render_result = match pool {
+        OutputScanout::Shared(pool) => {
+            let bo = pool.bos.get_mut(token.bo_idx).ok_or(SceneError::NoVk)?;
+            submit_shared_scanout_frame(
+                &inner.vk,
+                &device.device,
+                &layout.output,
+                bo,
+                &inner.pipeline,
+                descriptor_pool,
+                &built.scene,
+                repaint,
+                compose_ticket.fence(),
+                &mut gpu_submitted,
+            )
+            .map(|()| None)
+        }
+        OutputScanout::Copied(pool) => {
+            let source = pool.sources.get(token.bo_idx).ok_or(SceneError::NoVk)?;
+            let destination_state = &mut pool
+                .destinations
+                .bos
+                .get_mut(token.bo_idx)
+                .ok_or(SceneError::NoVk)?
+                .state;
+            submit_copied_scanout_render(
+                &inner.vk,
+                source,
+                destination_state,
+                &inner.pipeline,
+                descriptor_pool,
+                &built.scene,
+                Repaint::Full(token.extent),
+                compose_ticket.fence(),
+                &mut gpu_submitted,
+            )
+            .map(Some)
+        }
+    };
+    let compose_result = match render_result {
+        Ok(Some(completion)) => platform
+            .register_scanout_render_completion(output_key, token.bo_idx, completion)
+            .map(|job_id| InFlightStage::WaitingForRenderCompletion { job_id })
+            .map_err(PresentError::Io),
+        Ok(None) => Ok(InFlightStage::KmsFlipPending),
+        Err(err) => Err(err),
+    };
     let record_ns = u64::try_from(record_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
     telemetry.record_compose_cb_record_ns(record_ns);
     telemetry
@@ -1648,7 +1773,7 @@ fn tick_one_output(
 
     let state = inner.outputs.get_mut(output_idx).expect("range");
     match compose_result {
-        Ok(()) => {
+        Ok(stage) => {
             state.next_submit_retry_at = None;
             for id in &built.sampled_ids {
                 store.touch_render_fence(*id, compose_ticket.clone());
@@ -1657,6 +1782,7 @@ fn tick_one_output(
             state.pending_acks.push_back(PendingAck {
                 bo_idx: token.bo_idx,
                 generation: frame_gen,
+                stage,
                 drawable_snapshots: built.snapshots,
                 ticket: Some(compose_ticket),
                 submitted_output_damage: output_damage,
@@ -2799,8 +2925,71 @@ fn add_projected_damage(
 // handling stay identical to v1.
 // ────────────────────────────────────────────────────────────────
 
+trait ComposeRenderTarget {
+    fn image(&self) -> vk::Image;
+    fn image_view(&self) -> vk::ImageView;
+    fn command_buffer(&self) -> vk::CommandBuffer;
+    fn completion_semaphore(&self) -> vk::Semaphore;
+    fn width(&self) -> u32;
+    fn height(&self) -> u32;
+}
+
+impl ComposeRenderTarget for ScanoutBo {
+    fn image(&self) -> vk::Image {
+        self.vk_image
+    }
+
+    fn image_view(&self) -> vk::ImageView {
+        self.vk_image_view
+    }
+
+    fn command_buffer(&self) -> vk::CommandBuffer {
+        self.vk_transfer.command_buffer
+    }
+
+    fn completion_semaphore(&self) -> vk::Semaphore {
+        self.vk_semaphore
+    }
+
+    fn width(&self) -> u32 {
+        self.width
+    }
+
+    fn height(&self) -> u32 {
+        self.height
+    }
+}
+
+impl ComposeRenderTarget for CopiedRenderSource {
+    fn image(&self) -> vk::Image {
+        self.image()
+    }
+
+    fn image_view(&self) -> vk::ImageView {
+        self.image_view
+    }
+
+    fn command_buffer(&self) -> vk::CommandBuffer {
+        self.transfer.command_buffer
+    }
+
+    fn completion_semaphore(&self) -> vk::Semaphore {
+        self.completion_semaphore
+    }
+
+    fn width(&self) -> u32 {
+        self.width()
+    }
+
+    fn height(&self) -> u32 {
+        self.height()
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn record_compose(
+/// Submit a shared-buffer frame: render directly into the scanout BO and
+/// immediately queue its KMS flip, gated by the exported render fence.
+fn submit_shared_scanout_frame(
     vk: &crate::kms::vk::device::VkContext,
     drm: &crate::drm::Device,
     output: &crate::platform::drm::Output,
@@ -2819,64 +3008,19 @@ fn record_compose(
     }
     let fb_handle = bo.fb_handle.ok_or(PresentError::NoFb)?;
     bo.state.transition_to_recording();
+    let completion = record_and_submit_render(
+        vk,
+        bo,
+        pipeline,
+        descriptor_pool,
+        scene,
+        repaint,
+        signal_fence,
+        gpu_submitted,
+    )?;
 
-    // Allocate descriptor sets — same shape as v1.
-    let mut descriptors: Vec<vk::DescriptorSet> = Vec::with_capacity(scene.draws.len());
-    for draw in &scene.draws {
-        let layouts = [pipeline.descriptor_set_layout];
-        let alloc_info = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(descriptor_pool)
-            .set_layouts(&layouts);
-        let set = match unsafe { vk.device.allocate_descriptor_sets(&alloc_info) } {
-            Ok(sets) => sets[0],
-            Err(e) => {
-                log::warn!(
-                    "render compose: descriptor allocation failed ({e:?}) at draw {} of {}",
-                    descriptors.len(),
-                    scene.draws.len(),
-                );
-                break;
-            }
-        };
-        let image_info = [vk::DescriptorImageInfo::default()
-            .image_view(draw.image_view)
-            .sampler(pipeline.sampler)
-            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-        let writes = [vk::WriteDescriptorSet::default()
-            .dst_set(set)
-            .dst_binding(0)
-            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .image_info(&image_info)];
-        unsafe { vk.device.update_descriptor_sets(&writes, &[]) };
-        descriptors.push(set);
-    }
-
-    // Record.
-    record_command_buffer(vk, bo, pipeline, scene, &descriptors, repaint)?;
-
-    // Submit. Same shape as v1: signal bo.vk_semaphore for the
-    // KMS IN_FENCE_FD handoff; null fence.
-    let cb = bo.vk_transfer.command_buffer;
-    let cb_info = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
-    let sig_info = [vk::SemaphoreSubmitInfo::default()
-        .semaphore(bo.vk_semaphore)
-        .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
-    let submit = [vk::SubmitInfo2::default()
-        .command_buffer_infos(&cb_info)
-        .signal_semaphore_infos(&sig_info)];
-    unsafe {
-        crate::vk_count!(queue_submit2);
-        crate::vk_count!(submit_compositor);
-        vk.device
-            .queue_submit2(vk.graphics_queue, &submit, signal_fence)?;
-    }
-    *gpu_submitted = true;
-
-    // Export SYNC_FD + atomic flip — same as v1.
-    let fd = bo
-        .export_signaled_fd()
-        .map_err(PresentError::Vk)?
-        .map_or(-1, IntoRawFd::into_raw_fd);
+    // Atomic flip — same as v1.
+    let fd = completion.into_raw_fd();
     bo.state.transition_to_submitted(fd);
 
     let mut out_fence: i32 = -1;
@@ -2910,16 +3054,107 @@ fn record_compose(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn record_command_buffer(
+/// Submit GPU A's render into the copied-scanout source. The returned fence fd
+/// schedules the later GPU B copy and KMS flip through the main loop.
+fn submit_copied_scanout_render(
     vk: &crate::kms::vk::device::VkContext,
-    bo: &ScanoutBo,
+    source: &CopiedRenderSource,
+    destination_state: &mut BoState,
+    pipeline: &CompositorPipeline,
+    descriptor_pool: vk::DescriptorPool,
+    scene: &CompositeScene,
+    repaint: Repaint,
+    signal_fence: vk::Fence,
+    gpu_submitted: &mut bool,
+) -> Result<std::os::fd::OwnedFd, PresentError> {
+    if destination_state.phase != BoPhase::Free {
+        return Err(PresentError::WrongPhase(destination_state.phase));
+    }
+    destination_state.transition_to_recording();
+    record_and_submit_render(
+        vk,
+        source,
+        pipeline,
+        descriptor_pool,
+        scene,
+        repaint,
+        signal_fence,
+        gpu_submitted,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_and_submit_render(
+    vk: &crate::kms::vk::device::VkContext,
+    target: &impl ComposeRenderTarget,
+    pipeline: &CompositorPipeline,
+    descriptor_pool: vk::DescriptorPool,
+    scene: &CompositeScene,
+    repaint: Repaint,
+    signal_fence: vk::Fence,
+    gpu_submitted: &mut bool,
+) -> Result<std::os::fd::OwnedFd, PresentError> {
+    let mut descriptors: Vec<vk::DescriptorSet> = Vec::with_capacity(scene.draws.len());
+    for draw in &scene.draws {
+        let layouts = [pipeline.descriptor_set_layout];
+        let alloc_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(descriptor_pool)
+            .set_layouts(&layouts);
+        let set = match unsafe { vk.device.allocate_descriptor_sets(&alloc_info) } {
+            Ok(sets) => sets[0],
+            Err(e) => {
+                log::warn!(
+                    "render compose: descriptor allocation failed ({e:?}) at draw {} of {}",
+                    descriptors.len(),
+                    scene.draws.len(),
+                );
+                break;
+            }
+        };
+        let image_info = [vk::DescriptorImageInfo::default()
+            .image_view(draw.image_view)
+            .sampler(pipeline.sampler)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+        let writes = [vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(&image_info)];
+        unsafe { vk.device.update_descriptor_sets(&writes, &[]) };
+        descriptors.push(set);
+    }
+
+    record_command_buffer(vk, target, pipeline, scene, &descriptors, repaint)?;
+
+    let cb_info = [vk::CommandBufferSubmitInfo::default().command_buffer(target.command_buffer())];
+    let sig_info = [vk::SemaphoreSubmitInfo::default()
+        .semaphore(target.completion_semaphore())
+        .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
+    let submit = [vk::SubmitInfo2::default()
+        .command_buffer_infos(&cb_info)
+        .signal_semaphore_infos(&sig_info)];
+    unsafe {
+        crate::vk_count!(queue_submit2);
+        crate::vk_count!(submit_compositor);
+        vk.device
+            .queue_submit2(vk.graphics_queue, &submit, signal_fence)?;
+    }
+    *gpu_submitted = true;
+    crate::kms::vk::sync::export_sync_file(vk, target.completion_semaphore())
+        .map_err(PresentError::Vk)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_command_buffer<T: ComposeRenderTarget + ?Sized>(
+    vk: &crate::kms::vk::device::VkContext,
+    bo: &T,
     pipeline: &CompositorPipeline,
     scene: &CompositeScene,
     descriptors: &[vk::DescriptorSet],
     repaint: Repaint,
 ) -> Result<(), PresentError> {
     let device = &vk.device;
-    let cb = bo.vk_transfer.command_buffer;
+    let cb = bo.command_buffer();
 
     let (load_op, render_area, old_layout) = match repaint {
         Repaint::Full(extent) => (
@@ -2935,8 +3170,8 @@ fn record_command_buffer(
             vk::Rect2D {
                 offset: vk::Offset2D::default(),
                 extent: vk::Extent2D {
-                    width: bo.width,
-                    height: bo.height,
+                    width: bo.width(),
+                    height: bo.height(),
                 },
             },
             // LOAD requires the previous layout to be valid; the
@@ -2989,7 +3224,7 @@ fn record_command_buffer(
             )
             .old_layout(old_layout)
             .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .image(bo.vk_image)
+            .image(bo.image())
             .subresource_range(
                 vk::ImageSubresourceRange::default()
                     .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -3002,7 +3237,7 @@ fn record_command_buffer(
         device.cmd_pipeline_barrier2(cb, &to_color_dep);
 
         let color_attachment = [vk::RenderingAttachmentInfo::default()
-            .image_view(bo.vk_image_view)
+            .image_view(bo.image_view())
             .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             .load_op(load_op)
             .store_op(vk::AttachmentStoreOp::STORE)
@@ -3022,9 +3257,9 @@ fn record_command_buffer(
             x: 0.0,
             y: 0.0,
             #[allow(clippy::cast_precision_loss)]
-            width: bo.width as f32,
+            width: bo.width() as f32,
             #[allow(clippy::cast_precision_loss)]
-            height: bo.height as f32,
+            height: bo.height() as f32,
             min_depth: 0.0,
             max_depth: 1.0,
         }];
@@ -3034,7 +3269,7 @@ fn record_command_buffer(
         device.cmd_set_scissor(cb, 0, &[scissor]);
 
         #[allow(clippy::cast_precision_loss)]
-        let viewport_size = [bo.width as f32, bo.height as f32];
+        let viewport_size = [bo.width() as f32, bo.height() as f32];
         let mut last_pipeline: Option<vk::Pipeline> = None;
         for (i, draw) in scene.draws.iter().enumerate().take(descriptors.len()) {
             let pl = pipeline.pipeline_for(draw.alpha_passthrough);
@@ -3083,7 +3318,7 @@ fn record_command_buffer(
             .dst_access_mask(vk::AccessFlags2::empty())
             .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             .new_layout(vk::ImageLayout::GENERAL)
-            .image(bo.vk_image)
+            .image(bo.image())
             .subresource_range(
                 vk::ImageSubresourceRange::default()
                     .aspect_mask(vk::ImageAspectFlags::COLOR)

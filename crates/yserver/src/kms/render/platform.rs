@@ -37,7 +37,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     io,
-    os::fd::{AsFd, AsRawFd, OwnedFd, RawFd},
+    os::fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
     path::PathBuf,
     rc::{Rc, Weak},
     sync::Arc,
@@ -60,7 +60,10 @@ use crate::{
         vk::{
             device::VkContext,
             ops::OpsCommandPool,
-            scanout::{BoPhase, BoState, ScanoutAllocationPlan, ScanoutBoPool, ScanoutOwnership},
+            scanout::{
+                BoPhase, BoState, CopiedScanoutPool, OutputScanout, ScanoutAllocationPlan,
+                ScanoutBoPool, ScanoutOwnership,
+            },
         },
     },
 };
@@ -470,6 +473,25 @@ pub(crate) struct FlushOutcome {
 /// token instead, distinguishing them from the wakeup_eventfd.
 pub(crate) const WAKEUP_EVENTFD_TOKEN: u64 = u64::MAX;
 
+/// One source-GPU render completion registered with the stable scanout
+/// completion aggregator. The fd remains owned here until readiness is
+/// drained and handed to the sink-GPU copy submission.
+struct PendingScanoutRenderCompletion {
+    job_id: u64,
+    output_key: OutputKey,
+    bo_idx: usize,
+    fd: OwnedFd,
+}
+
+/// Ready source-GPU render handed from the platform poll inventory to the
+/// backend/scene state machine.
+pub(crate) struct ReadyScanoutRenderCompletion {
+    pub(crate) job_id: u64,
+    pub(crate) output_key: OutputKey,
+    pub(crate) bo_idx: usize,
+    pub(crate) fd: OwnedFd,
+}
+
 /// True iff a cursor-plane ioctl error means the driver does not
 /// implement the (legacy) cursor ioctls at all — a permanent,
 /// per-driver condition that warrants latching the HW cursor strategy
@@ -580,6 +602,12 @@ pub(crate) struct PlatformBackend {
     /// `present_completion_epfd` at init under `WAKEUP_EVENTFD_TOKEN`.
     pub(crate) wakeup_eventfd: nix::sys::eventfd::EventFd,
 
+    /// Stable native readiness aggregator for per-frame source-GPU render
+    /// completion sync_files used by copied scanout.
+    scanout_render_completion_epfd: crate::kms::render::completion_poller::CompletionPoller,
+    pending_scanout_render_completions: std::collections::VecDeque<PendingScanoutRenderCompletion>,
+    next_scanout_render_job_id: u64,
+
     // Vulkan side. `Option` only to support test fixtures that
     // skip Vk init (`for_tests`). Production `open_with_commit`
     // always returns `Some`. v2 has no pixman fallback.
@@ -604,10 +632,15 @@ pub(crate) struct PlatformBackend {
     /// output's allocation failed (rare; e.g. RADV/gfx8 quirks).
     /// Stage 2c+ paint paths skip output indices with `None`
     /// pool, mirroring v1's behaviour.
-    pub(crate) scanout_pools: Vec<Option<ScanoutBoPool>>,
+    pub(crate) scanout_pools: Vec<Option<OutputScanout>>,
+
+    /// Minimal Vulkan transfer contexts keyed by sink KMS device. Copied
+    /// outputs on one GPU share the queue/context; pools keep their own Arc so
+    /// imported aliases remain valid through pool teardown.
+    copy_vk_contexts: std::collections::HashMap<crate::platform::drm::DrmDeviceKey, Arc<VkContext>>,
 
     /// Per-output, per-BO generation entries. `bo_generations[oi][bi]`
-    /// pairs with `scanout_pools[oi].as_ref().unwrap().bos[bi]`.
+    /// pairs with `scanout_pools[oi].as_ref().unwrap().display_pool().bos[bi]`.
     /// `Vec::new()` for outputs whose pool is `None`.
     pub(crate) bo_generations: Vec<Vec<BoGenerationEntry>>,
     /// Monotonic per-platform counter. Each successful present
@@ -905,6 +938,37 @@ fn probe_scanout_setup(
     Ok(ProbedScanoutSetup::RendererOwned(selected))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn probe_copied_scanout_setup(
+    renderer_device_key: crate::platform::drm::DrmDeviceKey,
+    renderer_render_node_key: Option<crate::platform::drm::DrmDeviceKey>,
+    sink_device_key: crate::platform::drm::DrmDeviceKey,
+    sink_render_node_key: Option<crate::platform::drm::DrmDeviceKey>,
+    scanout_device: Rc<drm::Device>,
+    output: &crate::platform::drm::Output,
+    route: ScanoutRoute,
+    width: u16,
+    height: u16,
+) -> io::Result<()> {
+    let render_vk = VkContext::new_for_drm(renderer_device_key, renderer_render_node_key)
+        .map_err(|err| io::Error::other(format!("copy probe renderer Vulkan device: {err}")))?;
+    let sink_vk = VkContext::new_transfer_for_drm(sink_device_key, sink_render_node_key)
+        .map_err(|err| io::Error::other(format!("copy probe sink Vulkan device: {err}")))?;
+    let mut pool = CopiedScanoutPool::allocate(
+        render_vk,
+        sink_vk,
+        Rc::clone(&scanout_device),
+        route,
+        u32::from(width),
+        u32::from(height),
+        SCANOUT_POOL_DEPTH,
+        &output.scanout_modifiers,
+    )?;
+    test_scanout_pool(&scanout_device, output, &pool.destinations)?;
+    pool.probe_copy_all()?;
+    Ok(())
+}
+
 impl PlatformBackend {
     /// Backend constructor. Opens DRM, initialises Vk,
     /// allocates per-output scanout pools, builds the fence pool.
@@ -1057,7 +1121,7 @@ impl PlatformBackend {
             ) {
                 Ok(pool) => {
                     let n = pool.bos.len();
-                    scanout_pools.push(Some(pool));
+                    scanout_pools.push(Some(OutputScanout::Shared(pool)));
                     bo_generations.push(vec![BoGenerationEntry::default(); n]);
                 }
                 Err(e) => {
@@ -1123,6 +1187,8 @@ impl PlatformBackend {
         let present_completion_epfd =
             crate::kms::render::completion_poller::CompletionPoller::new()?;
         present_completion_epfd.register(wakeup_eventfd.as_fd(), WAKEUP_EVENTFD_TOKEN)?;
+        let scanout_render_completion_epfd =
+            crate::kms::render::completion_poller::CompletionPoller::new()?;
 
         let submit_group = SubmitGroup::new();
         #[cfg(target_os = "linux")]
@@ -1169,11 +1235,15 @@ impl PlatformBackend {
             hotplug_monitor,
             present_completion_epfd,
             wakeup_eventfd,
+            scanout_render_completion_epfd,
+            pending_scanout_render_completions: std::collections::VecDeque::new(),
+            next_scanout_render_job_id: 1,
             vk: Some(vk),
             ops_command_pool: Some(ops_command_pool),
             fence_pool: Some(fence_pool),
             pixmap_pool,
             scanout_pools,
+            copy_vk_contexts: std::collections::HashMap::new(),
             bo_generations,
             next_present_generation: 0,
             first_pageflip_logged,
@@ -1204,6 +1274,9 @@ impl PlatformBackend {
         present_completion_epfd
             .register(wakeup_eventfd.as_fd(), WAKEUP_EVENTFD_TOKEN)
             .expect("test poller register");
+        let scanout_render_completion_epfd =
+            crate::kms::render::completion_poller::CompletionPoller::new()
+                .expect("test scanout render poller");
         #[cfg(target_os = "linux")]
         let hotplug_monitor = None;
         let device_key = crate::platform::drm::DrmDeviceKey { major: 0, minor: 0 };
@@ -1262,11 +1335,15 @@ impl PlatformBackend {
             hotplug_monitor,
             present_completion_epfd,
             wakeup_eventfd,
+            scanout_render_completion_epfd,
+            pending_scanout_render_completions: std::collections::VecDeque::new(),
+            next_scanout_render_job_id: 1,
             vk: None,
             ops_command_pool: None,
             fence_pool: None,
             pixmap_pool: None,
             scanout_pools: vec![None],
+            copy_vk_contexts: std::collections::HashMap::new(),
             bo_generations: vec![Vec::new()],
             next_present_generation: 0,
             first_pageflip_logged: vec![false],
@@ -1818,6 +1895,28 @@ impl PlatformBackend {
         self.device_for_key(key.device_key)
     }
 
+    fn copy_vk_for_device(
+        &mut self,
+        key: crate::platform::drm::DrmDeviceKey,
+    ) -> io::Result<Arc<VkContext>> {
+        if let Some(vk) = self.copy_vk_contexts.get(&key) {
+            return Ok(Arc::clone(vk));
+        }
+        let render_key = self
+            .device_for_key(key)
+            .ok_or_else(|| io::Error::other(format!("no KMS device for copied scanout {key}")))?
+            .render_node
+            .as_ref()
+            .map(|node| node.key());
+        let vk = VkContext::new_transfer_for_drm(key, render_key).map_err(|err| {
+            io::Error::other(format!(
+                "copied scanout sink Vulkan context for {key}: {err}"
+            ))
+        })?;
+        self.copy_vk_contexts.insert(key, Arc::clone(&vk));
+        Ok(vk)
+    }
+
     fn output_index_for_crtc(&self, crtc_key: CrtcKey) -> Option<usize> {
         self.outputs
             .iter()
@@ -1868,7 +1967,7 @@ impl PlatformBackend {
     }
 
     pub(crate) fn poll_fds(&self) -> Vec<(RawFd, BackendFdKind)> {
-        let mut fds = Vec::with_capacity(3 + self.devices.len());
+        let mut fds = Vec::with_capacity(4 + self.devices.len());
         if let Some(ctx) = self.input_ctx.as_ref() {
             fds.push((ctx.fd(), BackendFdKind::Libinput));
         }
@@ -1885,7 +1984,115 @@ impl PlatformBackend {
             self.present_completion_epfd.as_raw_fd(),
             BackendFdKind::PresentCompletion,
         ));
+        fds.push((
+            self.scanout_render_completion_epfd.as_raw_fd(),
+            BackendFdKind::ScanoutRenderCompletion,
+        ));
         fds
+    }
+
+    /// Register one source-GPU render-completion sync_file with the stable
+    /// copied-scanout readiness aggregator.
+    pub(crate) fn register_scanout_render_completion(
+        &mut self,
+        output_key: OutputKey,
+        bo_idx: usize,
+        fd: OwnedFd,
+    ) -> io::Result<u64> {
+        let job_id = self.next_scanout_render_job_id;
+        self.next_scanout_render_job_id = self
+            .next_scanout_render_job_id
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("scanout render job id overflow"))?;
+        self.scanout_render_completion_epfd
+            .register(fd.as_fd(), job_id)?;
+        self.pending_scanout_render_completions
+            .push_back(PendingScanoutRenderCompletion {
+                job_id,
+                output_key,
+                bo_idx,
+                fd,
+            });
+        Ok(job_id)
+    }
+
+    /// Drain every currently-readable copied-scanout source completion. Jobs
+    /// on different outputs may complete independently, so this deliberately
+    /// does not impose queue-front ordering.
+    pub(crate) fn drain_scanout_render_completions(&mut self) -> Vec<ReadyScanoutRenderCompletion> {
+        use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+
+        let mut ready = Vec::new();
+        let mut index = 0;
+        while index < self.pending_scanout_render_completions.len() {
+            let is_ready = {
+                let pending = &self.pending_scanout_render_completions[index];
+                let mut fds = [PollFd::new(pending.fd.as_fd(), PollFlags::POLLIN)];
+                match poll(&mut fds, PollTimeout::ZERO) {
+                    Ok(0) => false,
+                    Ok(_) => fds[0].revents().is_some_and(|events| {
+                        events
+                            .intersects(PollFlags::POLLIN | PollFlags::POLLERR | PollFlags::POLLHUP)
+                    }),
+                    Err(err) => {
+                        log::warn!("scanout render completion poll failed: {err}");
+                        true
+                    }
+                }
+            };
+            if !is_ready {
+                index += 1;
+                continue;
+            }
+            let pending = self
+                .pending_scanout_render_completions
+                .remove(index)
+                .expect("scanout render completion index was in range");
+            if let Err(err) = self
+                .scanout_render_completion_epfd
+                .unregister(pending.fd.as_fd())
+            {
+                log::warn!("scanout render completion unregister failed: {err}");
+            }
+            ready.push(ReadyScanoutRenderCompletion {
+                job_id: pending.job_id,
+                output_key: pending.output_key,
+                bo_idx: pending.bo_idx,
+                fd: pending.fd,
+            });
+        }
+        ready
+    }
+
+    fn clear_scanout_render_completions(&mut self) {
+        while let Some(pending) = self.pending_scanout_render_completions.pop_front() {
+            if let Err(err) = self
+                .scanout_render_completion_epfd
+                .unregister(pending.fd.as_fd())
+            {
+                log::warn!("scanout render completion teardown unregister failed: {err}");
+            }
+        }
+    }
+
+    fn cancel_scanout_render_completions_for_output(&mut self, output_key: &OutputKey) {
+        let mut index = 0;
+        while index < self.pending_scanout_render_completions.len() {
+            if self.pending_scanout_render_completions[index].output_key != *output_key {
+                index += 1;
+                continue;
+            }
+            let pending = self
+                .pending_scanout_render_completions
+                .remove(index)
+                .expect("scanout completion cancellation index was in range");
+            if let Err(err) = self
+                .scanout_render_completion_epfd
+                .unregister(pending.fd.as_fd())
+            {
+                log::warn!("scanout render completion cancellation failed: {err}");
+            }
+        }
     }
 
     fn drm_device_index_for_fd(&self, drm_fd: RawFd) -> Option<usize> {
@@ -2689,7 +2896,7 @@ impl PlatformBackend {
     pub(crate) fn acquire_scanout_bo(&mut self, output_idx: usize) -> Option<ScanoutBoToken> {
         let pool = self.scanout_pools.get_mut(output_idx)?.as_mut()?;
         let gens = self.bo_generations.get(output_idx)?;
-        for (bo_idx, bo) in pool.bos.iter().enumerate() {
+        for (bo_idx, bo) in pool.display_pool().bos.iter().enumerate() {
             if bo.state.phase == BoPhase::Free {
                 let entry = gens.get(bo_idx).copied().unwrap_or_default();
                 return Some(ScanoutBoToken {
@@ -2705,6 +2912,83 @@ impl PlatformBackend {
             }
         }
         None
+    }
+
+    /// Run the B-side half of a copied frame and hand its completion directly
+    /// to KMS. A's completion fd has already become readable, but is imported
+    /// into B's Vulkan submission so the memory dependency remains explicit.
+    pub(crate) fn submit_copied_scanout(
+        &mut self,
+        output_idx: usize,
+        bo_idx: usize,
+        render_completion: OwnedFd,
+    ) -> io::Result<()> {
+        let output_key = self
+            .outputs
+            .get(output_idx)
+            .map(|output| output.key.clone())
+            .ok_or_else(|| io::Error::other("copied scanout output index out of range"))?;
+        let device = self
+            .device_for_output(&output_key)
+            .map(|device| Rc::clone(&device.device))
+            .ok_or_else(|| io::Error::other("copied scanout KMS device disappeared"))?;
+        let output = &self.outputs[output_idx].output;
+        let copied = self
+            .scanout_pools
+            .get_mut(output_idx)
+            .and_then(Option::as_mut)
+            .and_then(OutputScanout::copied_mut)
+            .ok_or_else(|| io::Error::other("render completion targeted non-copied output"))?;
+        let framebuffer = copied
+            .destinations
+            .bos
+            .get(bo_idx)
+            .ok_or_else(|| io::Error::other("copied destination index out of range"))?
+            .fb_handle
+            .ok_or_else(|| io::Error::other("copied destination has no framebuffer"))?;
+
+        let copy_completion = match copied.submit_copy(bo_idx, render_completion) {
+            Ok(fd) => fd,
+            Err(err) => {
+                copied.recover_copy_failure(bo_idx);
+                return Err(err);
+            }
+        };
+        let destination = copied
+            .destinations
+            .bos
+            .get_mut(bo_idx)
+            .expect("copied destination was checked before copy submission");
+        let in_fence_fd = copy_completion.into_raw_fd();
+        destination.state.transition_to_submitted(in_fence_fd);
+        let mut out_fence_fd = -1;
+        match crate::drm::page_flip::submit_flip_with_fences(
+            &device,
+            output,
+            framebuffer,
+            in_fence_fd,
+            &mut out_fence_fd,
+        ) {
+            Ok(()) => {
+                if let Some(fd) = destination.state.transition_to_pending(out_fence_fd) {
+                    drop(unsafe { OwnedFd::from_raw_fd(fd) });
+                }
+                Ok(())
+            }
+            Err(err) => {
+                if let Some(fd) = destination
+                    .state
+                    .transition_to_recording_after_atomic_reject()
+                {
+                    drop(unsafe { OwnedFd::from_raw_fd(fd) });
+                }
+                if out_fence_fd >= 0 {
+                    drop(unsafe { OwnedFd::from_raw_fd(out_fence_fd) });
+                }
+                copied.recover_copy_failure(bo_idx);
+                Err(err)
+            }
+        }
     }
 
     /// Mark a BO's content tracking as invalidated. Called by
@@ -2730,7 +3014,7 @@ impl PlatformBackend {
             .scanout_pools
             .get_mut(output_idx)
             .and_then(Option::as_mut)
-            .and_then(|pool| pool.bos.get_mut(bo_idx))
+            .and_then(|pool| pool.display_pool_mut().bos.get_mut(bo_idx))
         else {
             return;
         };
@@ -2755,6 +3039,7 @@ impl PlatformBackend {
     /// generation. Safe to call while still master (no DRM ioctl here —
     /// only Vulkan idle + fence-fd close).
     pub(crate) fn reset_scanout_bos_for_suspend(&mut self) {
+        self.clear_scanout_render_completions();
         let Some(vk) = self.vk.clone() else {
             return;
         };
@@ -2787,12 +3072,12 @@ impl PlatformBackend {
         };
         let device = self
             .device_for_output(output_key)
+            .map(|device| Rc::clone(&device.device))
             .ok_or_else(|| io::Error::other(format!("no DRM device for output {output_key:?}")))?;
+        self.cancel_scanout_render_completions_for_output(output_key);
 
         // DRM disable (ALLOW_MODESET atomic commit zeroing the CRTC).
-        if let Err(e) =
-            crate::drm::modeset::disable_output(&device.device, &self.outputs[idx].output)
-        {
+        if let Err(e) = crate::drm::modeset::disable_output(&device, &self.outputs[idx].output) {
             log::error!("render disable_connector: disable_output({connector}) failed: {e}");
             return Err(e);
         }
@@ -2867,8 +3152,14 @@ impl PlatformBackend {
             })
             .ok_or_else(|| io::Error::other("no DRM device backs the Vulkan renderer"))?;
         let scanout_route = ScanoutRoute::new(render_device_key, output_key.device_key);
-        let device = self
+        let (scanout_device, sink_render_node_key) = self
             .device_for_output(output_key)
+            .map(|device| {
+                (
+                    Rc::clone(&device.device),
+                    device.render_node.as_ref().map(|node| node.key()),
+                )
+            })
             .ok_or_else(|| io::Error::other(format!("no DRM device for output {output_key:?}")))?;
 
         // Resolve ModeSpec → the DRM mode on the output.
@@ -2922,8 +3213,7 @@ impl PlatformBackend {
             // are not DRM object identity (e.g. Xorg `HDMI-1` versus
             // drm-rs `HDMI-A-1`).
             use ::drm::control::Device as ControlDevice;
-            let connector_info = device
-                .device
+            let connector_info = scanout_device
                 .get_connector(output.connector, false)
                 .map_err(|e| {
                     io::Error::new(
@@ -2974,7 +3264,7 @@ impl PlatformBackend {
         // atomic TEST_ONLY validation. The actual pool is independently
         // validated before its state-changing commit. `None` means the
         // existing pool remains installed; `Some` is a committed replacement.
-        let new_pool = if needs_pool_realloc {
+        let new_pool: Option<OutputScanout> = if needs_pool_realloc {
             let vk = self.vk.as_ref().cloned().ok_or_else(|| {
                 io::Error::other(format!(
                     "enable_connector {connector}: allocating a scanout pool requires Vulkan"
@@ -2987,7 +3277,7 @@ impl PlatformBackend {
                     let setup = match probe_scanout_setup(
                         render_device_key,
                         render_node_key,
-                        Rc::clone(&device.device),
+                        Rc::clone(&scanout_device),
                         &output,
                         scanout_route,
                         ownership,
@@ -3015,7 +3305,7 @@ impl PlatformBackend {
                 let allocation = match probed_setup {
                     Some(setup) => setup.allocate_pool(
                         Arc::clone(&vk),
-                        Rc::clone(&device.device),
+                        Rc::clone(&scanout_device),
                         scanout_route,
                         w,
                         h,
@@ -3023,7 +3313,7 @@ impl PlatformBackend {
                     None => allocate_scanout_pool(
                         ownership,
                         Arc::clone(&vk),
-                        Rc::clone(&device.device),
+                        Rc::clone(&scanout_device),
                         scanout_route,
                         w,
                         h,
@@ -3042,7 +3332,7 @@ impl PlatformBackend {
                     }
                 };
                 if scanout_route.is_cross_device()
-                    && let Err(err) = test_scanout_pool(&device.device, &output, &pool)
+                    && let Err(err) = test_scanout_pool(&scanout_device, &output, &pool)
                 {
                     log::warn!(
                         "v2 enable_connector: {ownership:?}-owned real-pool TEST_ONLY for \
@@ -3060,14 +3350,14 @@ impl PlatformBackend {
                     failures.push(format!("{ownership:?}-owned pool has no framebuffer"));
                     continue;
                 };
-                match crate::drm::modeset::commit_modeset(&device.device, &output, framebuffer) {
+                match crate::drm::modeset::commit_modeset(&scanout_device, &output, framebuffer) {
                     Ok(()) => {
                         pool.bos[initial_bo].state.phase = BoPhase::OnScreen;
                         log::info!(
                             "v2 enable_connector: selected {ownership:?}-owned scanout for \
                              {connector} {w}x{h}"
                         );
-                        selected = Some(pool);
+                        selected = Some(OutputScanout::Shared(pool));
                         break;
                     }
                     Err(err) => {
@@ -3079,9 +3369,84 @@ impl PlatformBackend {
                     }
                 }
             }
+            if selected.is_none() && scanout_route.is_cross_device() {
+                match probe_copied_scanout_setup(
+                    render_device_key,
+                    render_node_key,
+                    output_key.device_key,
+                    sink_render_node_key,
+                    Rc::clone(&scanout_device),
+                    &output,
+                    scanout_route,
+                    w,
+                    h,
+                ) {
+                    Ok(()) => {
+                        log::info!(
+                            "v2 enable_connector: copied scanout probe for {connector} {w}x{h} succeeded"
+                        );
+                        let sink_vk = self.copy_vk_for_device(output_key.device_key)?;
+                        match CopiedScanoutPool::allocate(
+                            Arc::clone(&vk),
+                            sink_vk,
+                            Rc::clone(&scanout_device),
+                            scanout_route,
+                            u32::from(w),
+                            u32::from(h),
+                            SCANOUT_POOL_DEPTH,
+                            &output.scanout_modifiers,
+                        ) {
+                            Ok(mut copied) => {
+                                if let Err(err) = test_scanout_pool(
+                                    &scanout_device,
+                                    &output,
+                                    &copied.destinations,
+                                ) {
+                                    failures.push(format!("copied real-pool TEST_ONLY: {err}"));
+                                } else if let Some((initial_bo, framebuffer)) = copied
+                                    .destinations
+                                    .bos
+                                    .iter()
+                                    .enumerate()
+                                    .find_map(|(index, bo)| bo.fb_handle.map(|fb| (index, fb)))
+                                {
+                                    match crate::drm::modeset::commit_modeset(
+                                        &scanout_device,
+                                        &output,
+                                        framebuffer,
+                                    ) {
+                                        Ok(()) => {
+                                            copied.destinations.bos[initial_bo].state.phase =
+                                                BoPhase::OnScreen;
+                                            log::info!(
+                                                "v2 enable_connector: selected copied scanout for \
+                                                 {connector} {w}x{h}"
+                                            );
+                                            selected = Some(OutputScanout::Copied(copied));
+                                        }
+                                        Err(err) => failures.push(format!("copied modeset: {err}")),
+                                    }
+                                } else {
+                                    failures.push(
+                                        "copied destination pool has no framebuffer".to_string(),
+                                    );
+                                }
+                            }
+                            Err(err) => failures.push(format!("copied allocation: {err}")),
+                        }
+                    }
+                    Err(err) => {
+                        log::warn!(
+                            "v2 enable_connector: copied scanout probe for \
+                             {connector} {w}x{h} failed: {err}"
+                        );
+                        failures.push(format!("copied probe: {err}"));
+                    }
+                }
+            }
             Some(selected.ok_or_else(|| {
                 io::Error::other(format!(
-                    "enable_connector {connector}: every scanout ownership failed: {}",
+                    "enable_connector {connector}: every scanout mechanism failed: {}",
                     failures.join("; ")
                 ))
             })?)
@@ -3094,11 +3459,12 @@ impl PlatformBackend {
         // first BO from the replacement pool selected above.
         let fb_id = {
             let pool_ref: Option<&ScanoutBoPool> = if needs_pool_realloc {
-                new_pool.as_ref()
+                new_pool.as_ref().map(OutputScanout::display_pool)
             } else {
                 existing_idx
                     .and_then(|i| self.scanout_pools.get(i))
                     .and_then(|p| p.as_ref())
+                    .map(OutputScanout::display_pool)
             };
             pool_ref.and_then(|pool| {
                 use crate::kms::vk::scanout::BoPhase;
@@ -3120,7 +3486,7 @@ impl PlatformBackend {
         // ownership above. Existing pools still need the ordinary modeset.
         if !modeset_committed
             && let Err(e) =
-                crate::drm::modeset::commit_modeset(&device.device, &output, fb_for_commit)
+                crate::drm::modeset::commit_modeset(&scanout_device, &output, fb_for_commit)
         {
             log::error!(
                 "render enable_connector: commit_modeset for {connector} ({}×{}@{}) at ({x},{y}) failed: {e}",
@@ -3150,7 +3516,7 @@ impl PlatformBackend {
                         .scanout_pools
                         .get(idx)
                         .and_then(|p| p.as_ref())
-                        .map(|p| vec![BoGenerationEntry::default(); p.bos.len()])
+                        .map(|p| vec![BoGenerationEntry::default(); p.display_pool().bos.len()])
                         .unwrap_or_default();
                 }
             }
@@ -3168,7 +3534,7 @@ impl PlatformBackend {
                 x,
                 y,
             ));
-            let gens = vec![BoGenerationEntry::default(); pool.bos.len()];
+            let gens = vec![BoGenerationEntry::default(); pool.display_pool().bos.len()];
             self.scanout_pools.push(Some(pool));
             self.bo_generations.push(gens);
             self.first_pageflip_logged.push(false);
@@ -3226,11 +3592,12 @@ impl PlatformBackend {
         output_idx: usize,
     ) -> Option<PageFlipRetirement> {
         let pool = self.scanout_pools.get_mut(output_idx)?.as_mut()?;
+        let display_pool = pool.display_pool_mut();
         // First pass: find any BO currently `Pending`. Walk only
         // — don't mutate during the search.
         let mut pending: Option<usize> = None;
         let mut on_screen: Option<usize> = None;
-        for (i, bo) in pool.bos.iter().enumerate() {
+        for (i, bo) in display_pool.bos.iter().enumerate() {
             match bo.state.phase {
                 BoPhase::Pending => {
                     if let Some(prev) = pending {
@@ -3256,8 +3623,10 @@ impl PlatformBackend {
         //   - the previously Pending bo goes OnScreen
         // Doing it in this order matches v1's compositor.
         let retired = if let Some(prev) = on_screen {
-            pool.bos[prev].state.transition_to_retiring();
-            let released = pool.bos[prev].state.transition_to_free_after_retire();
+            display_pool.bos[prev].state.transition_to_retiring();
+            let released = display_pool.bos[prev]
+                .state
+                .transition_to_free_after_retire();
             if let Some(fd) = released {
                 // SAFETY: the release fence fd was owned by us;
                 // close it now that the BO is free.
@@ -3267,7 +3636,10 @@ impl PlatformBackend {
         } else {
             None
         };
-        pool.bos[presented].state.transition_to_on_screen();
+        display_pool.bos[presented].state.transition_to_on_screen();
+        if let Some(copied) = pool.copied_mut() {
+            copied.release_completed_source(presented);
+        }
 
         let logged_first = self
             .first_pageflip_logged
@@ -3337,6 +3709,7 @@ impl PlatformBackend {
     /// subsequent outputs still attempted.
     pub(crate) fn disable_output(&mut self) -> io::Result<()> {
         self.shutting_down = true;
+        self.clear_scanout_render_completions();
 
         // Best-effort: drain all in-flight GPU work before
         // pulling the modeset.
@@ -3373,9 +3746,7 @@ impl PlatformBackend {
                 // doesn't try to destroy framebuffers KMS may
                 // still hold (matches v1's behaviour).
                 if let Some(pool) = self.scanout_pools.get_mut(i).and_then(|p| p.as_mut()) {
-                    for bo in &mut pool.bos {
-                        bo.disarm();
-                    }
+                    pool.disarm();
                 }
                 if first_err.is_none() {
                     first_err = Some(e);
@@ -3421,6 +3792,7 @@ impl PlatformBackend {
                     .and_then(|p| p.as_ref())
                     .and_then(|pool| {
                         use crate::kms::vk::scanout::BoPhase;
+                        let pool = pool.display_pool();
                         pool.bos
                             .iter()
                             .find(|bo| bo.state.phase == BoPhase::OnScreen)
@@ -3556,6 +3928,8 @@ impl PlatformBackend {
         rescan.dropped_keys.dedup();
         rescan.dropped_old_indices.sort_unstable_by(|a, b| b.cmp(a));
         for idx in rescan.dropped_old_indices.iter().copied() {
+            let output_key = self.outputs[idx].key.clone();
+            self.cancel_scanout_render_completions_for_output(&output_key);
             self.outputs.remove(idx);
             if idx < self.scanout_pools.len() {
                 self.scanout_pools.remove(idx);
@@ -4200,6 +4574,44 @@ mod tests {
             raw1, raw2,
             "the inner epfd is stable across poll_fds() calls"
         );
+    }
+
+    #[test]
+    fn copied_scanout_completion_epfd_is_stable() {
+        let p = PlatformBackend::for_tests();
+        let kind = yserver_core::backend::BackendFdKind::ScanoutRenderCompletion;
+        let raw1 = p
+            .poll_fds()
+            .iter()
+            .find(|(_, candidate)| *candidate == kind)
+            .expect("copied scanout completion fd")
+            .0;
+        let raw2 = p
+            .poll_fds()
+            .iter()
+            .find(|(_, candidate)| *candidate == kind)
+            .expect("stable copied scanout completion fd")
+            .0;
+        assert_eq!(raw1, raw2);
+    }
+
+    #[test]
+    fn copied_scanout_completion_jobs_keep_stable_identity() {
+        use std::{io::Write, os::unix::net::UnixStream};
+
+        let mut platform = PlatformBackend::for_tests();
+        let output_key = platform.outputs[0].key.clone();
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        let job_id = platform
+            .register_scanout_render_completion(output_key.clone(), 2, reader.into())
+            .unwrap();
+        assert!(platform.drain_scanout_render_completions().is_empty());
+        writer.write_all(&[1]).unwrap();
+        let ready = platform.drain_scanout_render_completions();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].job_id, job_id);
+        assert_eq!(ready[0].output_key, output_key);
+        assert_eq!(ready[0].bo_idx, 2);
     }
 
     #[test]

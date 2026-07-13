@@ -319,6 +319,27 @@ Cross-cutting bugs and followups that don't fit a stage live in
   is rejected so an established route cannot silently outlive its RANDR
   policy. Arbitrary render-provider selection, render offload, provider
   properties, and automatic output layout remain unimplemented.
+- **2026-07-14 copied reverse-PRIME compatibility path**: cross-device output
+  enable now appends a third, copying mechanism after both copy-free ownership
+  directions fail. GPU A renders into its own exportable source ring; a stable
+  backend completion poller reports the source `sync_file` to the main loop,
+  which submits a semaphore-waiting full-image copy on a minimal Vulkan
+  transfer context for GPU B. B's copy-completion fence is handed directly to
+  KMS as `IN_FENCE_FD`, so the successful path needs no second userspace wait.
+  B scans from an independent local framebuffer ring, removing the requirement
+  that one allocation be simultaneously renderable by A and scannable by B.
+  The copied candidate uses disposable A/B logical devices to validate every
+  slot's export/import, real GPU copy, and atomic `TEST_ONLY` modeset before a
+  live pool is installed. Per-frame state distinguishes waiting-for-A from
+  flip-pending; stale job ids, B-copy/atomic failures, connector removal, VT
+  reset, and shutdown all retain, recover, or cancel the associated resources.
+  The initial policy always renders and copies the full output. CPU staging is
+  not included: B must still import A's DMA-BUF as a transfer source. Design
+  and implementation plan are in
+  `docs/superpowers/{specs,plans}/2026-07-14-reverse-prime-copy*.md`.
+  Validation: completion-fd core-loop/platform regressions, `cargo test
+  --workspace --all-targets --locked`, CI-style clippy, and nightly rustfmt;
+  forced-route dual-GPU hardware validation remains pending.
 - **2026-07-11 ordered multi-device override**: `YSERVER_DRM_DEVICES` now
   accepts a colon-separated, primary-first list such as
   `/dev/dri/card1:/dev/dri/card0`. This lets deployments select the Vulkan

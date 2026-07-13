@@ -1902,7 +1902,7 @@ impl KmsBackend {
                 ))
             })?;
             let n = pool.bos.len();
-            scanout_pools.push(Some(pool));
+            scanout_pools.push(Some(crate::kms::vk::scanout::OutputScanout::Shared(pool)));
             bo_generations.push(vec![
                 crate::kms::render::platform::BoGenerationEntry::default(
                 );
@@ -9515,6 +9515,7 @@ fn select_scanout_bo_for_rect(
         else {
             continue;
         };
+        let pool = pool.display_pool();
         for phase in phases {
             if let Some(bo_idx) = pool.bos.iter().position(|bo| bo.state.phase == *phase) {
                 let local = vk::Rect2D {
@@ -9628,13 +9629,30 @@ fn read_scanout_region(
     else {
         return Err(io::Error::other("scanout pool vanished"));
     };
-    let Some(bo) = pool.bos.get(bo_idx) else {
-        return Err(io::Error::other("scanout bo vanished"));
+    let (image, staging_buffer, staging_mapped, staging_size) = match pool {
+        crate::kms::vk::scanout::OutputScanout::Shared(pool) => {
+            let Some(bo) = pool.bos.get(bo_idx) else {
+                return Err(io::Error::other("scanout bo vanished"));
+            };
+            (
+                bo.vk_image,
+                bo.vk_transfer.staging_buffer,
+                bo.vk_transfer.staging_mapped,
+                bo.vk_transfer.staging_size,
+            )
+        }
+        crate::kms::vk::scanout::OutputScanout::Copied(pool) => {
+            let Some(source) = pool.sources.get(bo_idx) else {
+                return Err(io::Error::other("copied scanout source vanished"));
+            };
+            (
+                source.image(),
+                source.transfer.staging_buffer,
+                source.transfer.staging_mapped,
+                source.transfer.staging_size,
+            )
+        }
     };
-    let image = bo.vk_image;
-    let staging_buffer = bo.vk_transfer.staging_buffer;
-    let staging_mapped = bo.vk_transfer.staging_mapped;
-    let staging_size = bo.vk_transfer.staging_size;
     let copy_width = local_rect.extent.width;
     let copy_height = local_rect.extent.height;
     let needed_bytes = usize::try_from(copy_width)
@@ -11176,6 +11194,25 @@ impl Backend for KmsBackend {
         }
     }
 
+    fn on_scanout_render_completion(&mut self, _state: &mut ServerState) {
+        let completions = self.platform.drain_scanout_render_completions();
+        if !self.scanout_allowed() {
+            log::debug!(
+                "render copied scanout: discarded {} completion(s) while scanout is inactive",
+                completions.len(),
+            );
+            return;
+        }
+        for completion in completions {
+            if !self
+                .scene
+                .handle_scanout_render_completion(completion, &mut self.platform)
+            {
+                self.telemetry.record_missed_pageflip();
+            }
+        }
+    }
+
     fn before_block(&mut self) {
         // BlockHandler analog (cf. Xorg glamor_block_handler → glamor_flush):
         // every dispatch-loop iteration, just before the core loop blocks,
@@ -11349,7 +11386,7 @@ impl Backend for KmsBackend {
             // Phase A Task 4: flush the SubmitGroup so scene.tick
             // observes all paint CBs already submitted to the queue.
             // Compose stays on its own dedicated `vkQueueSubmit2`
-            // (record_compose) — only the buffered paint group is
+            // (submit_shared_scanout_frame) — only the buffered paint group is
             // flushed here. Drive through the engine wrapper so
             // parked `pending_group_ops` commit too.
             if let Err(e) = self.engine.flush_submit_group(

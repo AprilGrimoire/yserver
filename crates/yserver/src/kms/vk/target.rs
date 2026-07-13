@@ -277,6 +277,38 @@ impl DrawableImage {
         plane_offsets: &[u64],
         plane_pitches: &[u32],
     ) -> Result<Self, DrawableImageError> {
+        Self::from_dmabuf_with_usage(
+            vk,
+            dma_buf_fd,
+            width,
+            height,
+            format,
+            modifier,
+            plane_offsets,
+            plane_pitches,
+            vk::ImageUsageFlags::SAMPLED
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::TRANSFER_DST
+                | vk::ImageUsageFlags::COLOR_ATTACHMENT,
+        )
+    }
+
+    /// Import a DMA-BUF with an exact Vulkan usage contract. Copied scanout
+    /// uses this narrower entry point so the sink GPU only has to accept the
+    /// foreign source as `TRANSFER_SRC`, rather than also accepting irrelevant
+    /// color-attachment and destination usages.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_dmabuf_with_usage(
+        vk: Arc<VkContext>,
+        dma_buf_fd: std::os::fd::OwnedFd,
+        width: u32,
+        height: u32,
+        format: vk::Format,
+        modifier: u64,
+        plane_offsets: &[u64],
+        plane_pitches: &[u32],
+        usage: vk::ImageUsageFlags,
+    ) -> Result<Self, DrawableImageError> {
         use std::os::fd::IntoRawFd as _;
         if plane_offsets.len() != plane_pitches.len() {
             return Err(DrawableImageError::Vk(
@@ -344,12 +376,7 @@ impl DrawableImage {
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(tiling)
-            .usage(
-                vk::ImageUsageFlags::SAMPLED
-                    | vk::ImageUsageFlags::TRANSFER_SRC
-                    | vk::ImageUsageFlags::TRANSFER_DST
-                    | vk::ImageUsageFlags::COLOR_ATTACHMENT,
-            )
+            .usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED)
             .push_next(&mut external_info);
