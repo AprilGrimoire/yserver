@@ -18,6 +18,7 @@ pub mod copy;
 pub mod fill;
 pub mod image;
 pub mod render;
+pub mod scanout_logic_fill;
 pub mod text;
 pub mod traps;
 

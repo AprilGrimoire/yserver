@@ -161,6 +161,39 @@ pub(crate) const DEFAULT_ARROW_H: u16 = 16;
 pub(crate) const DEFAULT_ARROW_HOT_X: u16 = 8;
 pub(crate) const DEFAULT_ARROW_HOT_Y: u16 = 8;
 
+/// Unpack an X11 wire depth-1 bitmap (as produced by the render
+/// engine's `pack_from_storage` / returned by `get_image` at depth 1)
+/// into a tight `width × height` R8 buffer — one byte per pixel,
+/// `0xFF` where the bit is set, `0x00` otherwise.
+///
+/// Wire layout: 1 bit per pixel, LSBFirst within each byte (bit 0 =
+/// leftmost pixel of its 8-pixel group), each scanline padded to a
+/// 32-bit boundary (`⌈width/32⌉·4` bytes). This is the inverse of
+/// `pack_from_storage`'s depth-1 branch. `rasterise_create_cursor`
+/// consumes the R8 form, so `CreateCursor`'s source/mask pixmaps must
+/// be unpacked before rasterising (see `read_cursor_depth1_pixmap`).
+///
+/// A short `packed` (fewer bytes than the padded layout implies) is
+/// tolerated: missing bytes read as zero, matching `get_image`
+/// clamping a read to storage bounds.
+pub(crate) fn unpack_wire_bitmap_to_r8(packed: &[u8], width: u16, height: u16) -> Vec<u8> {
+    let w = usize::from(width);
+    let h = usize::from(height);
+    let row_stride = w.div_ceil(32) * 4;
+    let mut out = vec![0u8; w * h];
+    for row in 0..h {
+        let src_row = row * row_stride;
+        let dst_row = row * w;
+        for col in 0..w {
+            let byte = packed.get(src_row + (col >> 3)).copied().unwrap_or(0);
+            if byte & (1 << (col & 7)) != 0 {
+                out[dst_row + col] = 0xFF;
+            }
+        }
+    }
+    out
+}
+
 /// Rasterise an X11 `CreateCursor` (`source`, `mask`, `fore`, `back`)
 /// tuple into BGRA. Both sources are depth-1 R8-mirrored — a non-zero
 /// byte means the bit is set. Output uses straight alpha (0xFF for
@@ -474,5 +507,78 @@ mod tests {
         assert_eq!(&img.bgra_bytes[4..8], &[0, 0, 0, 0]);
         // Pixel (1,1) — src set → red.
         assert_eq!(&img.bgra_bytes[12..16], &[0x00, 0x00, 0xFF, 0xFF]);
+    }
+
+    /// `unpack_wire_bitmap_to_r8` reverses `pack_from_storage`'s
+    /// depth-1 layout: LSBFirst bits, rows padded to 32 bits. A width
+    /// that isn't a multiple of 8 exercises the partial-byte tail and
+    /// the row-stride padding — the case that flattened `import`'s
+    /// 17-wide crosshair.
+    #[test]
+    fn unpack_wire_bitmap_lsbfirst_padded_rows() {
+        // 17×2. Row stride = ⌈17/32⌉·4 = 4 bytes. Set cols 0, 7, 8, 16
+        // of row 0 and col 3 of row 1.
+        // Row 0: byte0 bits 0,7 = 0x81; byte1 bit 0 (col 8) = 0x01;
+        //        byte2 bit 0 (col 16) = 0x01; byte3 pad = 0x00.
+        // Row 1: byte0 bit 3 (col 3) = 0x08; rest 0.
+        let packed = [0x81, 0x01, 0x01, 0x00, 0x08, 0x00, 0x00, 0x00];
+        let r8 = unpack_wire_bitmap_to_r8(&packed, 17, 2);
+        assert_eq!(r8.len(), 34, "tight w*h R8, no padding");
+        let set: Vec<usize> = r8
+            .iter()
+            .enumerate()
+            .filter(|&(_, &b)| b != 0)
+            .map(|(i, _)| i)
+            .collect();
+        // Row 0 pixels 0,7,8,16 → indices 0,7,8,16; row 1 pixel 3 → 17+3=20.
+        assert_eq!(set, vec![0, 7, 8, 16, 20]);
+        assert!(r8.iter().all(|&b| b == 0 || b == 0xFF));
+    }
+
+    /// End-to-end regression for #90's flattened cursor: the exact
+    /// ImageMagick `import` crosshair bitmap (17×17, from
+    /// `XMakeCursor`'s `scope_bits`/`scope_mask_bits`) must round-trip
+    /// through the wire-bitmap unpack + `rasterise_create_cursor` into
+    /// a 17-row-tall "+" — NOT a top sliver. Feeding the packed wire
+    /// bytes straight into `rasterise_create_cursor` (the old bug)
+    /// left every pixel from row 4 down transparent.
+    #[test]
+    fn import_scope_crosshair_is_full_height_not_flattened() {
+        // Verbatim from ImageMagick MagickCore/xwindow.c XMakeCursor.
+        // LSBFirst, 3 bytes/row in the client image; the wire pads each
+        // row to 4 bytes, so re-pad here to match get_image output.
+        const CLIENT: [u8; 51] = [
+            0x80, 0x03, 0x00, 0x80, 0x02, 0x00, 0x80, 0x02, 0x00, 0x80, 0x02, 0x00, 0x80, 0x02,
+            0x00, 0x80, 0x02, 0x00, 0x80, 0x02, 0x00, 0x7f, 0xfc, 0x01, 0x01, 0x00, 0x01, 0x7f,
+            0xfc, 0x01, 0x80, 0x02, 0x00, 0x80, 0x02, 0x00, 0x80, 0x02, 0x00, 0x80, 0x02, 0x00,
+            0x80, 0x02, 0x00, 0x80, 0x02, 0x00, 0x80, 0x03, 0x00,
+        ];
+        // Re-pad 3-byte client rows to the 4-byte wire/get_image stride.
+        let mut wire = vec![0u8; 4 * 17];
+        for row in 0..17 {
+            wire[row * 4..row * 4 + 3].copy_from_slice(&CLIENT[row * 3..row * 3 + 3]);
+        }
+        let src = unpack_wire_bitmap_to_r8(&wire, 17, 17);
+        assert_eq!(src.len(), 17 * 17);
+        // No mask → source doubles as visibility.
+        let bgra = rasterise_create_cursor(
+            &src,
+            17,
+            17,
+            None,
+            (0xFFFF, 0xFFFF, 0xFFFF), // white fore
+            (0, 0, 0),                // black back
+        );
+        let opaque = |x: usize, y: usize| bgra[(y * 17 + x) * 4 + 3] != 0;
+        // The vertical bar runs down column 8 (0x80 in byte0 = bit 7,
+        // 0x02 in byte1 = bit 9... center col ~8) across every row —
+        // the bottom half MUST be present, which the flattened bug lost.
+        let bottom_rows_lit = (9..17).filter(|&y| (0..17).any(|x| opaque(x, y))).count();
+        assert_eq!(
+            bottom_rows_lit, 8,
+            "all 8 bottom rows of the crosshair must render (not flattened)"
+        );
+        // Sanity: top rows are lit too, so it's a full-height "+".
+        assert!((0..8).all(|y| (0..17).any(|x| opaque(x, y))));
     }
 }

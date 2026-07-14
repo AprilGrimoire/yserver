@@ -158,8 +158,41 @@ pub(crate) fn rasterize_pixmap_mask_to_rects(
     out
 }
 
-/// Append 1×1 rects covering a Bresenham line from (x0,y0) to (x1,y1).
+/// Append rects covering a thin line from (x0,y0) to (x1,y1). Axis-aligned
+/// (horizontal / vertical) segments emit a single span rect; diagonals emit
+/// one 1×1 rect per Bresenham pixel. Pixel coverage matches a per-pixel walk.
 pub(crate) fn bresenham_segment(x0: i32, y0: i32, x1: i32, y1: i32, out: &mut Vec<Rectangle16>) {
+    // Axis-aligned fast path: a horizontal or vertical thin line is ONE span,
+    // not N per-pixel 1×1 rects. This is the overwhelmingly common case
+    // (rectangle edges, borders, grids) and matches Xorg's fb layer, which
+    // fills H/V lines as a single span. Pixel coverage is identical to the
+    // per-pixel loop below; only the rect count shrinks. Emitting per-pixel
+    // here previously exploded rectangle outlines into thousands of rects
+    // (e.g. blew the root-overlay rect cap, making wide XOR rubber-bands
+    // vanish) and cost one GPU draw per pixel.
+    let clamp16 = |v: i32| v.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+    if y0 == y1 {
+        let (xa, xb) = (x0.min(x1), x0.max(x1));
+        let w = u16::try_from(xb - xa + 1).unwrap_or(u16::MAX);
+        out.push(Rectangle16 {
+            x: clamp16(xa),
+            y: clamp16(y0),
+            width: w,
+            height: 1,
+        });
+        return;
+    }
+    if x0 == x1 {
+        let (ya, yb) = (y0.min(y1), y0.max(y1));
+        let h = u16::try_from(yb - ya + 1).unwrap_or(u16::MAX);
+        out.push(Rectangle16 {
+            x: clamp16(x0),
+            y: clamp16(ya),
+            width: 1,
+            height: h,
+        });
+        return;
+    }
     let dx = (x1 - x0).abs();
     let dy = -(y1 - y0).abs();
     let sx = if x0 < x1 { 1 } else { -1 };

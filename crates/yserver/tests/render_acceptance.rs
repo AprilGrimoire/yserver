@@ -8132,3 +8132,100 @@ fn masked_copyarea_mask_written_same_frame() {
         }
     }
 }
+
+/// #90 follow-up regression: `create_cursor` (XCreatePixmapCursor)
+/// must round-trip a depth-1 source/mask pixmap through `get_image`
+/// into a full-height cursor sprite — NOT a flattened top sliver.
+///
+/// `get_image` at depth 1 returns the packed X11 wire bitmap
+/// (`⌈w/32⌉·4` bytes/row, LSBFirst); the rasteriser wants one byte
+/// per pixel. Before the fix `read_cursor_depth1_pixmap` handed the
+/// packed bytes straight to the rasteriser, so a 17-wide cursor
+/// collapsed into its first `⌈17/32⌉·4·17 ÷ 17` ≈ 4 rows. ImageMagick
+/// `import`'s crosshair (this exact 17×17 `scope` bitmap) showed as a
+/// horizontal sliver during the region-select pointer grab.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn create_cursor_depth1_source_is_full_height_not_flattened() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    // ImageMagick MagickCore/xwindow.c XMakeCursor scope_bits +
+    // scope_mask_bits, 17×17, LSBFirst, 3 bytes/row in the client
+    // image. The X11 wire pads each scanline to 4 bytes, which is what
+    // PutImage carries and what get_image returns. `import` passes both
+    // the source and the mask, and visibility follows the mask — so the
+    // mask suffers the same depth-1 unpack, and a flattened mask leaves
+    // the bottom of the crosshair invisible.
+    const SCOPE_CLIENT: [u8; 51] = [
+        0x80, 0x03, 0x00, 0x80, 0x02, 0x00, 0x80, 0x02, 0x00, 0x80, 0x02, 0x00, 0x80, 0x02, 0x00,
+        0x80, 0x02, 0x00, 0x80, 0x02, 0x00, 0x7f, 0xfc, 0x01, 0x01, 0x00, 0x01, 0x7f, 0xfc, 0x01,
+        0x80, 0x02, 0x00, 0x80, 0x02, 0x00, 0x80, 0x02, 0x00, 0x80, 0x02, 0x00, 0x80, 0x02, 0x00,
+        0x80, 0x02, 0x00, 0x80, 0x03, 0x00,
+    ];
+    const SCOPE_MASK_CLIENT: [u8; 51] = [
+        0xc0, 0x07, 0x00, 0xc0, 0x07, 0x00, 0xc0, 0x06, 0x00, 0xc0, 0x06, 0x00, 0xc0, 0x06, 0x00,
+        0xc0, 0x06, 0x00, 0xff, 0xfe, 0x01, 0x7f, 0xfc, 0x01, 0x03, 0x80, 0x01, 0x7f, 0xfc, 0x01,
+        0xff, 0xfe, 0x01, 0xc0, 0x06, 0x00, 0xc0, 0x06, 0x00, 0xc0, 0x06, 0x00, 0xc0, 0x06, 0x00,
+        0xc0, 0x07, 0x00, 0xc0, 0x07, 0x00,
+    ];
+    // Re-pad 3-byte client rows to the 4-byte wire stride.
+    let repad = |client: &[u8; 51]| {
+        let mut wire = vec![0u8; 4 * 17];
+        for row in 0..17 {
+            wire[row * 4..row * 4 + 3].copy_from_slice(&client[row * 3..row * 3 + 3]);
+        }
+        wire
+    };
+    let src_wire = repad(&SCOPE_CLIENT);
+    let mask_wire = repad(&SCOPE_MASK_CLIENT);
+
+    let src_pix = b
+        .create_pixmap(None, 1, 17, 17)
+        .expect("create_pixmap depth=1 17x17 src");
+    b.put_image(None, src_pix.as_raw(), 1, 17, 17, 0, 0, &src_wire)
+        .expect("put_image src depth=1");
+    let mask_pix = b
+        .create_pixmap(None, 1, 17, 17)
+        .expect("create_pixmap depth=1 17x17 mask");
+    b.put_image(None, mask_pix.as_raw(), 1, 17, 17, 0, 0, &mask_wire)
+        .expect("put_image mask depth=1");
+
+    let cursor = b
+        .create_cursor(
+            None,
+            src_pix,
+            Some(mask_pix),
+            (0xFFFF, 0xFFFF, 0xFFFF),
+            (0, 0, 0),
+            8,
+            8,
+        )
+        .expect("create_cursor");
+
+    let (w, h, bgra) = b
+        .cursor_record_bgra_for_tests(cursor.as_raw())
+        .expect("cursor record present");
+    assert_eq!((w, h), (17, 17), "cursor keeps its 17x17 dims");
+    assert_eq!(bgra.len(), 17 * 17 * 4);
+
+    let opaque = |x: usize, y: usize| bgra[(y * 17 + x) * 4 + 3] != 0;
+    // Every one of the 17 rows carries part of the crosshair, so every
+    // row must have at least one opaque pixel. The flattened bug left
+    // rows ~4..17 fully transparent.
+    for y in 0..17 {
+        assert!(
+            (0..17).any(|x| opaque(x, y)),
+            "row {y} of the crosshair is empty — cursor is flattened"
+        );
+    }
+    // Spot-check the vertical bar's extremes: top row and bottom row
+    // both light column 8 (the scope's centre stem).
+    assert!(opaque(8, 0), "top of vertical bar missing");
+    assert!(opaque(8, 16), "bottom of vertical bar missing");
+}

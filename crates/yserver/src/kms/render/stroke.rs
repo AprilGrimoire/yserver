@@ -176,15 +176,45 @@ pub fn stroke_path(
     if fast_path {
         let last_seg_idx = segments.len() - 1;
         for (i, &(p0, p1)) in segments.iter().enumerate() {
-            crate::kms::backend::bresenham_segment(p0.0, p0.1, p1.0, p1.1, &mut out.fg_rects);
-            // CapStyle::NotLast on the terminal endpoint of a
-            // Polyline: pop the final 1-px rect. Per X11 spec, only
-            // affects polylines; disjoint segments draw both ends.
-            if matches!(state.cap_style, CapStyle::NotLast)
+            // CapStyle::NotLast on the terminal endpoint of a Polyline drops
+            // the final pixel (per X11 spec; polylines only). `bresenham_segment`
+            // now coalesces axis-aligned segments into a single span, so a plain
+            // `pop()` would drop the whole terminal edge — instead, for an
+            // axis-aligned terminal segment, shorten its endpoint by one pixel.
+            // Diagonal segments are still emitted per-pixel, so for those we keep
+            // the exact "emit full, pop the last 1-px rect" behaviour.
+            let drop_terminal = matches!(state.cap_style, CapStyle::NotLast)
                 && shape == StrokeShape::Polyline
-                && i == last_seg_idx
-            {
-                out.fg_rects.pop();
+                && i == last_seg_idx;
+            if drop_terminal {
+                if p0 == p1 {
+                    // Terminal segment is a single point → NotLast drops it.
+                    continue;
+                }
+                if p0.0 == p1.0 || p0.1 == p1.1 {
+                    // Axis-aligned: shorten the endpoint one pixel toward p0.
+                    let sx = (p1.0 - p0.0).signum();
+                    let sy = (p1.1 - p0.1).signum();
+                    crate::kms::backend::bresenham_segment(
+                        p0.0,
+                        p0.1,
+                        p1.0 - sx,
+                        p1.1 - sy,
+                        &mut out.fg_rects,
+                    );
+                } else {
+                    // Diagonal: still per-pixel; pop exactly the terminal pixel.
+                    crate::kms::backend::bresenham_segment(
+                        p0.0,
+                        p0.1,
+                        p1.0,
+                        p1.1,
+                        &mut out.fg_rects,
+                    );
+                    out.fg_rects.pop();
+                }
+            } else {
+                crate::kms::backend::bresenham_segment(p0.0, p0.1, p1.0, p1.1, &mut out.fg_rects);
             }
         }
         return out;
@@ -734,6 +764,26 @@ mod tests {
             .map(|r| usize::from(r.width) * usize::from(r.height))
             .sum();
         assert_eq!(fc, nc + 1);
+    }
+
+    #[test]
+    fn axis_aligned_segments_coalesce_to_one_span() {
+        // Horizontal / vertical thin lines must emit ONE span, not N per-pixel
+        // rects (matches Xorg; keeps rectangle outlines cheap and under the
+        // root-overlay rect cap). Diagonals stay per-pixel.
+        let mut h = Vec::new();
+        crate::kms::backend::bresenham_segment(10, 5, 2000, 5, &mut h);
+        assert_eq!(h.len(), 1, "horizontal line is a single span, got {h:?}");
+        assert_eq!((h[0].x, h[0].y, h[0].width, h[0].height), (10, 5, 1991, 1));
+
+        let mut v = Vec::new();
+        crate::kms::backend::bresenham_segment(7, 100, 7, 8, &mut v);
+        assert_eq!(v.len(), 1, "vertical line is a single span, got {v:?}");
+        assert_eq!((v[0].x, v[0].y, v[0].width, v[0].height), (7, 8, 1, 93));
+
+        let mut d = Vec::new();
+        crate::kms::backend::bresenham_segment(0, 0, 3, 3, &mut d);
+        assert!(d.len() > 1, "diagonal stays per-pixel, got {d:?}");
     }
 
     #[test]

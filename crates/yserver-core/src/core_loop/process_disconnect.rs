@@ -420,6 +420,9 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
     for cursor_xid in removed.freed_cursors {
         let _ = backend.free_cursor(None, cursor_xid);
     }
+    // Drop any per-client transient backend state (e.g. the root-overlay
+    // contribution) so a crashed/killed client can't strand it.
+    backend.client_disconnected(client_id);
 }
 
 /// L2 plan B.6c — release the redirect's reason-1 hold on a

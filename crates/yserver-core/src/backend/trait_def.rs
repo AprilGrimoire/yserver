@@ -2026,6 +2026,11 @@ pub trait Backend {
         // no-op for backends without GLX-TFP export tracking
     }
 
+    /// A client fully disconnected. Backends holding per-client transient
+    /// state (e.g. the root front-buffer overlay) drop that client's
+    /// contribution here. Default no-op.
+    fn client_disconnected(&mut self, _client_id: yserver_protocol::x11::ClientId) {}
+
     /// GLX-TFP Task 3.5: promote the backing for `host_xid` to
     /// dma-buf-exportable storage (idempotent) WITHOUT touching the
     /// lifetime refcount (`glx_refs`) or allocating/exporting a dmabuf fd.

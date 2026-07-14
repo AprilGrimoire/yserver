@@ -898,6 +898,18 @@ impl KmsBackend {
         }))
     }
 
+    /// Test accessor: the rasterised `(width, height, bgra_bytes)` of a
+    /// cursor record by its host xid. Used by the acceptance harness to
+    /// verify `create_cursor`'s depth-1 source/mask roundtrip through
+    /// `get_image` (the #90 flattened-crosshair regression).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn cursor_record_bgra_for_tests(&self, cursor_xid: u32) -> Option<(u16, u16, Vec<u8>)> {
+        self.cursor_records
+            .get(&cursor_xid)
+            .map(|r| (r.width, r.height, r.bgra_bytes.clone()))
+    }
+
     fn alloc_window_stack_rank(&mut self) -> u64 {
         let rank = self.next_window_stack_rank;
         self.next_window_stack_rank = self.next_window_stack_rank.saturating_add(1);
@@ -1506,6 +1518,15 @@ impl KmsBackend {
     /// non-zero = bit set). Returns `(bytes, width, height)`. None
     /// when the pixmap isn't in the store or the engine readback
     /// fails (Vk-less fixture, format mismatch).
+    ///
+    /// `get_image` at depth 1 returns the X11 **wire bitmap** layout —
+    /// scanlines packed to 1 bit per pixel, each row padded to 32 bits,
+    /// LSBFirst (`pack_from_storage`). The cursor rasteriser
+    /// (`rasterise_create_cursor`) instead wants one byte per pixel,
+    /// so unpack the packed rows into a tight `w × h` R8 buffer here.
+    /// Skipping this unpack collapsed a `w`-wide cursor into its first
+    /// `⌈w/32⌉·4·h ÷ w` rows — the `import` crosshair showed as a
+    /// flattened horizontal sliver (#90 follow-up).
     fn read_cursor_depth1_pixmap(&mut self, host_xid: u32) -> Option<(Vec<u8>, u16, u16)> {
         let id = self.store.lookup(host_xid)?;
         let drawable = self.store.get(id)?;
@@ -1522,7 +1543,11 @@ impl KmsBackend {
             .engine
             .get_image(&mut self.store, &mut self.platform, id, rect, 1)
         {
-            Ok(bytes) => Some((bytes, w, h)),
+            Ok(packed) => Some((
+                crate::kms::render::cursor::unpack_wire_bitmap_to_r8(&packed, w, h),
+                w,
+                h,
+            )),
             Err(e) => {
                 log::debug!(
                     "render read_cursor_depth1_pixmap: get_image failed for 0x{host_xid:x}: {e:?}"
@@ -2535,6 +2560,27 @@ impl KmsBackend {
             self.scene.wake_for_damage();
         }
         Ok(true)
+    }
+
+    /// Read a root-window region from the composited scanout, assembling across
+    /// outputs. Returns the ZPixmap bytes (row-major, 4 bytes/pixel) for
+    /// `region`, or `None` when there is no scanout (no KMS outputs) so the
+    /// caller can fall through to the empty-reply path. Uncovered / failed
+    /// pieces are zero-filled. See [`assemble_root_scanout`] for why the plain
+    /// GetImage path must split like `CopyArea` does.
+    fn read_root_scanout_assembled(&self, region: vk::Rect2D) -> Option<Vec<u8>> {
+        let outputs: Vec<(i32, i32, u32, u32)> = self
+            .platform
+            .outputs
+            .iter()
+            .map(|o| (o.x, o.y, u32::from(o.width), u32::from(o.height)))
+            .collect();
+        if outputs.is_empty() {
+            return None;
+        }
+        Some(assemble_root_scanout(region, &outputs, |rect| {
+            read_scanout_region(self, rect, ScanoutReadSelection::OnScreenOnly).ok()
+        }))
     }
 
     /// Compute the surviving destination scissor rects for a CopyArea, in
@@ -7909,8 +7955,84 @@ impl KmsBackend {
     /// Clip a stroke's fg/bg rect lists against the current GC clip
     /// and submit them. `LineStyle::DoubleDash` off-runs land in
     /// `bg_rects` and paint in the GC background colour.
+    /// True iff this draw is a reversible-logic (`GXinvert`/`GXxor`) op to the
+    /// ROOT window with `IncludeInferiors`. Gate BEFORE looking at rects so a
+    /// background-only run (e.g. `LineStyle::DoubleDash`) still skips backing.
+    fn is_root_overlay_draw(&self, host_xid: u32) -> bool {
+        use yserver_core::backend::{GcFunction, SubwindowMode};
+        host_xid == self.core.window_id
+            && matches!(
+                self.core.current_subwindow_mode,
+                SubwindowMode::IncludeInferiors
+            )
+            && matches!(
+                self.core.current_function,
+                GcFunction::Invert | GcFunction::Xor
+            )
+    }
+
+    /// Route this draw to the front-buffer overlay instead of root's backing?
+    /// Requires a real client origin — a None-origin internal draw (ClearArea
+    /// background clear, put_image decomposition) must still paint the backing,
+    /// and must not be swallowed by stale GC scratch state.
+    fn should_route_root_overlay(&self, host_xid: u32, origin: Option<OriginContext>) -> bool {
+        origin.is_some() && self.is_root_overlay_draw(host_xid)
+    }
+
+    /// Fold one color-run's rects into the front-buffer overlay. Assumes
+    /// `is_root_overlay_draw(host_xid)` already held. `color` is the run's fill
+    /// value (fg for solid/fg runs, GC background for DoubleDash off-runs).
+    fn capture_root_overlay(
+        &mut self,
+        origin: Option<OriginContext>,
+        color: u32,
+        rects: &[Rectangle16],
+    ) {
+        if rects.is_empty() {
+            return;
+        }
+        let depth = self
+            .store
+            .lookup(self.core.window_id)
+            .and_then(|id| self.store.get(id))
+            .map_or(24, |d| d.depth);
+        let plane_mask = self.core.current_plane_mask & depth_plane_mask(depth);
+        if plane_mask == 0 {
+            return;
+        }
+        let Some(value) = crate::kms::render::root_overlay::xor_value_for(
+            self.core.current_function,
+            color,
+            plane_mask,
+        ) else {
+            return;
+        };
+        let Some(client) = origin.map(|o| o.client_id) else {
+            return;
+        };
+        let vk_rects: Vec<ash::vk::Rect2D> = rects
+            .iter()
+            .filter(|r| r.width != 0 && r.height != 0)
+            .map(|r| ash::vk::Rect2D {
+                offset: ash::vk::Offset2D {
+                    x: i32::from(r.x),
+                    y: i32::from(r.y),
+                },
+                extent: ash::vk::Extent2D {
+                    width: u32::from(r.width),
+                    height: u32::from(r.height),
+                },
+            })
+            .collect();
+        if vk_rects.is_empty() {
+            return;
+        }
+        self.scene.root_overlay_toggle(client, value, &vk_rects);
+    }
+
     fn emit_stroke_output(
         &mut self,
+        origin: Option<OriginContext>,
         host_xid: u32,
         target: PaintTarget,
         foreground: u32,
@@ -7929,6 +8051,17 @@ impl KmsBackend {
         // `fill_rects_honoring_fill_state` collects inferiors.
         let fg_clipped = self.intersect_with_current_clip_live(&out.fg_rects);
         let bg_clipped = self.intersect_with_current_clip_live(&out.bg_rects);
+
+        // Legacy root-overlay idiom: reroute reversible root+IncludeInferiors
+        // strokes to the compose-time front-buffer overlay instead of the
+        // (occluded) root backing. BOTH fg and bg runs toggle; gate on the
+        // op-kind predicate (not rect emptiness) so a bg-only DoubleDash run
+        // still skips backing.
+        if self.should_route_root_overlay(host_xid, origin) {
+            self.capture_root_overlay(origin, foreground, &fg_clipped);
+            self.capture_root_overlay(origin, background, &bg_clipped);
+            return;
+        }
 
         let fg_inferiors = if include_inferiors {
             self.collect_stroke_inferior_targets(host_xid, &fg_clipped)
@@ -8418,6 +8551,7 @@ impl KmsBackend {
     /// opaque-background semantics all stay exact.
     fn fill_rects_honoring_fill_state(
         &mut self,
+        origin: Option<OriginContext>,
         host_xid: u32,
         target: PaintTarget,
         fg: u32,
@@ -8425,6 +8559,20 @@ impl KmsBackend {
     ) {
         use yserver_core::backend::{FillState, GcFunction};
         if rects.is_empty() {
+            return;
+        }
+        // Legacy root-overlay idiom: reroute reversible root+IncludeInferiors
+        // SOLID fills to the compose-time front-buffer overlay instead of the
+        // (occluded) root backing. Gate FIRST — before the inferior-tree walk —
+        // so the overlay path pays for no wasted child collection. Patterned
+        // (tiled/stippled) fills are excluded (the overlay stores a single
+        // XOR/invert color). For IncludeInferiors,
+        // `clip_fill_rects_by_subwindow_mode` is pass-through, so the raw rects
+        // equal what the backing path would have captured.
+        if matches!(self.core.current_fill, FillState::Solid)
+            && self.should_route_root_overlay(host_xid, origin)
+        {
+            self.capture_root_overlay(origin, fg, rects);
             return;
         }
         let include_inferiors = matches!(
@@ -9701,6 +9849,67 @@ fn split_root_scanout_reads(
         });
     }
     reads
+}
+
+/// Assemble a root-region `GetImage` ZPixmap buffer from per-output scanout
+/// reads.
+///
+/// The plain root `GetImage` path — unlike `CopyArea`-from-root, which already
+/// splits — used to issue ONE `read_scanout_region` for the whole rect.
+/// `select_scanout_bo_for_rect` rejects any rect that isn't fully inside a
+/// single output, so a multi-monitor full-root grab matched no BO and the reply
+/// came back all-black (ImageMagick `import` screenshots over a dual-head root:
+/// `import` grabs the entire root, then crops client-side). Split the region
+/// per output, read each piece, and blit it into one row-major 4-bytes-per-pixel
+/// buffer. Region area not covered by any output stays zero-filled (X11 leaves
+/// off-screen root pixels undefined).
+///
+/// `read(rect)` returns tightly-packed 4-bpp rows for `rect` (guaranteed by the
+/// splitter to sit fully within one output) or `None` if that read failed — a
+/// failed piece is left zero-filled rather than aborting the whole capture.
+fn assemble_root_scanout<F>(
+    region: vk::Rect2D,
+    outputs: &[(i32, i32, u32, u32)],
+    mut read: F,
+) -> Vec<u8>
+where
+    F: FnMut(vk::Rect2D) -> Option<Vec<u8>>,
+{
+    let w = region.extent.width as usize;
+    let h = region.extent.height as usize;
+    let stride = w * 4;
+    let mut assembled = vec![0u8; stride * h];
+    // src origin = region origin, dst origin = 0 → each piece's `dst_local` is
+    // its offset within the assembled buffer.
+    let src_x = i16::try_from(region.offset.x).unwrap_or(i16::MAX);
+    let src_y = i16::try_from(region.offset.y).unwrap_or(i16::MAX);
+    let sub = vk::Rect2D {
+        offset: vk::Offset2D::default(),
+        extent: region.extent,
+    };
+    for piece in split_root_scanout_reads(sub, src_x, src_y, 0, 0, outputs) {
+        let Some(bytes) = read(piece.read) else {
+            continue;
+        };
+        let pw = piece.read.extent.width as usize;
+        let ph = piece.read.extent.height as usize;
+        let dx = usize::try_from(piece.dst_local.x).unwrap_or(0);
+        let dy = usize::try_from(piece.dst_local.y).unwrap_or(0);
+        let row_bytes = pw * 4;
+        for row in 0..ph {
+            let src = row * row_bytes;
+            let dst = (dy + row) * stride + dx * 4;
+            let (Some(src_end), Some(dst_end)) =
+                (src.checked_add(row_bytes), dst.checked_add(row_bytes))
+            else {
+                break;
+            };
+            if src_end <= bytes.len() && dst_end <= assembled.len() {
+                assembled[dst..dst_end].copy_from_slice(&bytes[src..src_end]);
+            }
+        }
+    }
+    assembled
 }
 
 fn read_scanout_region(
@@ -12310,6 +12519,11 @@ impl Backend for KmsBackend {
         // invalidate` parks the DrawableId in `pending_retire` if the GPU
         // fence has not yet signaled, deferring the VkImage destroy until the
         // compose CB finishes — no `wait_idle_bounded` needed.
+        //
+        // root-overlay is root-absolute + layout-dependent; drop it on
+        // topology change. `rebuild_outputs` isn't called here (see above),
+        // so this logical-resize path needs its own explicit clear.
+        self.scene.root_overlay_clear();
         self.scene.wake_for_damage();
 
         log::info!("render set_logical_screen_size: resized virtual screen to {w}×{h}");
@@ -12727,6 +12941,10 @@ impl Backend for KmsBackend {
 
     fn release_glx_pixmap_export(&mut self, host_xid: u32) {
         KmsBackend::release_glx_pixmap_export(self, host_xid);
+    }
+
+    fn client_disconnected(&mut self, client_id: yserver_protocol::x11::ClientId) {
+        self.scene.root_overlay_on_disconnect(client_id);
     }
 
     fn promote_pixmap_exportable(&mut self, host_xid: u32) -> bool {
@@ -14801,15 +15019,21 @@ impl Backend for KmsBackend {
                 self.log_render_gap("get_image_root_unknown_root");
                 return Ok(None);
             };
-            let (depth, storage_extent) = match self.store.get(root_id) {
-                Some(d) => (d.depth, d.storage.extent),
+            let depth = match self.store.get(root_id) {
+                Some(d) => d.depth,
                 None => return Ok(None),
             };
             let mask = plane_mask & depth_plane_mask(depth);
             if format == GET_IMAGE_FORMAT_XY_PIXMAP && mask == 0 {
                 return Ok(Some(wrap_get_image_reply(depth, Vec::new())));
             }
-            let rect = ash::vk::Rect2D {
+            // Root GetImage reads the composited scanout. The requested region
+            // can span multiple outputs (multi-monitor root), so split it per
+            // output and assemble; a single `read_scanout_region` rejects a
+            // cross-output rect and yields an all-black reply. The rect is
+            // already validated on-screen by the request handler, so it is not
+            // re-clamped to root storage (which need not span the whole layout).
+            let region = ash::vk::Rect2D {
                 offset: ash::vk::Offset2D {
                     x: i32::from(x),
                     y: i32::from(y),
@@ -14819,15 +15043,14 @@ impl Backend for KmsBackend {
                     height: u32::from(height),
                 },
             };
-            let clipped = crate::kms::render::engine::clamp_rect(rect, storage_extent);
             let start = std::time::Instant::now();
-            let result = match read_scanout_region(self, rect, ScanoutReadSelection::OnScreenOnly) {
-                Ok(mut pixel_bytes) => {
+            let result = match self.read_root_scanout_assembled(region) {
+                Some(mut pixel_bytes) => {
                     if format == GET_IMAGE_FORMAT_XY_PIXMAP {
                         pixel_bytes = z_to_xy_planes(
                             &pixel_bytes,
-                            clipped.extent.width,
-                            clipped.extent.height,
+                            region.extent.width,
+                            region.extent.height,
                             depth,
                             mask,
                         );
@@ -14840,13 +15063,7 @@ impl Backend for KmsBackend {
                     self.trace_simple(SubmitKind::GetImage, root_id, 1);
                     Ok(Some(wrap_get_image_reply(depth, pixel_bytes)))
                 }
-                Err(e) => {
-                    log::warn!(
-                        "render get_image: root scanout readback failed for host_xid \
-                         {host_xid:#x}: {e:?}",
-                    );
-                    Ok(None)
-                }
+                None => Ok(None),
             };
             self.drain_frame_builder_telemetry();
             return result;
@@ -15034,7 +15251,7 @@ impl Backend for KmsBackend {
 
     fn poly_line(
         &mut self,
-        _origin: Option<OriginContext>,
+        origin: Option<OriginContext>,
         host_xid: u32,
         foreground: u32,
         coordinate_mode: u8,
@@ -15069,13 +15286,13 @@ impl Backend for KmsBackend {
             crate::kms::render::stroke::StrokeShape::Polyline,
             &stroke,
         );
-        self.emit_stroke_output(host_xid, target, foreground, stroke.background, out);
+        self.emit_stroke_output(origin, host_xid, target, foreground, stroke.background, out);
         Ok(())
     }
 
     fn poly_segment(
         &mut self,
-        _origin: Option<OriginContext>,
+        origin: Option<OriginContext>,
         host_xid: u32,
         foreground: u32,
         segments: &[u8],
@@ -15106,13 +15323,13 @@ impl Backend for KmsBackend {
             crate::kms::render::stroke::StrokeShape::DisjointSegments,
             &stroke,
         );
-        self.emit_stroke_output(host_xid, target, foreground, stroke.background, out);
+        self.emit_stroke_output(origin, host_xid, target, foreground, stroke.background, out);
         Ok(())
     }
 
     fn poly_rectangle(
         &mut self,
-        _origin: Option<OriginContext>,
+        origin: Option<OriginContext>,
         host_xid: u32,
         foreground: u32,
         rectangles: &[u8],
@@ -15150,6 +15367,7 @@ impl Backend for KmsBackend {
             bg_rects.extend(out.bg_rects);
         }
         self.emit_stroke_output(
+            origin,
             host_xid,
             target,
             foreground,
@@ -15161,7 +15379,7 @@ impl Backend for KmsBackend {
 
     fn poly_arc(
         &mut self,
-        _origin: Option<OriginContext>,
+        origin: Option<OriginContext>,
         host_xid: u32,
         foreground: u32,
         arcs: &[u8],
@@ -15203,6 +15421,7 @@ impl Backend for KmsBackend {
             bg_rects.extend(out.bg_rects);
         }
         self.emit_stroke_output(
+            origin,
             host_xid,
             target,
             foreground,
@@ -15251,7 +15470,7 @@ impl Backend for KmsBackend {
 
     fn poly_fill_rectangle(
         &mut self,
-        _origin: Option<OriginContext>,
+        origin: Option<OriginContext>,
         host_xid: u32,
         foreground: u32,
         rectangles: &[u8],
@@ -15271,13 +15490,13 @@ impl Backend for KmsBackend {
             rects.push(r);
         }
         let rects = self.intersect_with_current_clip_live(&rects);
-        self.fill_rects_honoring_fill_state(host_xid, target, foreground, &rects);
+        self.fill_rects_honoring_fill_state(origin, host_xid, target, foreground, &rects);
         Ok(())
     }
 
     fn poly_fill_arc(
         &mut self,
-        _origin: Option<OriginContext>,
+        origin: Option<OriginContext>,
         host_xid: u32,
         foreground: u32,
         arcs: &[u8],
@@ -15318,14 +15537,14 @@ impl Backend for KmsBackend {
         if !rects.is_empty() {
             let clipped = crate::kms::backend::clip_rects_to_image(&rects, img_w, img_h);
             let rects = self.intersect_with_current_clip_live(&clipped);
-            self.fill_rects_honoring_fill_state(host_xid, target, foreground, &rects);
+            self.fill_rects_honoring_fill_state(origin, host_xid, target, foreground, &rects);
         }
         Ok(())
     }
 
     fn fill_poly(
         &mut self,
-        _origin: Option<OriginContext>,
+        origin: Option<OriginContext>,
         host_xid: u32,
         foreground: u32,
         coord_mode: u8,
@@ -15357,13 +15576,13 @@ impl Backend for KmsBackend {
             .unwrap_or((0, 0));
         let clipped = crate::kms::backend::clip_rects_to_image(&rects, img_w, img_h);
         let rects = self.intersect_with_current_clip_live(&clipped);
-        self.fill_rects_honoring_fill_state(host_xid, target, foreground, &rects);
+        self.fill_rects_honoring_fill_state(origin, host_xid, target, foreground, &rects);
         Ok(())
     }
 
     fn fill_rectangle(
         &mut self,
-        _origin: Option<OriginContext>,
+        origin: Option<OriginContext>,
         host_xid: u32,
         foreground: u32,
         x: i16,
@@ -15381,7 +15600,7 @@ impl Backend for KmsBackend {
             width,
             height,
         }]);
-        self.fill_rects_honoring_fill_state(host_xid, target, foreground, &rects);
+        self.fill_rects_honoring_fill_state(origin, host_xid, target, foreground, &rects);
         Ok(())
     }
 
@@ -21393,9 +21612,19 @@ mod tests {
         let abs_rects = rasterise(&pack(&absolute_pts), 0);
         let prev_rects = rasterise(&pack(&delta_pts), 1);
 
-        // Both modes must produce the same rasterised pixel set.
+        // Both modes must produce the same rasterised pixel set. Expand each
+        // rect to its covered pixels: `bresenham_segment` coalesces axis-aligned
+        // runs into spans, so a rect is no longer necessarily 1×1.
         let to_set = |rs: &[Rectangle16]| -> std::collections::BTreeSet<(i16, i16)> {
-            rs.iter().map(|r| (r.x, r.y)).collect()
+            let mut s = std::collections::BTreeSet::new();
+            for r in rs {
+                for dy in 0..i32::from(r.height) {
+                    for dx in 0..i32::from(r.width) {
+                        s.insert(((i32::from(r.x) + dx) as i16, (i32::from(r.y) + dy) as i16));
+                    }
+                }
+            }
+            s
         };
         assert_eq!(to_set(&abs_rects), to_set(&prev_rects));
         // Sanity: pixel set covers the L's expected vertices.
@@ -21446,6 +21675,71 @@ mod tests {
             assert_eq!(span, (0, 4), "row {y} span");
         }
         assert!(!rows.contains_key(&4), "row 4 must not be filled");
+    }
+
+    #[test]
+    fn root_include_inferiors_xor_routes_to_overlay() {
+        let mut b = KmsBackend::for_tests();
+        b.core.current_function = yserver_core::backend::GcFunction::Invert;
+        b.core.current_subwindow_mode = yserver_core::backend::SubwindowMode::IncludeInferiors;
+        let origin = Some(yserver_core::backend::OriginContext {
+            client_id: yserver_protocol::x11::ClientId(3),
+            nested_seq: 0,
+            opcode: 70,
+        });
+        let rects = [Rectangle16 {
+            x: 10,
+            y: 10,
+            width: 50,
+            height: 1,
+        }];
+        let root = b.core.window_id;
+        assert!(b.is_root_overlay_draw(root));
+        b.capture_root_overlay(origin, !0, &rects);
+        assert!(!b.scene.root_overlay.is_empty(), "op landed in overlay");
+    }
+
+    #[test]
+    fn client_disconnected_clears_overlay() {
+        let mut b = KmsBackend::for_tests();
+        b.scene.root_overlay_toggle(
+            yserver_protocol::x11::ClientId(5),
+            0xffffff,
+            &[ash::vk::Rect2D {
+                offset: ash::vk::Offset2D { x: 0, y: 0 },
+                extent: ash::vk::Extent2D {
+                    width: 4,
+                    height: 4,
+                },
+            }],
+        );
+        assert!(!b.scene.root_overlay.is_empty());
+        yserver_core::backend::Backend::client_disconnected(
+            &mut b,
+            yserver_protocol::x11::ClientId(5),
+        );
+        assert!(b.scene.root_overlay.is_empty());
+    }
+
+    #[test]
+    fn none_origin_reversible_root_draw_not_routed_to_overlay() {
+        let mut b = KmsBackend::for_tests();
+        // stale GC scratch state as if a prior root+II XOR draw ran
+        b.core.current_function = yserver_core::backend::GcFunction::Invert;
+        b.core.current_subwindow_mode = yserver_core::backend::SubwindowMode::IncludeInferiors;
+        let root = b.core.window_id;
+        assert!(b.is_root_overlay_draw(root));
+        // A None-origin op (ClearArea bg clear / put_image decomposition) must
+        // NOT route to the overlay — it must fall through to backing paint.
+        assert!(!b.should_route_root_overlay(root, None));
+        assert!(b.should_route_root_overlay(
+            root,
+            Some(yserver_core::backend::OriginContext {
+                client_id: yserver_protocol::x11::ClientId(3),
+                nested_seq: 0,
+                opcode: 70,
+            })
+        ));
     }
 
     /// Sanity: the v2 GC-clip intersection helper matches v1's shape.
@@ -27566,6 +27860,123 @@ mod tests {
 
     #[test]
     #[ignore = "needs live Vulkan ICD"]
+    fn root_overlay_xor_pass_reaches_scanout() {
+        // Task 6: the retained root-`IncludeInferiors` overlay is applied
+        // as an XOR pass at the END of compose, into the freshly-
+        // composited scanout BO. Drive one compose with the whole root
+        // filled a uniform color and an Invert (`value = plane_mask`)
+        // overlay toggled over ONE sub-region, then read the scanout back:
+        // the overlaid region must differ from an identically-filled
+        // control region that has no overlay (i.e. the XOR reached the
+        // scanout), while the control region reflects the untouched fill.
+        use ash::vk;
+        use yserver_core::{resources::ROOT_WINDOW, server::ServerState};
+        use yserver_protocol::x11::ClientId;
+
+        let mut state = ServerState::new();
+        let mut backend = match KmsBackend::for_tests_with_vk_live_scene() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: no Vk: {e}");
+                return;
+            }
+        };
+        install_client_for_render(&mut state, 14);
+        state
+            .resources
+            .window_mut(ROOT_WINDOW)
+            .expect("root")
+            .host_xid = yserver_core::backend::WindowHandle::from_raw(backend.core.window_id);
+
+        let (root_w, root_h) = {
+            let root = state.resources.window(ROOT_WINDOW).expect("root window");
+            (root.width, root.height)
+        };
+
+        // Uniform root fill so the overlaid region and the control region
+        // start from the same pixels.
+        let root_color = 0x0033_5577;
+        backend
+            .fill_rectangle(
+                None,
+                backend.core.window_id,
+                root_color,
+                0,
+                0,
+                root_w,
+                root_h,
+            )
+            .expect("fill root");
+
+        // Overlay region + an identically-filled control region.
+        let overlay_rect = vk::Rect2D {
+            offset: vk::Offset2D { x: 20, y: 20 },
+            extent: vk::Extent2D {
+                width: 60,
+                height: 60,
+            },
+        };
+        let control_rect = vk::Rect2D {
+            offset: vk::Offset2D { x: 200, y: 20 },
+            extent: vk::Extent2D {
+                width: 60,
+                height: 60,
+            },
+        };
+
+        // Invert: xor_value = plane_mask (24-bit). Injects damage so the
+        // compose actually runs over the region.
+        let xor_value = 0x00ff_ffff;
+        backend
+            .scene
+            .root_overlay_toggle(ClientId(14), xor_value, &[overlay_rect]);
+        assert!(
+            !backend.scene.root_overlay.is_empty(),
+            "overlay op must be retained"
+        );
+
+        backend.tick_maybe_composite_for_tests();
+
+        let overlaid = super::read_scanout_region(
+            &backend,
+            overlay_rect,
+            super::ScanoutReadSelection::OnScreenOnly,
+        )
+        .expect("scanout readback (overlay)");
+        let control = super::read_scanout_region(
+            &backend,
+            control_rect,
+            super::ScanoutReadSelection::OnScreenOnly,
+        )
+        .expect("scanout readback (control)");
+
+        assert!(
+            !overlaid.is_empty() && !control.is_empty(),
+            "non-empty reads"
+        );
+        assert_eq!(
+            overlaid.len(),
+            control.len(),
+            "same-size regions read same byte count"
+        );
+        assert_ne!(
+            overlaid, control,
+            "XOR overlay pass must have changed the overlaid scanout region \
+             relative to the identically-filled control region"
+        );
+        // Control region is uniform (the untouched fill): every pixel equals
+        // the first, confirming the compose ran and only the overlay region
+        // was toggled.
+        let px = &control[0..4];
+        assert!(
+            control.chunks_exact(4).all(|c| c == px),
+            "control region must be the uniform root fill (overlay must not \
+             have touched it)"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
     fn root_copy_area_include_inferiors_captures_window_into_pixmap() {
         use yserver_core::{backend::SubwindowMode, resources::ROOT_WINDOW, server::ServerState};
         use yserver_protocol::x11::ResourceId;
@@ -27751,6 +28162,46 @@ mod tests {
         let got =
             super::split_root_scanout_reads(r(0, 0, 50, 50), 500, 500, 0, 0, &[(0, 0, 100, 100)]);
         assert!(got.is_empty());
+    }
+
+    #[test]
+    fn assemble_root_scanout_spans_two_outputs() {
+        // Two 2x2 outputs side by side; a full 4x2 root region. Left output's
+        // read returns solid 0x11, right returns 0x22. The assembled buffer must
+        // carry each output's pixels in its half — the exact dual-monitor case
+        // the old single-`read_scanout_region` path returned all-black for
+        // (rect spanning two outputs → no matching BO → empty reply).
+        let outputs = [(0i32, 0i32, 2u32, 2u32), (2, 0, 2, 2)];
+        let got = super::assemble_root_scanout(r(0, 0, 4, 2), &outputs, |rect| {
+            let px = (rect.extent.width * rect.extent.height) as usize;
+            let byte = if rect.offset.x == 0 { 0x11u8 } else { 0x22u8 };
+            Some(vec![byte; px * 4])
+        });
+        assert_eq!(got.len(), 4 * 2 * 4);
+        // stride = 4 px * 4 bytes = 16. Left 2 px (8 bytes) then right 2 px.
+        assert_eq!(&got[0..8], &[0x11u8; 8], "row0 left half from output 0");
+        assert_eq!(&got[8..16], &[0x22u8; 8], "row0 right half from output 1");
+        assert_eq!(&got[16..24], &[0x11u8; 8], "row1 left half from output 0");
+        assert_eq!(&got[24..32], &[0x22u8; 8], "row1 right half from output 1");
+    }
+
+    #[test]
+    fn assemble_root_scanout_failed_read_is_zero_filled() {
+        // A piece whose read fails stays zero (black) instead of aborting the
+        // whole capture; the covered output still lands.
+        let outputs = [(0i32, 0i32, 2u32, 2u32), (2, 0, 2, 2)];
+        let got = super::assemble_root_scanout(r(0, 0, 4, 1), &outputs, |rect| {
+            if rect.offset.x == 0 {
+                Some(vec![
+                    0x11u8;
+                    (rect.extent.width * rect.extent.height) as usize * 4
+                ])
+            } else {
+                None
+            }
+        });
+        assert_eq!(&got[0..8], &[0x11u8; 8], "covered output landed");
+        assert_eq!(&got[8..16], &[0x00u8; 8], "failed-read output stays black");
     }
 
     #[test]
