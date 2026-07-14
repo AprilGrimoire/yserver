@@ -954,6 +954,7 @@ fn probe_copied_scanout_setup(
         .map_err(|err| io::Error::other(format!("copy probe renderer Vulkan device: {err}")))?;
     let sink_vk = VkContext::new_transfer_for_drm(sink_device_key, sink_render_node_key)
         .map_err(|err| io::Error::other(format!("copy probe sink Vulkan device: {err}")))?;
+    require_copied_sink_explicit_dmabuf_layout_import(sink_vk.image_drm_format_modifier)?;
     let mut pool = CopiedScanoutPool::allocate(
         render_vk,
         sink_vk,
@@ -967,6 +968,15 @@ fn probe_copied_scanout_setup(
     test_scanout_pool(&scanout_device, output, &pool.destinations)?;
     pool.probe_copy_all()?;
     Ok(())
+}
+
+fn require_copied_sink_explicit_dmabuf_layout_import(supported: bool) -> io::Result<()> {
+    if supported {
+        return Ok(());
+    }
+    Err(io::Error::other(
+        "copied scanout requires VK_EXT_image_drm_format_modifier on the sink GPU to import the source DMA-BUF with its exact pitch",
+    ))
 }
 
 impl PlatformBackend {
@@ -1913,6 +1923,7 @@ impl PlatformBackend {
                 "copied scanout sink Vulkan context for {key}: {err}"
             ))
         })?;
+        require_copied_sink_explicit_dmabuf_layout_import(vk.image_drm_format_modifier)?;
         self.copy_vk_contexts.insert(key, Arc::clone(&vk));
         Ok(vk)
     }
@@ -4347,6 +4358,13 @@ mod tests {
             scanout_ownership_order(ScanoutRoute::local(render)),
             &[ScanoutOwnership::Renderer]
         );
+    }
+
+    #[test]
+    fn copied_scanout_rejects_sink_without_explicit_dmabuf_layout_import() {
+        let err = require_copied_sink_explicit_dmabuf_layout_import(false).unwrap_err();
+        assert!(err.to_string().contains("VK_EXT_image_drm_format_modifier"));
+        require_copied_sink_explicit_dmabuf_layout_import(true).unwrap();
     }
 
     #[test]

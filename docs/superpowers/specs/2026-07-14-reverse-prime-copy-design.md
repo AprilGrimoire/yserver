@@ -12,7 +12,10 @@ GPU B when neither copy-free allocation direction works:
 
 The copied path removes the requirement that one allocation be both writable
 by A and scannable by B. B must still be able to import A's DMA-BUF as a Vulkan
-copy source. CPU readback/upload is not part of this design.
+copy source with its exact modifier and pitch. The Vulkan implementation
+therefore requires `VK_EXT_image_drm_format_modifier` on B; sink Vulkan drivers
+without explicit DMA-BUF layout import support are rejected before any
+foreign-memory submission. CPU readback/upload is not part of this design.
 
 ## Selection model
 
@@ -116,6 +119,12 @@ full three-slot pool and, for every slot:
 The probe returns the exact successful source and destination allocation plans
 for replay by the live pool.
 
+The sink capability gate runs before pool allocation. Without
+`VK_EXT_image_drm_format_modifier`, Vulkan's linear-image import chooses its own
+row pitch and cannot represent the renderer's exported layout. Even when that
+driver-chosen pitch happens to match, attempting the foreign import is not a
+safe compatibility probe on affected older GPUs.
+
 ## Correctness and failure invariants
 
 - At most one frame per output is waiting for A completion or pending a KMS
@@ -133,6 +142,8 @@ for replay by the live pool.
   waiting completion before destroying its resources.
 - Device loss disables the affected copied route rather than reusing uncertain
   memory.
+- A sink without explicit DMA-BUF layout import support rejects copied scanout
+  before importing or submitting foreign GPU memory.
 
 ## Initial performance policy
 

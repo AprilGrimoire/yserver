@@ -6270,6 +6270,7 @@ impl KmsBackend {
 
         self.platform.wait_idle_bounded();
         self.scene.drain_all(&mut self.platform);
+        self.platform.reset_scanout_bos_for_suspend();
         if let Err(e) = self.scene.rebuild_outputs(&self.platform) {
             log::error!("kms: scene rebuild after topology change failed: {e:?}; exiting");
             self.request_exit();
@@ -10714,6 +10715,13 @@ fn depth_for_visual(visual: HostSubwindowVisual, parent_depth: Option<u8>) -> u8
 // ───────────────────────────────────────────────────────────────
 
 impl KmsBackend {
+    fn dri3_import_supported_for_topology(
+        device_count: usize,
+        has_explicit_dmabuf_layout_import: bool,
+    ) -> bool {
+        device_count <= 1 || has_explicit_dmabuf_layout_import
+    }
+
     fn live_crtc_and_gamma_size(
         &self,
         output_key: &OutputKey,
@@ -17139,6 +17147,19 @@ impl Backend for KmsBackend {
             return Dri3Caps::unsupported();
         }
         let vk = self.platform.vk.as_ref().expect("vk Some by branch above");
+        // A legacy DRI3 PixmapFromBuffer carries an arbitrary client stride.
+        // Without the modifier extension Vulkan cannot describe that foreign
+        // linear layout; it can only accept the pitch chosen for its own
+        // VkImage. Same-device Mesa allocations happen to match on supported
+        // drivers without explicit DMA-BUF layout import, but PRIME allocations can be padded
+        // differently. Hide DRI3 in that topology so clients take their
+        // software fallback instead of rendering empty window interiors.
+        if !Self::dri3_import_supported_for_topology(
+            self.platform.devices.len(),
+            vk.image_drm_format_modifier,
+        ) {
+            return Dri3Caps::unsupported();
+        }
         let modifiers = vk.image_drm_format_modifier;
         // VK_KHR_external_semaphore_fd is unconditionally enabled at
         // device init; fence_fd / SYNC_FD handle type rides along
@@ -19272,6 +19293,30 @@ mod tests {
         assert!(
             b.hotplug_rescan_deadline.is_none(),
             "an elapsed hotplug rescan deadline must be cleared so the loop can idle",
+        );
+    }
+
+    #[test]
+    fn randr_change_cancels_copied_completion_for_surviving_output() {
+        use std::{io::Write, os::unix::net::UnixStream};
+
+        let mut b = KmsBackend::for_tests();
+        let mut state = ServerState::new();
+        let output_key = b.platform.outputs[0].key.clone();
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        b.platform
+            .register_scanout_render_completion(output_key, 1, reader.into())
+            .unwrap();
+        writer.write_all(&[1]).unwrap();
+
+        b.fire_randr_changes(
+            &mut state,
+            &crate::kms::render::platform::RescanResult::default(),
+        );
+
+        assert!(
+            b.platform.drain_scanout_render_completions().is_empty(),
+            "RANDR rebuild must cancel copied completions for surviving outputs",
         );
     }
 
@@ -25632,6 +25677,13 @@ mod tests {
         assert!(!caps.modifiers);
         assert!(!caps.fence_fd);
         assert!(!caps.syncobj);
+    }
+
+    #[test]
+    fn dri3_without_explicit_dmabuf_layout_import_is_limited_to_one_device() {
+        assert!(KmsBackend::dri3_import_supported_for_topology(1, false));
+        assert!(KmsBackend::dri3_import_supported_for_topology(2, true));
+        assert!(!KmsBackend::dri3_import_supported_for_topology(2, false));
     }
 
     #[test]

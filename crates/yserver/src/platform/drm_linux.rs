@@ -660,16 +660,22 @@ fn render_node_via_dev_walk(
 ) -> io::Result<Option<DrmNode>> {
     let render_nodes = platform.enumerate_render_nodes()?;
     let primary_parent = device_parent_for(primary).ok();
-    if let Some(primary_parent) = primary_parent.as_deref() {
-        for node in &render_nodes {
-            if let Ok(render_parent) = device_parent_for(node.key)
-                && render_parent == primary_parent
-            {
-                return Ok(Some(node.clone()));
-            }
-        }
-    }
-    Ok(render_nodes.into_iter().next())
+    Ok(select_render_node_for_parent(
+        render_nodes,
+        primary_parent.as_deref(),
+        |key| device_parent_for(key).ok(),
+    ))
+}
+
+fn select_render_node_for_parent(
+    render_nodes: Vec<DrmNode>,
+    primary_parent: Option<&std::path::Path>,
+    mut parent_for: impl FnMut(DrmDeviceKey) -> Option<PathBuf>,
+) -> Option<DrmNode> {
+    let primary_parent = primary_parent?;
+    render_nodes.into_iter().find(|node| {
+        parent_for(node.key).is_some_and(|render_parent| render_parent == primary_parent)
+    })
 }
 
 fn device_parent_for(key: DrmDeviceKey) -> io::Result<PathBuf> {
@@ -716,6 +722,50 @@ mod tests {
                 major: 226,
                 minor: 128,
             }
+        );
+    }
+
+    #[test]
+    fn render_node_fallback_never_selects_an_unmatched_gpu() {
+        let first_key = DrmDeviceKey {
+            major: 226,
+            minor: 128,
+        };
+        let matching_key = DrmDeviceKey {
+            major: 226,
+            minor: 129,
+        };
+        let nodes = || {
+            vec![
+                DrmNode {
+                    path: "/dev/dri/renderD128".into(),
+                    key: first_key,
+                    kind: DrmNodeKind::Render,
+                },
+                DrmNode {
+                    path: "/dev/dri/renderD129".into(),
+                    key: matching_key,
+                    kind: DrmNodeKind::Render,
+                },
+            ]
+        };
+        let primary_parent = std::path::Path::new("/sys/devices/pci0000:00/0000:00:02.0");
+        let other_parent = PathBuf::from("/sys/devices/pci0000:00/0000:00:03.0");
+
+        let selected = select_render_node_for_parent(nodes(), Some(primary_parent), |key| {
+            (key == matching_key).then(|| primary_parent.to_path_buf())
+        });
+        assert_eq!(selected.map(|node| node.key), Some(matching_key));
+
+        let selected = select_render_node_for_parent(nodes(), Some(primary_parent), |_| {
+            Some(other_parent.clone())
+        });
+        assert!(selected.is_none(), "must not fall back to the first GPU");
+
+        let selected = select_render_node_for_parent(nodes(), None, |_| None);
+        assert!(
+            selected.is_none(),
+            "an unresolved primary has no safe match"
         );
     }
 

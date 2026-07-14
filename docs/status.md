@@ -334,7 +334,16 @@ Cross-cutting bugs and followups that don't fit a stage live in
   flip-pending; stale job ids, B-copy/atomic failures, connector removal, VT
   reset, and shutdown all retain, recover, or cancel the associated resources.
   The initial policy always renders and copies the full output. CPU staging is
-  not included: B must still import A's DMA-BUF as a transfer source. Design
+  not included: B must still import A's DMA-BUF as a transfer source with its
+  exact pitch. Post-review hardware validation on RADV/Polaris showed that a
+  sink Vulkan driver without explicit DMA-BUF layout import support cannot
+  safely express that layout and may reset the GPU, so copied scanout now
+  requires `VK_EXT_image_drm_format_modifier` on B and rejects the route before
+  foreign-memory allocation. The same validation found PRIME-padded legacy
+  DRI3 buffers whose stride a renderer without that import support cannot
+  express; DRI3 is therefore hidden for multi-device topologies on such
+  renderers, preserving the working one-device path and allowing clients to
+  fall back instead of displaying empty interiors. Design
   and implementation plan are in
   `docs/superpowers/{specs,plans}/2026-07-14-reverse-prime-copy*.md`.
   Validation: completion-fd core-loop/platform regressions, `cargo test
