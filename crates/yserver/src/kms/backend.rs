@@ -611,7 +611,10 @@ fn activate_initial_scanout_outputs(
         ::drm::control::framebuffer::Handle,
     ) -> io::Result<()>,
 ) -> io::Result<Vec<ActiveOutput>> {
-    let outputs = crate::platform::drm::discover_outputs(device)?;
+    let outputs = crate::platform::drm::discover_outputs(
+        device,
+        crate::platform::drm::ConnectorProbe::Force,
+    )?;
     let mut active_outputs: Vec<ActiveOutput> = Vec::with_capacity(outputs.len());
     let mut bring_up_err: Option<io::Error> = None;
     for output in outputs {

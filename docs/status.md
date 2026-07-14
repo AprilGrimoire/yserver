@@ -349,6 +349,22 @@ Cross-cutting bugs and followups that don't fit a stage live in
   Validation: completion-fd core-loop/platform regressions, `cargo test
   --workspace --all-targets --locked`, CI-style clippy, and nightly rustfmt;
   forced-route dual-GPU hardware validation remains pending.
+- **2026-07-14 forced connector identity refresh**: DRM connector discovery
+  now distinguishes cached reads from synchronous force probes. Startup,
+  hotplug/resume rescans, and RANDR `GetScreenResources` force-query paths
+  refresh kernel connection state, exact modes, physical dimensions, and EDID;
+  ordinary `SetCrtcConfig` mode application stays on the cached path. The
+  stable device-qualified connector registry now owns the complete probed
+  monitor metadata, detects EDID-only replacements, exposes identity for
+  connected-but-off outputs, clears departed EDID on disconnect, and preserves
+  output/CRTC XIDs across replacement. Live RANDR projection no longer
+  overwrites freshly probed registry data with an older scanout snapshot, and
+  retains the currently programmed mode resource until clients select a mode
+  advertised by the replacement monitor. Mode XIDs now include exact timing,
+  preventing same-resolution replacements from inheriting stale blanking, and
+  `OutputChangeNotify` reports disconnects correctly. Validation: focused
+  connector/RANDR regressions, `cargo test --workspace --all-targets --locked`,
+  CI-style clippy, and nightly rustfmt.
 - **2026-07-11 ordered multi-device override**: `YSERVER_DRM_DEVICES` now
   accepts a colon-separated, primary-first list such as
   `/dev/dri/card1:/dev/dri/card0`. This lets deployments select the Vulkan

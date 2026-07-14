@@ -58,7 +58,7 @@ pub(crate) struct KmsCardCandidate {
     pub(crate) has_connected_connector: bool,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Mode {
     pub(crate) name: String,
     pub(crate) width: u16,
@@ -79,6 +79,24 @@ pub(crate) struct Mode {
     pub(crate) vtotal: u16,
     /// Raw `DRM_MODE_FLAG_*` bits; mapped to RANDR flags at report time.
     pub(crate) flags: u32,
+}
+
+/// Whether connector discovery may use the kernel's cached metadata or must
+/// synchronously refresh status, modes, and EDID.
+///
+/// Forced probing is intentionally reserved for startup, hotplug/resume, and
+/// explicit RANDR force-query paths because the DRM ioctl can block and may
+/// make a display flicker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConnectorProbe {
+    Cached,
+    Force,
+}
+
+impl ConnectorProbe {
+    pub(crate) fn force_probe(self) -> bool {
+        matches!(self, Self::Force)
+    }
 }
 
 /// Normalized KMS topology for one connected output.
@@ -147,7 +165,11 @@ pub(crate) trait DrmPlatform {
 /// connected connector, selected mode, assigned CRTC, assigned primary
 /// plane, scanout modifiers, EDID, and RANDR-facing connector metadata.
 pub(crate) trait KmsPlatform {
-    fn discover_outputs(&self, device: &crate::drm::Device) -> io::Result<Vec<Output>>;
+    fn discover_outputs(
+        &self,
+        device: &crate::drm::Device,
+        probe: ConnectorProbe,
+    ) -> io::Result<Vec<Output>>;
 }
 
 #[cfg(target_os = "linux")]
@@ -164,12 +186,18 @@ pub(crate) fn primary_node_from_fd(_fd: BorrowedFd<'_>) -> io::Result<DrmNode> {
 
 /// Discover the currently connected KMS outputs on `device`.
 #[cfg(target_os = "linux")]
-pub(crate) fn discover_outputs(device: &crate::drm::Device) -> io::Result<Vec<Output>> {
-    crate::platform::drm_linux::LinuxDrmPlatform.discover_outputs(device)
+pub(crate) fn discover_outputs(
+    device: &crate::drm::Device,
+    probe: ConnectorProbe,
+) -> io::Result<Vec<Output>> {
+    crate::platform::drm_linux::LinuxDrmPlatform.discover_outputs(device, probe)
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn discover_outputs(_device: &crate::drm::Device) -> io::Result<Vec<Output>> {
+pub(crate) fn discover_outputs(
+    _device: &crate::drm::Device,
+    _probe: ConnectorProbe,
+) -> io::Result<Vec<Output>> {
     Err(io::Error::other(
         "KMS output discovery is not implemented on this platform",
     ))
@@ -329,11 +357,12 @@ fn discover_kms_candidates(platform: &impl DrmPlatform) -> io::Result<Vec<KmsCar
             }
         };
 
-        // Use cached connector state (force_probe=false), matching
-        // discover_outputs; a full probe per card on startup is needless.
+        // Startup is one of the DRM API's explicit force-probe boundaries:
+        // card ordering must use current connection state rather than an EDID
+        // left cached by a monitor previously attached to the connector.
         let has_connected_connector = resources.connectors().iter().any(|&handle| {
             device
-                .get_connector(handle, false)
+                .get_connector(handle, true)
                 .is_ok_and(|info| info.state() == connector::State::Connected)
         });
         log::info!(

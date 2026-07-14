@@ -715,6 +715,10 @@ pub(crate) struct RescanResult {
 pub(crate) struct ConnectorSnapshot {
     pub(crate) key: OutputKey,
     pub(crate) modes: Vec<crate::platform::drm::Mode>,
+    pub(crate) edid: Vec<u8>,
+    pub(crate) mm_width: u32,
+    pub(crate) mm_height: u32,
+    pub(crate) connector_type: String,
 }
 
 impl ConnectorSnapshot {
@@ -722,6 +726,10 @@ impl ConnectorSnapshot {
         Self {
             key,
             modes: output.modes.clone(),
+            edid: output.edid.clone(),
+            mm_width: output.mm_width,
+            mm_height: output.mm_height,
+            connector_type: output.connector_type.clone(),
         }
     }
 }
@@ -1949,15 +1957,17 @@ impl PlatformBackend {
     /// same connector name or raw DRM object handles.
     pub(crate) fn discover_connected_outputs(
         &self,
+        probe: crate::platform::drm::ConnectorProbe,
     ) -> io::Result<Vec<(OutputKey, crate::platform::drm::Output)>> {
         let mut connected = Vec::new();
         for device in &self.devices {
-            let outputs = crate::platform::drm::discover_outputs(&device.device).map_err(|e| {
-                io::Error::new(
-                    e.kind(),
-                    format!("discover outputs on DRM device {}: {e}", device.key),
-                )
-            })?;
+            let outputs =
+                crate::platform::drm::discover_outputs(&device.device, probe).map_err(|e| {
+                    io::Error::new(
+                        e.kind(),
+                        format!("discover outputs on DRM device {}: {e}", device.key),
+                    )
+                })?;
             connected.extend(outputs.into_iter().map(|output| {
                 (
                     OutputKey::new(device.key, output.connector_name.clone()),
@@ -1968,8 +1978,11 @@ impl PlatformBackend {
         Ok(connected)
     }
 
-    pub(crate) fn discover_connector_snapshots(&self) -> io::Result<Vec<ConnectorSnapshot>> {
-        self.discover_connected_outputs().map(|outputs| {
+    pub(crate) fn discover_connector_snapshots(
+        &self,
+        probe: crate::platform::drm::ConnectorProbe,
+    ) -> io::Result<Vec<ConnectorSnapshot>> {
+        self.discover_connected_outputs(probe).map(|outputs| {
             outputs
                 .into_iter()
                 .map(|(key, output)| ConnectorSnapshot::from_output(key, &output))
@@ -3897,7 +3910,8 @@ impl PlatformBackend {
             return Ok(RescanResult::default());
         }
 
-        let discovered = self.discover_connected_outputs()?;
+        let discovered =
+            self.discover_connected_outputs(crate::platform::drm::ConnectorProbe::Force)?;
         let connected: Vec<ConnectorSnapshot> = discovered
             .iter()
             .map(|(key, output)| ConnectorSnapshot::from_output(key.clone(), output))
@@ -4124,6 +4138,25 @@ fn cursor_footprint_intersects_output(dx: i32, dy: i32, cw: i32, ch: i32, w: i32
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connector_snapshot_preserves_randr_monitor_metadata() {
+        let mut platform = PlatformBackend::for_tests();
+        let active = &mut platform.outputs[0];
+        active.output.edid = vec![0x00, 0xff, 0xff, 0xff];
+        active.output.mm_width = 310;
+        active.output.mm_height = 210;
+        active.output.connector_type = "HDMI".to_string();
+
+        let snapshot = ConnectorSnapshot::from_output(active.key.clone(), &active.output);
+
+        assert_eq!(snapshot.key, active.key);
+        assert_eq!(snapshot.modes, active.output.modes);
+        assert_eq!(snapshot.edid, active.output.edid);
+        assert_eq!(snapshot.mm_width, 310);
+        assert_eq!(snapshot.mm_height, 210);
+        assert_eq!(snapshot.connector_type, "HDMI");
+    }
 
     #[test]
     fn renderer_owned_probe_advances_after_incomplete_candidate_failure() {

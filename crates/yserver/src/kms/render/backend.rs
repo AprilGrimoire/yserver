@@ -149,14 +149,73 @@ struct SeedInferiorDraw {
 ///   id advertised for that GPU.
 /// - `connectors`: maps each device-qualified connector identity to its
 ///   stable RANDR output/CRTC ids and remembered connector state.
-/// - `modes`: maps a logical `(width, height, vrefresh)` mode signature to
-///   the stable RANDR mode id used in screen resources and output info.
+/// - `modes`: maps the complete client-visible mode identity (size, refresh,
+///   and DRM timing) to the stable RANDR mode id used in screen resources and
+///   output info. `preferred` is deliberately excluded because it is an output
+///   association, not part of a RANDR mode resource.
 #[derive(Debug, Default)]
 pub(crate) struct RandrIdAllocator {
     next: u32,
     providers: HashMap<crate::platform::drm::DrmDeviceKey, u32>,
     connectors: HashMap<OutputKey, ConnectorEntry>,
-    modes: HashMap<(u16, u16, u32), u32>,
+    modes: HashMap<ModeIdentity, u32>,
+}
+
+/// Fields which make one RANDR mode resource distinct from another.
+///
+/// Two monitors can advertise the same nominal `1920x1080@60` mode with
+/// different dot clocks or blanking. Reusing one XID for both would retain
+/// stale timing after a monitor replacement and could also make an existing
+/// XID silently change meaning across reprobes.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ModeIdentity {
+    width: u16,
+    height: u16,
+    vrefresh: u32,
+    clock_khz: u32,
+    hsync_start: u16,
+    hsync_end: u16,
+    htotal: u16,
+    vsync_start: u16,
+    vsync_end: u16,
+    vtotal: u16,
+    flags: u32,
+}
+
+impl From<&crate::platform::drm::Mode> for ModeIdentity {
+    fn from(mode: &crate::platform::drm::Mode) -> Self {
+        // `clock_khz == 0` is projected as a synthetic timing, so the dormant
+        // DRM timing fields are not client-visible in that case. Higher DRM
+        // flag bits are likewise masked before RANDR reports the mode.
+        let has_real_timing = mode.clock_khz != 0;
+        let (hsync_start, hsync_end, htotal, vsync_start, vsync_end, vtotal, flags) =
+            if has_real_timing {
+                (
+                    mode.hsync_start,
+                    mode.hsync_end,
+                    mode.htotal,
+                    mode.vsync_start,
+                    mode.vsync_end,
+                    mode.vtotal,
+                    mode.flags & 0x3f,
+                )
+            } else {
+                (0, 0, 0, 0, 0, 0, 0)
+            };
+        Self {
+            width: mode.width,
+            height: mode.height,
+            vrefresh: mode.vrefresh,
+            clock_khz: mode.clock_khz,
+            hsync_start,
+            hsync_end,
+            htotal,
+            vsync_start,
+            vsync_end,
+            vtotal,
+            flags,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,35 +225,6 @@ pub(crate) struct ConnectorIds {
     /// Stable RANDR `RRCrtc` id paired with this connector in yserver's
     /// current one-output-one-CRTC model.
     pub crtc_id: u32,
-}
-
-/// One mode advertised by a connector in RANDR `GetOutputInfo`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct AdvertisedMode {
-    /// Pixel width of the mode.
-    width: u16,
-    /// Pixel height of the mode.
-    height: u16,
-    /// Integer refresh rate used by yserver's current RANDR mode-id key.
-    vrefresh: u32,
-    /// Whether this mode belongs to the preferred prefix reported through
-    /// `GetOutputInfo.nPreferred`.
-    preferred: bool,
-}
-
-impl AdvertisedMode {
-    fn from_mode(mode: &crate::platform::drm::Mode) -> Self {
-        Self {
-            width: mode.width,
-            height: mode.height,
-            vrefresh: mode.vrefresh,
-            preferred: mode.preferred,
-        }
-    }
-
-    fn signature(&self) -> (u16, u16, u32) {
-        (self.width, self.height, self.vrefresh)
-    }
 }
 
 /// Snapshot for a registered connector that is not currently backed by an
@@ -208,7 +238,11 @@ struct NotLiveConnector {
     /// Physical connection state to expose as RR_Connected/RR_Disconnected.
     connected: bool,
     /// Last-known advertised modes retained across disable/disconnect.
-    modes: Vec<AdvertisedMode>,
+    modes: Vec<crate::platform::drm::Mode>,
+    edid: Vec<u8>,
+    mm_width: u32,
+    mm_height: u32,
+    connector_type: String,
 }
 
 /// Per-connector current configuration in the registry.
@@ -246,7 +280,15 @@ pub(crate) struct ConnectorEntry {
     /// Last-known advertised mode list, preferred-first. Retained across
     /// disconnect so a momentarily-gone monitor keeps reporting its modes
     /// until reconnect refreshes them.
-    pub modes: Vec<AdvertisedMode>,
+    pub modes: Vec<crate::platform::drm::Mode>,
+    /// Raw identity metadata from the latest forced connector probe. Unlike
+    /// active scanout state, this remains available while a connected output
+    /// is off so RANDR clients can identify a newly attached monitor before
+    /// enabling it.
+    pub edid: Vec<u8>,
+    pub mm_width: u32,
+    pub mm_height: u32,
+    pub connector_type: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -320,17 +362,22 @@ impl RandrIdAllocator {
                 config: ConnectorConfig::Off,
                 client_configured: false,
                 modes: Vec::new(),
+                edid: Vec::new(),
+                mm_width: 0,
+                mm_height: 0,
+                connector_type: String::new(),
             },
         );
         ids
     }
 
-    pub(crate) fn mode_id(&mut self, w: u16, h: u16, vrefresh: u32) -> u32 {
-        if let Some(id) = self.modes.get(&(w, h, vrefresh)) {
+    pub(crate) fn mode_id(&mut self, mode: &crate::platform::drm::Mode) -> u32 {
+        let identity = ModeIdentity::from(mode);
+        if let Some(id) = self.modes.get(&identity) {
             return *id;
         }
         let id = self.fresh();
-        self.modes.insert((w, h, vrefresh), id);
+        self.modes.insert(identity, id);
         id
     }
 
@@ -3073,7 +3120,9 @@ impl KmsBackend {
             let _ = self.randr_id_alloc.ids_for(key);
         }
 
-        let connected = self.platform.discover_connector_snapshots()?;
+        let connected = self
+            .platform
+            .discover_connector_snapshots(crate::platform::drm::ConnectorProbe::Force)?;
         let _ = self.reconcile_connector_registry(&connected, &[]);
 
         let live_configs: Vec<_> = self
@@ -3110,25 +3159,42 @@ impl KmsBackend {
         let mut changed = false;
         for key in dropped {
             let entry = self.randr_id_alloc.entry_mut(key);
-            if entry.connected || entry.config != ConnectorConfig::Off || entry.client_configured {
+            if entry.connected
+                || entry.config != ConnectorConfig::Off
+                || entry.client_configured
+                || !entry.edid.is_empty()
+                || entry.mm_width != 0
+                || entry.mm_height != 0
+            {
                 changed = true;
             }
             entry.connected = false;
             entry.config = ConnectorConfig::Off;
             entry.client_configured = false;
+            // Retain the connector's last mode list for stable resource
+            // queries, but never leak the departed physical monitor's
+            // identity into a later disconnected/off projection.
+            entry.edid.clear();
+            entry.mm_width = 0;
+            entry.mm_height = 0;
         }
         for snapshot in connected {
-            let modes: Vec<AdvertisedMode> = snapshot
-                .modes
-                .iter()
-                .map(AdvertisedMode::from_mode)
-                .collect();
             let entry = self.randr_id_alloc.entry_mut(&snapshot.key);
-            if !entry.connected || entry.modes != modes {
+            if !entry.connected
+                || entry.modes != snapshot.modes
+                || entry.edid != snapshot.edid
+                || entry.mm_width != snapshot.mm_width
+                || entry.mm_height != snapshot.mm_height
+                || entry.connector_type != snapshot.connector_type
+            {
                 changed = true;
             }
             entry.connected = true;
-            entry.modes = modes;
+            entry.modes.clone_from(&snapshot.modes);
+            entry.edid.clone_from(&snapshot.edid);
+            entry.mm_width = snapshot.mm_width;
+            entry.mm_height = snapshot.mm_height;
+            entry.connector_type.clone_from(&snapshot.connector_type);
         }
         changed
     }
@@ -3240,7 +3306,7 @@ impl KmsBackend {
         Vec<yserver_core::randr::RandrOutput>,
         Vec<yserver_core::randr::RandrMode>,
     ) {
-        use yserver_core::randr::{ModeTiming, RandrMode, RandrOutput};
+        use yserver_core::randr::{RandrMode, RandrOutput};
 
         for device in &self.platform.devices {
             let _ = self.randr_id_alloc.provider_id_for(device.key);
@@ -3250,20 +3316,13 @@ impl KmsBackend {
             .platform
             .outputs
             .iter()
+            .filter(|layout| {
+                self.randr_id_alloc
+                    .entry(&layout.key)
+                    .is_none_or(|entry| entry.connected || entry.modes.is_empty())
+            })
             .map(|layout| layout.key.clone())
             .collect();
-        // Timing for each advertised (w,h,vrefresh), preferred-first so the
-        // preferred instance's timing survives the #48 duplicate collapse.
-        let mut timing_map: HashMap<(u16, u16, u32), ModeTiming> = HashMap::new();
-        for layout in &self.platform.outputs {
-            for m in &layout.output.modes {
-                if let Some(t) = mode_timing(m) {
-                    timing_map
-                        .entry((m.width, m.height, m.vrefresh))
-                        .or_insert(t);
-                }
-            }
-        }
         let mut outs: Vec<RandrOutput> = Vec::with_capacity(
             self.platform.outputs.len() + self.randr_id_alloc.known_connectors().len(),
         );
@@ -3272,32 +3331,64 @@ impl KmsBackend {
         self.output_identity_by_id.clear();
         self.output_key_by_id.clear();
         self.crtc_key_by_id.clear();
-        for layout in &self.platform.outputs {
+        for layout in self
+            .platform
+            .outputs
+            .iter()
+            .filter(|layout| live_keys.contains(&layout.key))
+        {
             let vrefresh = layout.output.picked.vrefresh;
             let output_key = layout.key.clone();
             let ids = self.randr_id_alloc.ids_for(&output_key);
-            self.output_identity_by_id.insert(
-                ids.output_id,
+            let (connector_modes, edid, mm_width, mm_height, connector_type) = {
+                let entry = self.randr_id_alloc.entry_mut(&output_key);
+                // Production seeds every connector from a forced snapshot
+                // before the first projection. Keep a defensive fallback for
+                // synthetic/test backends which construct an ActiveOutput
+                // directly without running connector discovery.
+                if entry.modes.is_empty() {
+                    entry.modes.clone_from(&layout.output.modes);
+                    entry.edid.clone_from(&layout.output.edid);
+                    entry.mm_width = layout.output.mm_width;
+                    entry.mm_height = layout.output.mm_height;
+                    entry
+                        .connector_type
+                        .clone_from(&layout.output.connector_type);
+                }
+                entry.connected = true;
+                entry.config = ConnectorConfig::Enabled {
+                    mode_w: layout.width,
+                    mode_h: layout.height,
+                    vrefresh,
+                    x: layout.x,
+                    y: layout.y,
+                };
                 (
-                    layout.output.edid.clone(),
-                    layout.output.connector_type.clone(),
-                ),
-            );
+                    entry.modes.clone(),
+                    entry.edid.clone(),
+                    entry.mm_width,
+                    entry.mm_height,
+                    entry.connector_type.clone(),
+                )
+            };
+            if !edid.is_empty() {
+                self.output_identity_by_id
+                    .insert(ids.output_id, (edid, connector_type));
+            }
             self.output_key_by_id
                 .insert(ids.output_id, output_key.clone());
             self.crtc_key_by_id.insert(ids.crtc_id, output_key.clone());
-            let mode_id = self
-                .randr_id_alloc
-                .mode_id(layout.width, layout.height, vrefresh);
-            // Full advertised list, preferred-first (Output.modes is
-            // already sorted preferred-first by discover_outputs).
-            let mut mode_ids = Vec::with_capacity(layout.output.modes.len());
+            let mode_id = self.randr_id_alloc.mode_id(&layout.output.picked);
+            // Full advertised list, preferred-first. The connector registry
+            // is authoritative here: an explicit forced reprobe may have
+            // refreshed monitor metadata without changing the live CRTC.
+            let mut mode_ids = Vec::with_capacity(connector_modes.len());
             let mut num_preferred: u16 = 0;
-            for m in &layout.output.modes {
-                let mode_id = self.randr_id_alloc.mode_id(m.width, m.height, m.vrefresh);
-                // A connector can advertise the same (w,h,vrefresh) more
-                // than once (HDMI EDID+CEA+DMT); those collapse to one XID
-                // and must appear once in GetOutputInfo (issue #48).
+            for m in &connector_modes {
+                let mode_id = self.randr_id_alloc.mode_id(m);
+                // A connector can advertise the same exact timing more than
+                // once (HDMI EDID+CEA+DMT); those collapse to one XID and must
+                // appear once in GetOutputInfo (issue #48).
                 if mode_ids.contains(&mode_id) {
                     continue;
                 }
@@ -3306,21 +3397,6 @@ impl KmsBackend {
                     num_preferred = num_preferred.saturating_add(1);
                 }
             }
-            let entry = self.randr_id_alloc.entry_mut(&output_key);
-            entry.connected = true;
-            entry.config = ConnectorConfig::Enabled {
-                mode_w: layout.width,
-                mode_h: layout.height,
-                vrefresh,
-                x: layout.x,
-                y: layout.y,
-            };
-            entry.modes = layout
-                .output
-                .modes
-                .iter()
-                .map(AdvertisedMode::from_mode)
-                .collect();
             outs.push(RandrOutput {
                 name: layout.output.connector_name.clone(),
                 output_id: ids.output_id,
@@ -3333,35 +3409,41 @@ impl KmsBackend {
                 height: layout.height,
                 vrefresh,
                 timing: mode_timing(&layout.output.picked),
-                mm_width: layout.output.mm_width,
-                mm_height: layout.output.mm_height,
+                mm_width,
+                mm_height,
                 mode_ids,
                 num_preferred,
             });
         }
 
-        let advertised_modes: Vec<(u16, u16, u32)> = self
+        let advertised_modes: Vec<crate::platform::drm::Mode> = self
             .randr_id_alloc
             .entries()
-            .flat_map(|(_, entry)| {
-                entry
-                    .modes
-                    .iter()
-                    .map(AdvertisedMode::signature)
-                    .collect::<Vec<_>>()
-            })
+            .flat_map(|(_, entry)| entry.modes.clone())
+            .collect();
+        // A monitor replacement can remove the mode currently programmed on
+        // the still-live CRTC. Keep that current mode resource in
+        // GetScreenResources until a client selects a mode advertised by the
+        // replacement monitor, avoiding a dangling CRTC mode XID.
+        let current_modes: Vec<crate::platform::drm::Mode> = self
+            .platform
+            .outputs
+            .iter()
+            .filter(|layout| live_keys.contains(&layout.key))
+            .map(|layout| layout.output.picked.clone())
             .collect();
         let mut modes: Vec<RandrMode> = Vec::new();
-        let mut mode_map: HashMap<(u16, u16, u32), u32> = HashMap::new();
-        for (w, h, vrefresh) in advertised_modes {
-            let mode_id = self.randr_id_alloc.mode_id(w, h, vrefresh);
-            if mode_map.insert((w, h, vrefresh), mode_id).is_none() {
+        let mut mode_identities = HashSet::new();
+        for mode in current_modes.into_iter().chain(advertised_modes) {
+            let identity = ModeIdentity::from(&mode);
+            let mode_id = self.randr_id_alloc.mode_id(&mode);
+            if mode_identities.insert(identity) {
                 modes.push(RandrMode {
                     mode_id,
-                    width: w,
-                    height: h,
-                    vrefresh,
-                    timing: timing_map.get(&(w, h, vrefresh)).copied(),
+                    width: mode.width,
+                    height: mode.height,
+                    vrefresh: mode.vrefresh,
+                    timing: mode_timing(&mode),
                 });
             }
         }
@@ -3385,17 +3467,19 @@ impl KmsBackend {
                 ids: entry.ids,
                 connected: entry.connected,
                 modes: entry.modes.clone(),
+                edid: entry.edid.clone(),
+                mm_width: entry.mm_width,
+                mm_height: entry.mm_height,
+                connector_type: entry.connector_type.clone(),
             })
             .collect();
         for connector in not_live {
             let mut mode_ids = Vec::with_capacity(connector.modes.len());
             let mut num_preferred: u16 = 0;
             for mode in connector.modes {
-                let mode_id = self
-                    .randr_id_alloc
-                    .mode_id(mode.width, mode.height, mode.vrefresh);
-                // See live-output loop above: dedup repeated (w,h,vrefresh)
-                // so GetOutputInfo lists each mode XID once (issue #48).
+                let mode_id = self.randr_id_alloc.mode_id(&mode);
+                // See live-output loop above: dedup repeated exact timings so
+                // GetOutputInfo lists each mode XID once (issue #48).
                 if mode_ids.contains(&mode_id) {
                     continue;
                 }
@@ -3408,6 +3492,12 @@ impl KmsBackend {
                 .insert(connector.ids.output_id, connector.key.clone());
             self.crtc_key_by_id
                 .insert(connector.ids.crtc_id, connector.key.clone());
+            if connector.connected && !connector.edid.is_empty() {
+                self.output_identity_by_id.insert(
+                    connector.ids.output_id,
+                    (connector.edid, connector.connector_type),
+                );
+            }
             outs.push(RandrOutput {
                 name: connector.key.connector_name,
                 output_id: connector.ids.output_id,
@@ -3420,8 +3510,16 @@ impl KmsBackend {
                 height: 0,
                 vrefresh: 0,
                 timing: None,
-                mm_width: 0,
-                mm_height: 0,
+                mm_width: if connector.connected {
+                    connector.mm_width
+                } else {
+                    0
+                },
+                mm_height: if connector.connected {
+                    connector.mm_height
+                } else {
+                    0
+                },
                 mode_ids,
                 num_preferred,
             });
@@ -6321,6 +6419,25 @@ impl KmsBackend {
         self.scene.wake_for_damage();
     }
 
+    fn rescan_display_topology(&mut self, state: &mut ServerState) -> io::Result<()> {
+        let configured = self.randr_id_alloc.client_configured_keys();
+        let known_connected = self.randr_id_alloc.connected_keys();
+        let rescan = self
+            .platform
+            .requery_outputs_and_modeset(&configured, &known_connected)?;
+        let registry_changed =
+            self.reconcile_connector_registry(&rescan.connected, &rescan.dropped_keys);
+        if !registry_changed && rescan.dropped_old_indices.is_empty() {
+            log::debug!("kms: display rescan found no topology change");
+            return Ok(());
+        }
+        self.fire_randr_changes(state, &rescan);
+        // A retired connector's CRTC is gone; drop any stale armed entry so
+        // it can't block re-arm or mis-dedup a reused id.
+        self.prune_armed_targets_to_live_outputs();
+        Ok(())
+    }
+
     fn run_display_rescan(&mut self, state: &mut ServerState) {
         // Defer while VT-suspended: DRM master is dropped, so a rescan's
         // modeset ioctls would fail or wedge. Gate rescans on `vt_state`.
@@ -6328,25 +6445,8 @@ impl KmsBackend {
             log::debug!("kms: display rescan skipped (VT not Active)");
             return;
         }
-        let configured = self.randr_id_alloc.client_configured_keys();
-        let known_connected = self.randr_id_alloc.connected_keys();
-        match self
-            .platform
-            .requery_outputs_and_modeset(&configured, &known_connected)
-        {
-            Ok(rescan) => {
-                let registry_changed =
-                    self.reconcile_connector_registry(&rescan.connected, &rescan.dropped_keys);
-                if !registry_changed && rescan.dropped_old_indices.is_empty() {
-                    log::debug!("kms: display rescan found no topology change");
-                    return;
-                }
-                self.fire_randr_changes(state, &rescan);
-                // A retired connector's CRTC is gone; drop any stale armed
-                // entry so it can't block re-arm or mis-dedup a reused id.
-                self.prune_armed_targets_to_live_outputs();
-            }
-            Err(e) => log::error!("kms: display rescan failed: {e}"),
+        if let Err(e) = self.rescan_display_topology(state) {
+            log::error!("kms: display rescan failed: {e}");
         }
     }
 
@@ -11697,31 +11797,16 @@ impl Backend for KmsBackend {
     }
 
     fn reprobe_connectors(&mut self, state: &mut ServerState) -> io::Result<()> {
-        // Reconcile the connector registry with the hardware WITHOUT
-        // disturbing any enabled output (no auto-enable, no recompact,
-        // no modeset). Mirrors requery's discover/diff minus the apply.
-        // discover_outputs reads connector/mode/property state and
-        // computes a hypothetical CRTC/plane assignment but commits
-        // nothing, so it is safe to call while outputs are live.
-        let connected = self.platform.discover_connector_snapshots()?;
-        let seen: HashSet<OutputKey> = connected
-            .iter()
-            .map(|snapshot| snapshot.key.clone())
-            .collect();
-        let mut dropped: Vec<OutputKey> = self
-            .randr_id_alloc
-            .connected_keys()
-            .difference(&seen)
-            .cloned()
-            .collect();
-        dropped.sort();
-        let changed = self.reconcile_connector_registry(&connected, &dropped);
-        // Pure re-probe: never bumps lastSetTime (set_time = None); bumps
-        // lastConfigTime only when something actually changed. A no-op
-        // probe leaves both timestamps + the client-set screen size
-        // intact (Xorg RRGetInfo force_query semantics).
-        self.rebuild_randr_state(state, None, changed);
-        Ok(())
+        // RRGetScreenResources is an explicit force-query boundary. Drive the
+        // same full reconciliation as a debounced hotplug so a missed uevent
+        // cannot leave a disconnected ActiveOutput reviving stale EDID during
+        // projection. Surviving enabled outputs keep their current mode and
+        // placement; newly connected outputs remain off.
+        if self.vt_state != crate::vt::state::VtState::Active {
+            log::debug!("kms: explicit connector reprobe skipped (VT not Active)");
+            return Ok(());
+        }
+        self.rescan_display_topology(state)
     }
 
     fn set_provider_output_source(
@@ -11939,7 +12024,10 @@ impl Backend for KmsBackend {
                     .ok_or_else(|| {
                         io::Error::other(format!("no DRM device for output {output_key:?}"))
                     })?;
-                let discovered = match crate::platform::drm::discover_outputs(&kms_device.device) {
+                let discovered = match crate::platform::drm::discover_outputs(
+                    &kms_device.device,
+                    crate::platform::drm::ConnectorProbe::Cached,
+                ) {
                     Ok(v) => v,
                     Err(e) => {
                         log::error!("apply_crtc_config: discover_outputs failed: {e}");
@@ -18771,12 +18859,14 @@ mod tests {
         height: u16,
         vrefresh: u32,
         preferred: bool,
-    ) -> super::AdvertisedMode {
-        super::AdvertisedMode {
+    ) -> crate::platform::drm::Mode {
+        crate::platform::drm::Mode {
+            name: format!("{width}x{height}"),
             width,
             height,
             vrefresh,
             preferred,
+            ..Default::default()
         }
     }
 
@@ -19523,6 +19613,10 @@ mod tests {
                     preferred: true,
                     ..Default::default()
                 }],
+                edid: vec![0x01],
+                mm_width: 510,
+                mm_height: 290,
+                connector_type: "HDMI".to_string(),
             },
             ConnectorSnapshot {
                 key: second.clone(),
@@ -19533,6 +19627,10 @@ mod tests {
                     preferred: true,
                     ..Default::default()
                 }],
+                edid: vec![0x02],
+                mm_width: 600,
+                mm_height: 340,
+                connector_type: "HDMI".to_string(),
             },
         ];
 
@@ -19568,20 +19666,251 @@ mod tests {
     }
 
     #[test]
-    fn randr_mode_ids_dedup_by_resolution() {
+    fn connector_registry_detects_edid_only_replacement_and_keeps_xids() {
+        let mut backend = KmsBackend::for_tests();
+        let key = test_output_key(0, "HDMI-A-1");
+        let mode = crate::platform::drm::Mode {
+            name: "1600x1200".to_string(),
+            width: 1600,
+            height: 1200,
+            vrefresh: 60,
+            preferred: true,
+            ..Default::default()
+        };
+        let first = ConnectorSnapshot {
+            key: key.clone(),
+            modes: vec![mode.clone()],
+            edid: vec![0x01, 0x02],
+            mm_width: 600,
+            mm_height: 340,
+            connector_type: "HDMI".to_string(),
+        };
+        let replacement = ConnectorSnapshot {
+            edid: vec![0x03, 0x04],
+            ..first.clone()
+        };
+
+        assert!(backend.reconcile_connector_registry(std::slice::from_ref(&first), &[]));
+        let ids = backend.randr_id_alloc.entry(&key).unwrap().ids;
+        assert!(
+            backend.reconcile_connector_registry(std::slice::from_ref(&replacement), &[]),
+            "a changed EDID must invalidate the cached RANDR connector projection"
+        );
+
+        let entry = backend.randr_id_alloc.entry(&key).unwrap();
+        assert_eq!(
+            entry.ids, ids,
+            "physical monitor changes reuse connector XIDs"
+        );
+        assert_eq!(entry.edid, replacement.edid);
+        assert!(
+            !backend.reconcile_connector_registry(std::slice::from_ref(&replacement), &[]),
+            "the refreshed connector snapshot must be idempotent"
+        );
+    }
+
+    #[test]
+    fn live_randr_projection_uses_reprobed_connector_identity() {
+        let mut backend = KmsBackend::for_tests();
+        let key = backend.platform.outputs[0].key.clone();
+        let initial = backend.randr_outputs();
+        let initial_output = initial.iter().find(|output| output.name == "test").unwrap();
+        let initial_ids = (initial_output.output_id, initial_output.crtc_id);
+        let replacement = ConnectorSnapshot {
+            key,
+            modes: vec![crate::platform::drm::Mode {
+                name: "1200x1600".to_string(),
+                width: 1200,
+                height: 1600,
+                vrefresh: 60,
+                preferred: true,
+                ..Default::default()
+            }],
+            edid: vec![0x00, 0xff, 0xff, 0xff, 0xff],
+            mm_width: 203,
+            mm_height: 271,
+            connector_type: "HDMI".to_string(),
+        };
+
+        assert!(backend.reconcile_connector_registry(std::slice::from_ref(&replacement), &[]));
+        let (refreshed, mode_table) = backend.randr_outputs_and_modes();
+        let output = refreshed
+            .iter()
+            .find(|output| output.name == "test")
+            .unwrap();
+
+        assert_eq!((output.output_id, output.crtc_id), initial_ids);
+        assert_eq!((output.mm_width, output.mm_height), (203, 271));
+        assert!(
+            mode_table.iter().any(|mode| mode.mode_id == output.mode_id),
+            "the preserved live CRTC mode must not dangle when the replacement monitor omits it"
+        );
+        assert_eq!(
+            backend.output_identity(output.output_id),
+            Some((replacement.edid, "HDMI".to_string()))
+        );
+    }
+
+    #[test]
+    fn connected_off_output_exposes_identity_and_disconnect_clears_it() {
+        let mut backend = KmsBackend::for_tests();
+        let key = test_output_key(0, "HDMI-A-1");
+        let snapshot = ConnectorSnapshot {
+            key: key.clone(),
+            modes: vec![crate::platform::drm::Mode {
+                name: "1200x1600".to_string(),
+                width: 1200,
+                height: 1600,
+                vrefresh: 60,
+                preferred: true,
+                ..Default::default()
+            }],
+            edid: vec![0x00, 0xff, 0xff, 0xff],
+            mm_width: 203,
+            mm_height: 271,
+            connector_type: "HDMI".to_string(),
+        };
+        assert!(backend.reconcile_connector_registry(std::slice::from_ref(&snapshot), &[]));
+        let ids = backend.randr_id_alloc.entry(&key).unwrap().ids;
+
+        let (outputs, _) = backend.randr_outputs_and_modes();
+        let connected = outputs
+            .iter()
+            .find(|output| output.output_id == ids.output_id)
+            .unwrap();
+        assert!(connected.connected);
+        assert_eq!(connected.mode_id, 0);
+        assert_eq!((connected.mm_width, connected.mm_height), (203, 271));
+        assert_eq!(
+            backend.output_identity(ids.output_id),
+            Some((snapshot.edid, "HDMI".to_string()))
+        );
+
+        assert!(backend.reconcile_connector_registry(&[], std::slice::from_ref(&key)));
+        let (outputs, _) = backend.randr_outputs_and_modes();
+        let disconnected = outputs
+            .iter()
+            .find(|output| output.output_id == ids.output_id)
+            .unwrap();
+        assert!(!disconnected.connected);
+        assert_eq!((disconnected.mm_width, disconnected.mm_height), (0, 0));
+        assert_eq!(backend.output_identity(ids.output_id), None);
+    }
+
+    #[test]
+    fn forced_disconnect_projection_does_not_revive_stale_active_output() {
+        let mut backend = KmsBackend::for_tests();
+        let key = backend.platform.outputs[0].key.clone();
+        let initial = backend.randr_outputs();
+        let ids = initial
+            .iter()
+            .find(|output| output.name == "test")
+            .map(|output| (output.output_id, output.crtc_id))
+            .unwrap();
+
+        assert!(backend.reconcile_connector_registry(&[], std::slice::from_ref(&key)));
+        let projected = backend.randr_outputs();
+        let output = projected
+            .iter()
+            .find(|output| output.output_id == ids.0)
+            .unwrap();
+
+        assert_eq!(output.crtc_id, ids.1);
+        assert!(!output.connected);
+        assert_eq!(output.mode_id, 0);
+        assert!(
+            !backend.randr_id_alloc.entry(&key).unwrap().connected,
+            "a stale platform.outputs record must not overwrite a forced disconnected probe"
+        );
+    }
+
+    #[test]
+    fn randr_mode_ids_dedup_exact_modes_but_distinguish_timings() {
         let mut alloc = RandrIdAllocator::default();
-        let m1 = alloc.mode_id(2560, 1440, 60);
-        let m2 = alloc.mode_id(2560, 1440, 60);
-        let m3 = alloc.mode_id(1920, 1080, 60);
+        let mode = test_advertised_mode(2560, 1440, 60, true);
+        let same_mode_different_preference = crate::platform::drm::Mode {
+            preferred: false,
+            ..mode.clone()
+        };
+        let different_timing = crate::platform::drm::Mode {
+            clock_khz: 241_500,
+            hsync_start: 2608,
+            hsync_end: 2640,
+            htotal: 2720,
+            vsync_start: 1443,
+            vsync_end: 1448,
+            vtotal: 1481,
+            ..mode.clone()
+        };
+        let m1 = alloc.mode_id(&mode);
+        let m2 = alloc.mode_id(&same_mode_different_preference);
+        let m3 = alloc.mode_id(&different_timing);
         assert_eq!(m1, m2);
         assert_ne!(m1, m3);
     }
 
-    /// Issue #48: a connector advertising the same `(w,h,vrefresh)` more
-    /// than once (HDMI EDID+CEA+DMT timings all collapse to one mode XID)
+    #[test]
+    fn same_signature_monitor_replacement_keeps_exact_timings_distinct() {
+        let mut backend = KmsBackend::for_tests();
+        let initial = backend.randr_outputs();
+        let initial = initial.iter().find(|output| output.name == "test").unwrap();
+        let current_mode_id = initial.mode_id;
+        let key = backend.platform.outputs[0].key.clone();
+        let replacement_mode = crate::platform::drm::Mode {
+            name: "test".to_string(),
+            width: 800,
+            height: 600,
+            vrefresh: 60,
+            preferred: true,
+            clock_khz: 40_000,
+            hsync_start: 840,
+            hsync_end: 968,
+            htotal: 1056,
+            vsync_start: 601,
+            vsync_end: 605,
+            vtotal: 628,
+            flags: 0x5,
+        };
+        let replacement = ConnectorSnapshot {
+            key,
+            modes: vec![replacement_mode.clone()],
+            edid: vec![0x00, 0xff, 0xff, 0xff, 0x02],
+            mm_width: 211,
+            mm_height: 158,
+            connector_type: "HDMI".to_string(),
+        };
+
+        assert!(backend.reconcile_connector_registry(&[replacement], &[]));
+        let (outputs, modes) = backend.randr_outputs_and_modes();
+        let output = outputs.iter().find(|output| output.name == "test").unwrap();
+        let advertised_mode_id = output.mode_ids[0];
+
+        assert_eq!(output.mode_id, current_mode_id);
+        assert_ne!(
+            output.mode_id, advertised_mode_id,
+            "the old live timing and the replacement monitor timing need distinct XIDs"
+        );
+        assert_eq!(
+            modes
+                .iter()
+                .find(|mode| mode.mode_id == output.mode_id)
+                .and_then(|mode| mode.timing),
+            None,
+        );
+        assert_eq!(
+            modes
+                .iter()
+                .find(|mode| mode.mode_id == advertised_mode_id)
+                .and_then(|mode| mode.timing),
+            mode_timing(&replacement_mode),
+        );
+    }
+
+    /// Issue #48: a connector advertising the same exact mode more than once
     /// must not emit that XID multiple times in `GetOutputInfo` — `xrandr`
-    /// showed `1920x1080 60.00*+ 60.00* 60.00*`. The per-output `mode_ids`
-    /// list must contain each XID at most once.
+    /// showed `1920x1080 60.00*+ 60.00* 60.00*`. Distinct timings at the same
+    /// nominal resolution/refresh retain distinct XIDs; exact duplicates do
+    /// not. The per-output `mode_ids` list must contain each XID at most once.
     #[test]
     fn randr_output_mode_ids_have_no_duplicate_xids() {
         let mut b = KmsBackend::for_tests();

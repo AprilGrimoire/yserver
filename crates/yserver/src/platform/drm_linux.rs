@@ -26,7 +26,7 @@ use ::drm::{
 use crate::{
     drm::{Device, modeset::PropMap},
     platform::drm::{
-        DrmDeviceKey, DrmNode, DrmNodeKind, DrmPlatform, KmsPlatform, Mode, Output,
+        ConnectorProbe, DrmDeviceKey, DrmNode, DrmNodeKind, DrmPlatform, KmsPlatform, Mode, Output,
         open_path_cloexec,
     },
 };
@@ -69,8 +69,8 @@ impl DrmPlatform for LinuxDrmPlatform {
 }
 
 impl KmsPlatform for LinuxDrmPlatform {
-    fn discover_outputs(&self, device: &Device) -> io::Result<Vec<Output>> {
-        discover_outputs(device)
+    fn discover_outputs(&self, device: &Device, probe: ConnectorProbe) -> io::Result<Vec<Output>> {
+        discover_outputs(device, probe)
     }
 }
 
@@ -243,7 +243,7 @@ fn assign_outputs(connectors: &[ConnectorCandidate]) -> Result<Vec<Assignment>, 
 /// Panics only on internal invariant violations: a connector tracked in
 /// `connector_infos` must always be present when its assignment is finalized,
 /// and the picked mode must always be one of the connector's local modes.
-fn discover_outputs(device: &Device) -> io::Result<Vec<Output>> {
+fn discover_outputs(device: &Device, probe: ConnectorProbe) -> io::Result<Vec<Output>> {
     let resources = device.resource_handles()?;
 
     // Pre-collect primary planes with their possible-CRTC sets.
@@ -278,7 +278,7 @@ fn discover_outputs(device: &Device) -> io::Result<Vec<Output>> {
     let mut candidates: Vec<ConnectorCandidate> = Vec::new();
     let mut connector_infos: HashMap<connector::Handle, connector::Info> = HashMap::new();
     for &handle in resources.connectors() {
-        let info = device.get_connector(handle, false)?;
+        let info = device.get_connector(handle, probe.force_probe())?;
         if info.state() != connector::State::Connected || info.modes().is_empty() {
             continue;
         }

@@ -1075,6 +1075,21 @@ pub fn emit_randr_change_notifications(state: &mut ServerState, changed: &[(u32,
         .iter()
         .map(|o| (o.crtc_id, (o.x, o.y, o.width, o.height)))
         .collect();
+    let output_connections: std::collections::HashMap<u32, u8> = state
+        .randr
+        .outputs
+        .iter()
+        .map(|output| {
+            (
+                output.output_id,
+                if output.connected {
+                    x11randr::CONNECTION_CONNECTED
+                } else {
+                    x11randr::CONNECTION_DISCONNECTED
+                },
+            )
+        })
+        .collect();
 
     let subscribers: Vec<(u32, yserver_protocol::x11::ResourceId, u16)> = state
         .randr_select_masks
@@ -1136,6 +1151,10 @@ pub fn emit_randr_change_notifications(state: &mut ServerState, changed: &[(u32,
                         output,
                         crtc,
                         mode,
+                        connection: output_connections
+                            .get(&output)
+                            .copied()
+                            .unwrap_or(x11randr::CONNECTION_CONNECTED),
                     },
                 );
                 let _ = client_io::write_or_buffer(client, &event);

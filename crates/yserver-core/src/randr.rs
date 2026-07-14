@@ -63,7 +63,7 @@ pub struct ModeTiming {
     pub mode_flags: u32,
 }
 
-/// One unique mode (deduped by `(width, height, vrefresh)`).
+/// One unique mode (deduped by dimensions, refresh, and exact timing).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RandrMode {
     pub mode_id: u32,
@@ -143,10 +143,9 @@ impl RandrState {
     ///
     /// The caller is responsible for picking output / CRTC / mode IDs
     /// per spec §2.6.1: outputs `1..=N`, CRTCs `(N+1)..=2N`, modes
-    /// `2N+1..` with dedup by `(width, height, vrefresh)`. `from_outputs`
-    /// trusts the caller's mode-id assignment and just collects the
-    /// unique `(mode_id, w, h, vrefresh)` tuples for the `modes`
-    /// vector.
+    /// `2N+1..` with timing-aware deduplication. `from_outputs` trusts the
+    /// caller's mode-id assignment and just collects the unique
+    /// `(mode_id, w, h, vrefresh, timing)` tuples for the `modes` vector.
     ///
     /// Aggregation (boot default; `RRSetScreenSize` later overrides the
     /// reported `screen_width`/`screen_height`):
