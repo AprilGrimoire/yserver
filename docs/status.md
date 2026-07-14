@@ -321,13 +321,17 @@ Cross-cutting bugs and followups that don't fit a stage live in
   properties, and automatic output layout remain unimplemented.
 - **2026-07-14 copied reverse-PRIME compatibility path**: cross-device output
   enable now appends a third, copying mechanism after both copy-free ownership
-  directions fail. GPU A renders into its own exportable source ring; a stable
-  backend completion poller reports the source `sync_file` to the main loop,
-  which submits a semaphore-waiting full-image copy on a minimal Vulkan
-  transfer context for GPU B. B's copy-completion fence is handed directly to
-  KMS as `IN_FENCE_FD`, so the successful path needs no second userspace wait.
-  B scans from an independent local framebuffer ring, removing the requirement
-  that one allocation be simultaneously renderable by A and scannable by B.
+  directions fail. GPU A renders into an optimal renderer-local source ring,
+  then copies each composed frame into a transfer-only linear DMA-BUF transport
+  ring. A stable backend completion poller reports the transport `sync_file` to
+  the main loop, which submits a semaphore-waiting full-image copy on a minimal
+  Vulkan transfer context for GPU B. B's copy-completion fence is handed
+  directly to KMS as `IN_FENCE_FD`, so the successful path needs no second
+  userspace wait. B scans from an independent local framebuffer ring, removing
+  the requirement that one allocation be simultaneously renderable by A and
+  scannable by B. Separating A's optimal render target from its linear transport
+  also supports drivers such as RADV that cannot use a linear external-memory
+  image as a color attachment.
   The copied candidate uses disposable A/B logical devices to validate every
   slot's export/import, real GPU copy, and atomic `TEST_ONLY` modeset before a
   live pool is installed. Per-frame state distinguishes waiting-for-A from

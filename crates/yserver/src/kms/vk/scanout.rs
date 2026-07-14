@@ -345,13 +345,14 @@ impl OutputScanout {
     }
 }
 
-/// A renderer-owned source image on GPU A together with GPU B's imported
-/// transfer-source alias. Field order keeps the B alias alive no longer than
-/// the A allocation it references.
+/// An optimal render target and a linear cross-GPU transport image on GPU A,
+/// together with GPU B's imported transfer-source alias of that transport.
+/// Field order keeps the B alias alive no longer than the A allocation it
+/// references.
 pub(crate) struct CopiedRenderSource {
     imported_on_sink: DrawableImage,
-    exportable_on_renderer: super::target::ExportableImage,
-    pub(crate) image_view: vk::ImageView,
+    linear_on_renderer: super::target::ExportableImage,
+    render_target: DrawableImage,
     pub(crate) completion_semaphore: vk::Semaphore,
     pub(crate) transfer: TransferResources,
     render_vk: Arc<VkContext>,
@@ -366,15 +367,18 @@ impl CopiedRenderSource {
         width: u32,
         height: u32,
     ) -> io::Result<Self> {
-        let exportable_on_renderer = super::target::allocate_exportable(
+        let render_target =
+            DrawableImage::new_server_owned_window(Arc::clone(&render_vk), width, height)
+                .map_err(|err| io::Error::other(format!("copy render target allocation: {err}")))?;
+        let linear_on_renderer = super::target::allocate_linear_transport(
             &render_vk,
             width,
             height,
             vk::Format::B8G8R8A8_UNORM,
         )
-        .map_err(|err| io::Error::other(format!("copy source allocation: {err:?}")))?;
-        let exported = super::dri3::export_backing(&render_vk, &exportable_on_renderer)
-            .map_err(|err| io::Error::other(format!("copy source DMA-BUF export: {err:?}")))?;
+        .map_err(|err| io::Error::other(format!("linear transport allocation: {err:?}")))?;
+        let exported = super::dri3::export_backing(&render_vk, &linear_on_renderer)
+            .map_err(|err| io::Error::other(format!("linear transport DMA-BUF export: {err:?}")))?;
         let imported_on_sink = DrawableImage::from_dmabuf_with_usage(
             Arc::clone(&sink_vk),
             exported.fd,
@@ -386,29 +390,11 @@ impl CopiedRenderSource {
             &[exported.stride],
             vk::ImageUsageFlags::TRANSFER_SRC,
         )
-        .map_err(|err| io::Error::other(format!("copy source sink import: {err:?}")))?;
+        .map_err(|err| io::Error::other(format!("linear transport sink import: {err:?}")))?;
 
-        let view_info = vk::ImageViewCreateInfo::default()
-            .image(exportable_on_renderer.image)
-            .view_type(vk::ImageViewType::TYPE_2D)
-            .format(vk::Format::B8G8R8A8_UNORM)
-            .subresource_range(
-                vk::ImageSubresourceRange::default()
-                    .aspect_mask(vk::ImageAspectFlags::COLOR)
-                    .level_count(1)
-                    .layer_count(1),
-            );
-        let image_view = unsafe { render_vk.device.create_image_view(&view_info, None) }
-            .map_err(|err| io::Error::other(format!("copy source image view: {err:?}")))?;
-        let completion_semaphore = match create_export_semaphore(&render_vk) {
-            Ok(semaphore) => semaphore,
-            Err(err) => {
-                unsafe { render_vk.device.destroy_image_view(image_view, None) };
-                return Err(io::Error::other(format!(
-                    "copy source completion semaphore: {err:?}"
-                )));
-            }
-        };
+        let completion_semaphore = create_export_semaphore(&render_vk).map_err(|err| {
+            io::Error::other(format!("copy source completion semaphore: {err:?}"))
+        })?;
         let transfer = match allocate_transfer_resources(&render_vk, width, height) {
             Ok(transfer) => transfer,
             Err(err) => {
@@ -416,7 +402,6 @@ impl CopiedRenderSource {
                     render_vk
                         .device
                         .destroy_semaphore(completion_semaphore, None);
-                    render_vk.device.destroy_image_view(image_view, None);
                 }
                 return Err(io::Error::other(format!(
                     "copy source command resources: {err:?}"
@@ -426,8 +411,8 @@ impl CopiedRenderSource {
 
         Ok(Self {
             imported_on_sink,
-            exportable_on_renderer,
-            image_view,
+            linear_on_renderer,
+            render_target,
             completion_semaphore,
             transfer,
             render_vk,
@@ -437,15 +422,110 @@ impl CopiedRenderSource {
     }
 
     pub(crate) fn image(&self) -> vk::Image {
-        self.exportable_on_renderer.image
+        self.render_target.vk_image
+    }
+
+    pub(crate) fn image_view(&self) -> vk::ImageView {
+        self.render_target.vk_image_view
+    }
+
+    pub(crate) fn linear_image(&self) -> vk::Image {
+        self.linear_on_renderer.image
+    }
+
+    /// Finish an A-side compose by copying the optimal render target into the
+    /// linear DMA-BUF transport image. Both images are left in `GENERAL`: the
+    /// render target is then ready for a later buffer-age `LOAD`, while GPU B
+    /// imports the transport image from the same externally visible layout.
+    pub(crate) fn record_linearization(
+        &self,
+        device: &ash::Device,
+        command_buffer: vk::CommandBuffer,
+    ) {
+        unsafe {
+            let before_copy = [
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                    .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+                    .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
+                    .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .image(self.image())
+                    .subresource_range(color_subresource_range()),
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
+                    .src_access_mask(vk::AccessFlags2::empty())
+                    .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+                    .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                    // Every frame overwrites the complete transport image, so
+                    // its previous contents and layout can be discarded.
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .image(self.linear_image())
+                    .subresource_range(color_subresource_range()),
+            ];
+            crate::vk_count!(cmd_pipeline_barrier2);
+            device.cmd_pipeline_barrier2(
+                command_buffer,
+                &vk::DependencyInfo::default().image_memory_barriers(&before_copy),
+            );
+
+            let layers = vk::ImageSubresourceLayers::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .layer_count(1);
+            let regions = [vk::ImageCopy::default()
+                .src_subresource(layers)
+                .dst_subresource(layers)
+                .extent(vk::Extent3D {
+                    width: self.width(),
+                    height: self.height(),
+                    depth: 1,
+                })];
+            crate::vk_count!(cmd_copy_image);
+            device.cmd_copy_image(
+                command_buffer,
+                self.image(),
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                self.linear_image(),
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &regions,
+            );
+
+            let after_copy = [
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                    .src_access_mask(vk::AccessFlags2::TRANSFER_READ)
+                    .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                    .dst_access_mask(vk::AccessFlags2::empty())
+                    .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .image(self.image())
+                    .subresource_range(color_subresource_range()),
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                    .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                    .dst_access_mask(vk::AccessFlags2::empty())
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .image(self.linear_image())
+                    .subresource_range(color_subresource_range()),
+            ];
+            crate::vk_count!(cmd_pipeline_barrier2);
+            device.cmd_pipeline_barrier2(
+                command_buffer,
+                &vk::DependencyInfo::default().image_memory_barriers(&after_copy),
+            );
+        }
     }
 
     pub(crate) fn width(&self) -> u32 {
-        self.exportable_on_renderer.extent.width
+        self.render_target.extent.width
     }
 
     pub(crate) fn height(&self) -> u32 {
-        self.exportable_on_renderer.extent.height
+        self.render_target.extent.height
     }
 
     pub(crate) fn export_render_completion(&self) -> Result<OwnedFd, vk::Result> {
@@ -467,9 +547,6 @@ impl Drop for CopiedRenderSource {
             self.render_vk
                 .device
                 .destroy_semaphore(self.completion_semaphore, None);
-            self.render_vk
-                .device
-                .destroy_image_view(self.image_view, None);
         }
     }
 }
@@ -677,8 +754,9 @@ impl CopiedScanoutPool {
     }
 
     /// Probe the actual cross-device handoff for every slot: A clears its
-    /// exportable source, exports completion, and B imports that completion
-    /// while copying into the local scanout destination.
+    /// optimal render target, copies it into the linear transport image, and
+    /// exports completion; B imports that completion while copying into the
+    /// local scanout destination.
     pub(crate) fn probe_copy_all(&mut self) -> io::Result<()> {
         for bo_idx in 0..self.sources.len() {
             let render_completion = {
@@ -716,7 +794,7 @@ impl CopiedScanoutPool {
                         &vk::DependencyInfo::default().image_memory_barriers(&to_color),
                     );
                     let color_attachment = [vk::RenderingAttachmentInfo::default()
-                        .image_view(source.image_view)
+                        .image_view(source.image_view())
                         .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                         .load_op(vk::AttachmentLoadOp::CLEAR)
                         .store_op(vk::AttachmentStoreOp::STORE)
@@ -739,18 +817,7 @@ impl CopiedScanoutPool {
                             .color_attachments(&color_attachment),
                     );
                     source.render_vk.device.cmd_end_rendering(command_buffer);
-                    let to_general = [vk::ImageMemoryBarrier2::default()
-                        .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-                        .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
-                        .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-                        .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                        .new_layout(vk::ImageLayout::GENERAL)
-                        .image(source.image())
-                        .subresource_range(color_subresource_range())];
-                    source.render_vk.device.cmd_pipeline_barrier2(
-                        command_buffer,
-                        &vk::DependencyInfo::default().image_memory_barriers(&to_general),
-                    );
+                    source.record_linearization(&source.render_vk.device, command_buffer);
                     source
                         .render_vk
                         .device

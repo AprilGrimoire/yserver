@@ -1369,6 +1369,37 @@ fn allocate_exportable_linear(
     height: u32,
     format: vk::Format,
 ) -> Result<ExportableImage, vk::Result> {
+    allocate_exportable_linear_with_usage(vk, width, height, format, EXPORT_IMAGE_USAGE)
+}
+
+/// Allocate the deliberately simple cross-GPU transport image used by copied
+/// scanout. Unlike a GLX-TFP export, this image is never rendered into or
+/// sampled on GPU A: A only copies into it and GPU B only copies out of its
+/// imported alias. Keeping `COLOR_ATTACHMENT` out of the usage contract lets
+/// drivers such as RADV allocate a linear external-memory image even when
+/// linear render targets are unsupported.
+pub(crate) fn allocate_linear_transport(
+    vk: &Arc<VkContext>,
+    width: u32,
+    height: u32,
+    format: vk::Format,
+) -> Result<ExportableImage, vk::Result> {
+    allocate_exportable_linear_with_usage(
+        vk,
+        width,
+        height,
+        format,
+        vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST,
+    )
+}
+
+fn allocate_exportable_linear_with_usage(
+    vk: &Arc<VkContext>,
+    width: u32,
+    height: u32,
+    format: vk::Format,
+    usage: vk::ImageUsageFlags,
+) -> Result<ExportableImage, vk::Result> {
     let mut ext_mem = vk::ExternalMemoryImageCreateInfo::default()
         .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
 
@@ -1384,7 +1415,7 @@ fn allocate_exportable_linear(
         .array_layers(1)
         .samples(vk::SampleCountFlags::TYPE_1)
         .tiling(vk::ImageTiling::LINEAR)
-        .usage(EXPORT_IMAGE_USAGE)
+        .usage(usage)
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
         .initial_layout(vk::ImageLayout::UNDEFINED)
         .push_next(&mut ext_mem);

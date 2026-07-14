@@ -2928,10 +2928,18 @@ fn add_projected_damage(
 trait ComposeRenderTarget {
     fn image(&self) -> vk::Image;
     fn image_view(&self) -> vk::ImageView;
+    fn record_post_compose_commands(&self, device: &ash::Device, command_buffer: vk::CommandBuffer);
     fn command_buffer(&self) -> vk::CommandBuffer;
     fn completion_semaphore(&self) -> vk::Semaphore;
     fn width(&self) -> u32;
     fn height(&self) -> u32;
+}
+
+fn color_subresource_range() -> vk::ImageSubresourceRange {
+    vk::ImageSubresourceRange::default()
+        .aspect_mask(vk::ImageAspectFlags::COLOR)
+        .level_count(1)
+        .layer_count(1)
 }
 
 impl ComposeRenderTarget for ScanoutBo {
@@ -2941,6 +2949,29 @@ impl ComposeRenderTarget for ScanoutBo {
 
     fn image_view(&self) -> vk::ImageView {
         self.vk_image_view
+    }
+
+    fn record_post_compose_commands(
+        &self,
+        device: &ash::Device,
+        command_buffer: vk::CommandBuffer,
+    ) {
+        let to_scanout = [vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+            .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            .dst_access_mask(vk::AccessFlags2::empty())
+            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .new_layout(vk::ImageLayout::GENERAL)
+            .image(self.image())
+            .subresource_range(color_subresource_range())];
+        unsafe {
+            crate::vk_count!(cmd_pipeline_barrier2);
+            device.cmd_pipeline_barrier2(
+                command_buffer,
+                &vk::DependencyInfo::default().image_memory_barriers(&to_scanout),
+            );
+        }
     }
 
     fn command_buffer(&self) -> vk::CommandBuffer {
@@ -2966,7 +2997,15 @@ impl ComposeRenderTarget for CopiedRenderSource {
     }
 
     fn image_view(&self) -> vk::ImageView {
-        self.image_view
+        self.image_view()
+    }
+
+    fn record_post_compose_commands(
+        &self,
+        device: &ash::Device,
+        command_buffer: vk::CommandBuffer,
+    ) {
+        self.record_linearization(device, command_buffer);
     }
 
     fn command_buffer(&self) -> vk::CommandBuffer {
@@ -3008,7 +3047,7 @@ fn submit_shared_scanout_frame(
     }
     let fb_handle = bo.fb_handle.ok_or(PresentError::NoFb)?;
     bo.state.transition_to_recording();
-    let completion = record_and_submit_render(
+    let completion = record_and_submit_composite(
         vk,
         bo,
         pipeline,
@@ -3054,8 +3093,9 @@ fn submit_shared_scanout_frame(
 }
 
 #[allow(clippy::too_many_arguments)]
-/// Submit GPU A's render into the copied-scanout source. The returned fence fd
-/// schedules the later GPU B copy and KMS flip through the main loop.
+/// Submit GPU A's render and its copy into the linear transport image. The
+/// returned fence fd schedules the later GPU B copy and KMS flip through the
+/// main loop.
 fn submit_copied_scanout_render(
     vk: &crate::kms::vk::device::VkContext,
     source: &CopiedRenderSource,
@@ -3071,7 +3111,7 @@ fn submit_copied_scanout_render(
         return Err(PresentError::WrongPhase(destination_state.phase));
     }
     destination_state.transition_to_recording();
-    record_and_submit_render(
+    record_and_submit_composite(
         vk,
         source,
         pipeline,
@@ -3084,7 +3124,7 @@ fn submit_copied_scanout_render(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn record_and_submit_render(
+fn record_and_submit_composite(
     vk: &crate::kms::vk::device::VkContext,
     target: &impl ComposeRenderTarget,
     pipeline: &CompositorPipeline,
@@ -3124,7 +3164,7 @@ fn record_and_submit_render(
         descriptors.push(set);
     }
 
-    record_command_buffer(vk, target, pipeline, scene, &descriptors, repaint)?;
+    record_composite_command_buffer(vk, target, pipeline, scene, &descriptors, repaint)?;
 
     let cb_info = [vk::CommandBufferSubmitInfo::default().command_buffer(target.command_buffer())];
     let sig_info = [vk::SemaphoreSubmitInfo::default()
@@ -3145,7 +3185,7 @@ fn record_and_submit_render(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn record_command_buffer<T: ComposeRenderTarget + ?Sized>(
+fn record_composite_command_buffer<T: ComposeRenderTarget + ?Sized>(
     vk: &crate::kms::vk::device::VkContext,
     bo: &T,
     pipeline: &CompositorPipeline,
@@ -3310,25 +3350,7 @@ fn record_command_buffer<T: ComposeRenderTarget + ?Sized>(
         crate::vk_count!(cmd_end_rendering);
         device.cmd_end_rendering(cb);
 
-        // Transition to GENERAL for KMS scanout.
-        let to_scanout = vk::ImageMemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-            .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
-            .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-            .dst_access_mask(vk::AccessFlags2::empty())
-            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .new_layout(vk::ImageLayout::GENERAL)
-            .image(bo.image())
-            .subresource_range(
-                vk::ImageSubresourceRange::default()
-                    .aspect_mask(vk::ImageAspectFlags::COLOR)
-                    .level_count(1)
-                    .layer_count(1),
-            );
-        let to_scanout_arr = [to_scanout];
-        let to_scanout_dep = vk::DependencyInfo::default().image_memory_barriers(&to_scanout_arr);
-        crate::vk_count!(cmd_pipeline_barrier2);
-        device.cmd_pipeline_barrier2(cb, &to_scanout_dep);
+        bo.record_post_compose_commands(device, cb);
 
         crate::vk_count!(end_command_buffer);
         device.end_command_buffer(cb)?;
