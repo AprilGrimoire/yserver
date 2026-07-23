@@ -205,8 +205,8 @@ pub(crate) fn discover_outputs(
 
 /// Resolve the KMS cards yserver should open at startup.
 ///
-/// `YSERVER_DRM_DEVICES` accepts a colon-separated, primary-first device
-/// list. The existing singular `YSERVER_DRM_DEVICE` remains a one-device-only
+/// `YSERVER_DRM_DEVICES` accepts a comma-separated, primary-first device list.
+/// The existing singular `YSERVER_DRM_DEVICE` remains a one-device-only
 /// override for compatibility. Without either override this delegates
 /// enumeration and node-relationship details to the current platform
 /// implementation, then applies yserver's shared policy:
@@ -241,7 +241,7 @@ fn parse_ordered_kms_devices(spec: &str) -> io::Result<Vec<PathBuf>> {
     }
 
     let mut devices = Vec::new();
-    for (index, component) in spec.split(':').enumerate() {
+    for (index, component) in spec.split(',').enumerate() {
         let component = component.trim();
         if component.is_empty() {
             return Err(io::Error::new(
@@ -506,12 +506,16 @@ mod tests {
     }
 
     #[test]
-    fn ordered_kms_device_override_preserves_primary_first_order() {
+    fn ordered_kms_device_override_accepts_stable_by_path_names() {
         assert_eq!(
-            parse_ordered_kms_devices("/dev/dri/card1:/dev/dri/card0").unwrap(),
+            parse_ordered_kms_devices(
+                "/dev/dri/by-path/pci-0000:01:00.0-card,\
+                 /dev/dri/by-path/pci-0000:00:02.0-card",
+            )
+            .unwrap(),
             vec![
-                PathBuf::from("/dev/dri/card1"),
-                PathBuf::from("/dev/dri/card0"),
+                PathBuf::from("/dev/dri/by-path/pci-0000:01:00.0-card"),
+                PathBuf::from("/dev/dri/by-path/pci-0000:00:02.0-card"),
             ]
         );
     }
@@ -520,10 +524,10 @@ mod tests {
     fn ordered_kms_device_override_rejects_empty_and_duplicate_paths() {
         for invalid in [
             "",
-            ":/dev/dri/card0",
-            "/dev/dri/card0:",
-            "/dev/dri/card1::/dev/dri/card0",
-            "/dev/dri/card1:/dev/dri/card1",
+            ",/dev/dri/card0",
+            "/dev/dri/card0,",
+            "/dev/dri/card1,,/dev/dri/card0",
+            "/dev/dri/card1,/dev/dri/card1",
         ] {
             assert!(
                 parse_ordered_kms_devices(invalid).is_err(),
