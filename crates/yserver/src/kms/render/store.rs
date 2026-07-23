@@ -25,7 +25,11 @@
     reason = "DrawableStore primitives are consumed by Stages 2c–2e"
 )]
 
-use std::{collections::HashMap, os::fd::OwnedFd, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    os::fd::OwnedFd,
+    sync::Arc,
+};
 
 use ash::vk;
 
@@ -610,6 +614,21 @@ pub(crate) struct Drawable {
     pub(crate) presentation_damage: RegionSet,
     pub(crate) presentation_damage_epoch: u64,
 
+    /// Idle free-run fix (cut 2b): set when this drawable is
+    /// scene-participating and holds presentation damage but was NOT
+    /// drawn by `build_scene` on ANY output last tick — i.e. it clips
+    /// to an empty visible box (mapped but off-screen / empty bounding
+    /// shape). Such damage can never be composed/ack'd, so it must not
+    /// keep arming the compose scheduler (`has_pending_presentation_
+    /// damage`) — that busy-spins the core loop at idle. The damage
+    /// itself is PRESERVED (not cleared): when a structural change
+    /// (map/move/restack/configure/shape/RandR — all mark
+    /// `scene_structure_dirty`) brings the drawable on-screen, the
+    /// forced full recompose draws it from storage and the ack drains
+    /// it, clearing this flag. Reconciled only when every output walked
+    /// this tick (see `SceneCompositor::tick`).
+    pub(crate) offscreen_no_draw: bool,
+
     /// Ungated monotonic content-write counter. Bumped (saturating) on EVERY
     /// write to this drawable's pixels — the eight engine paint entry points —
     /// regardless of `scene_participating`, unlike `presentation_damage_epoch`
@@ -818,6 +837,7 @@ impl DrawableStore {
             last_render_ticket: None,
             presentation_damage: RegionSet::new(),
             presentation_damage_epoch: 0,
+            offscreen_no_draw: false,
             content_version: 0,
             redirected_target: None,
         };
@@ -1034,9 +1054,31 @@ impl DrawableStore {
     /// event pokes the loop (the xfce submenu bug). Cheap: short-
     /// circuits on the first match, no allocation.
     pub(crate) fn has_pending_presentation_damage(&self) -> bool {
-        self.entries
-            .values()
-            .any(|d| d.scene_participating && !d.presentation_damage.is_empty())
+        self.entries.values().any(|d| {
+            d.scene_participating && !d.presentation_damage.is_empty() && !d.offscreen_no_draw
+        })
+    }
+
+    /// Idle free-run fix (cut 2b): reconcile the `offscreen_no_draw`
+    /// flag from the set of drawables actually drawn (sampled) by
+    /// `build_scene` across ALL outputs this tick. A scene-participating
+    /// drawable with undrained presentation damage that was NOT drawn on
+    /// any output cannot be composed/ack'd right now (it clips to an
+    /// empty visible box — off-screen / empty bounding shape), so flag
+    /// it OUT of the compose scheduler; one that WAS drawn is cleared.
+    /// The damage is never cleared here — see `offscreen_no_draw`. MUST
+    /// be called only when every output walked (`build_scene` ran), so a
+    /// drawable visible only on a mid-flip output isn't mis-flagged.
+    /// `drawn` holds *sampled source* ids (a redirected Automatic
+    /// window is sampled via its backing id, not its own).
+    pub(crate) fn reconcile_offscreen_no_draw(&mut self, drawn: &HashSet<DrawableId>) {
+        for (id, d) in &mut self.entries {
+            if !d.scene_participating || d.presentation_damage.is_empty() {
+                d.offscreen_no_draw = false;
+                continue;
+            }
+            d.offscreen_no_draw = !drawn.contains(id);
+        }
     }
 
     /// Snapshot for the SceneCompositor to ack later.
@@ -1407,6 +1449,44 @@ mod tests {
         let d = s.get(id).unwrap();
         assert!(d.presentation_damage.is_empty());
         assert!(d.presentation_damage_epoch > epoch_before);
+    }
+
+    /// Idle free-run fix (cut 2b): a scene-participating window with
+    /// damage that `build_scene` did NOT draw (not in the `drawn` set)
+    /// is flagged out of the compose scheduler — but its damage is
+    /// PRESERVED, and being drawn again re-includes it.
+    #[test]
+    fn reconcile_offscreen_no_draw_gates_scheduler_but_preserves_damage() {
+        let mut s = DrawableStore::new();
+        let id = s
+            .allocate(0x1, DrawableKind::Window, 24, true, stub_storage())
+            .unwrap();
+        s.damage(id, rect(0, 0, 4, 4));
+        assert!(
+            s.has_pending_presentation_damage(),
+            "fresh damage on a scene window arms the scheduler",
+        );
+
+        // Not drawn on any output this tick → flag off-screen.
+        s.reconcile_offscreen_no_draw(&HashSet::new());
+        assert!(
+            !s.has_pending_presentation_damage(),
+            "un-drawable off-screen damage must not arm the scheduler (idle spin)",
+        );
+        assert_eq!(
+            s.get(id).unwrap().presentation_damage.rects().len(),
+            1,
+            "damage must be PRESERVED, not cleared",
+        );
+
+        // Drawn this tick (e.g. it came on-screen) → flag cleared →
+        // counted again so its damage composes + drains.
+        let drawn: HashSet<DrawableId> = std::iter::once(id).collect();
+        s.reconcile_offscreen_no_draw(&drawn);
+        assert!(
+            s.has_pending_presentation_damage(),
+            "a drawn window's damage re-arms the scheduler",
+        );
     }
 
     #[test]

@@ -4935,3 +4935,67 @@ ids allocated across the range wrap under ynest, server log confirms
 `GetXIDRange` firing at the wrap boundary. Wire encoder unit tests are
 in `yserver-protocol`; core wiring is in `yserver-core`. `cargo test
 --locked` workspace-green; plain clippy + nightly fmt clean.
+
+## Steam Library-tab crash (#94, 2026-07-14)
+
+Steam's `steamwebhelper` SIGSEGV'd on the first Library-tab click under
+yserver (fine on Xorg), across every WM tried (mate/xfce/cinnamon/e27/e17/
+fvwm/icewm). Live gdb on the CEF browser process showed a NULL-pointer
+dereference inside stripped `libcef`: on a slave-device button event Chromium
+extracts the event's window XID, looks it up via `GetWindowFromXID()`, gets
+`nullptr`, and dereferences it unchecked. (An earlier `_XFetchEventCookie` /
+`Xfree` backtrace was a corrupted-unwind red herring — `info symbol` on the
+faulting frame was empty, i.e. a stripped bundled lib, not libX11.)
+
+Root cause was ours: **XI2 device events were reported with the raw hit
+window for every recipient**. XI2 device events propagate up the window tree
+like core events (Xorg `DeliverDeviceEvents`) — each selecting client must be
+reported the event on the window *it* selected on. Stamping the hit window
+uniformly handed a client (e.g. a root-selector like the webhelper) a window
+owned by a *different* client; `mate.xtrace` showed the webhelper receiving
+`event=`another client's window, which Xorg's trace never does. That foreign
+XID is what Chromium then NULL-dereferenced.
+
+Fix (`pointer_fanout.rs`): resolve the `event` window per recipient — the
+deepest ancestor-chain window the client owns or selected on, never a foreign
+window (root fallback), with `child` and coordinates relative to it. Crossing
+and grab-redirected delivery keep their producer/grab window. Regression test
+`xi2_device_event_reported_on_selected_ancestor_not_hit_leaf`.
+
+Separately (prior commit, orthogonal): raw XI2 events had two wire mismatches
+— the declared valuator-mask width exceeded the bytes written, and raw button
+events carried X/Y valuators. Xorg emits `RawButtonPress`/`RawButtonRelease`
+as a 40-byte event with an eight-byte all-zero valuator mask and no values;
+yserver now matches that while retaining X/Y valuators for `RawMotion` and raw
+touch. Sync-passive pointer replay suppresses the already-delivered raw event,
+and XI2 device events are delivered slave-first to match Xorg. These are real
+conformance fixes but were **not** the crash cause.
+
+## Pointer grab ownership unification (2026-07-16)
+
+Pointer grab state now has one authoritative record:
+`ActivePointerGrab`. The legacy owner/window tuple and separate passive flag
+were removed, and explicit core/XI2 grabs, activated passive grabs, and
+press-driven implicit grabs all install complete snapshots through the same
+mutation path.
+
+Implicit-grab ownership now follows the relevant Xorg
+`DeliverDeviceEvents` ordering: the deepest delivery window wins, with XI2
+before core at the same window. XI2 candidates are reduced by window depth
+rather than client hash-map iteration order. This fixes the MATE/XFCE case
+where a core selector on an ancestor incorrectly stole ownership from an XI2
+selector on the app leaf.
+
+Passive and implicit grabs persist until the final button release.
+Passive teardown now runs after the full core/XI2 fanout, so the terminating
+XI2 release is delivered under the grab before it is cleared. ReplayDevice
+still transitions an activated passive grab to NOT_GRABBED before replay.
+With attribution and lifetime corrected, XIGrabDevice now uses the pure Xorg
+guard: every foreign active grab, including an implicit one, returns
+AlreadyGrabbed; SameClient re-grabs replace successfully.
+
+Regression coverage includes the MATE leaf-attribution case, Cinnamon
+ReplayDevice dialog sequence, XFCE XI2 release delivery, matched passive-grab
+snapshot selection, multi-button final-release lifetime, and foreign
+implicit-grab AlreadyGrabbed behavior. `cargo test -p yserver-core`: 919
+passed.

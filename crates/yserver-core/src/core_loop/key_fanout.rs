@@ -123,7 +123,7 @@ pub fn key_event_fanout_to_state(
 
     // Unified device freeze (Xorg FreezeThaw switches the whole
     // device to the enqueue proc): while the keyboard device is
-    // frozen, the WHOLE key event is withheld in core_key_queue.
+    // frozen, the WHOLE key event is withheld in the global pending queue.
     // The replay (`xi1_compute_freezes` → `deliver_routed_key`)
     // regenerates both the core and the XI1 form — queueing the XI1
     // form separately here would double-deliver it on thaw (XTS
@@ -134,11 +134,11 @@ pub fn key_event_fanout_to_state(
         .is_some_and(crate::server::Xi1Freeze::frozen)
     {
         state
-            .xi1_frozen
-            .entry(crate::xinput::DEVICEID_SLAVE_KEYBOARD)
-            .or_default()
-            .core_key_queue
-            .push_back(event);
+            .sync_pending
+            .push_back(crate::server::PendingSyncEvent {
+                device: crate::xinput::DEVICEID_SLAVE_KEYBOARD,
+                event: crate::server::QueuedInputEvent::HostKey(event),
+            });
         return Vec::new();
     }
 
@@ -213,7 +213,11 @@ pub(crate) fn deliver_routed_key(state: &mut ServerState, event: HostKeyEvent) -
             // focus window if the grab owner declines it. Mirrors the
             // sync passive-button-grab freeze in `pointer_fanout`.
             if freeze && event.pressed {
-                state.frozen_keyboard_event = Some(event);
+                state
+                    .xi1_frozen
+                    .entry(crate::xinput::DEVICEID_SLAVE_KEYBOARD)
+                    .or_default()
+                    .stored = Some(crate::server::QueuedInputEvent::HostKey(event));
             }
             // Xorg DeliverGrabbedEvent: with owner_events, key events
             // that would naturally land on one of the grab client's
@@ -476,7 +480,12 @@ fn key_route(state: &mut ServerState, event: &HostKeyEvent) -> KeyRoute {
             && kc == event.keycode
         {
             state.active_keyboard_grab = None;
-            state.frozen_keyboard_event = None;
+            if let Some(freeze) = state
+                .xi1_frozen
+                .get_mut(&crate::xinput::DEVICEID_SLAVE_KEYBOARD)
+            {
+                freeze.stored = None;
+            }
             // Release the XI1-side holds the activation placed.
             crate::core_loop::pointer_fanout::xi1_core_grab_bridge_release(
                 state,
@@ -933,7 +942,11 @@ mod tests {
             "passive grab must activate, owned by client 7"
         );
         assert!(
-            state.frozen_keyboard_event.is_some(),
+            state
+                .xi1_frozen
+                .get(&crate::xinput::DEVICEID_SLAVE_KEYBOARD)
+                .and_then(|f| f.stored.as_ref())
+                .is_some(),
             "synchronous grab must freeze the press for replay"
         );
         assert!(
@@ -982,7 +995,11 @@ mod tests {
         let _ = key_event_fanout_to_state(&mut state, &mut backend, key_event(true, 33));
         assert!(state.active_keyboard_grab.is_some());
         assert!(
-            state.frozen_keyboard_event.is_none(),
+            state
+                .xi1_frozen
+                .get(&crate::xinput::DEVICEID_SLAVE_KEYBOARD)
+                .and_then(|f| f.stored.as_ref())
+                .is_none(),
             "async grab must not freeze"
         );
     }

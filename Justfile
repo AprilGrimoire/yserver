@@ -198,16 +198,14 @@ yserver-mate-hw-perf log="warn" freq="999":
 yserver-mate-hw-release log="warn":
     RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release --bin yserver
     bash -c '\
-        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
         RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-mate.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 \
-            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
+            XDG_SESSION_TYPE=x11 \
             dbus-run-session mate-session --display :7 > mate.log 2>&1;\
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;\
-        rm -rf "$xdg_rd" 2>/dev/null;'
 
 # Release-build counterpart to `yserver-mate-hw-trace`: builds with
 # `--release` (so perf characteristics match real-world) but still
@@ -226,7 +224,7 @@ yserver-mate-hw-release-trace log="warn":
         RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-mate.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
-        x11trace -d :7 -D :8 -n -o mate.xtrace &\
+        x11trace -d :7 -D :8 -k -n -o mate.xtrace &\
         xtrace_pid=$!;\
         sleep 1;\
         env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:8 GDK_BACKEND=x11 \
@@ -281,7 +279,6 @@ yserver-mate-hw-trace log="trace":
     cargo build --bin yserver
     rm -f mate.xtrace
     bash -c '\
-        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
         RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
             YSERVER_SCENE_WALK_ALL=1 \
             target/debug/yserver > yserver-hw-mate.log 2>&1 &\
@@ -291,11 +288,10 @@ yserver-mate-hw-trace log="trace":
         xtrace_pid=$!;\
         sleep 1;\
         env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:8 GDK_BACKEND=x11 \
-            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
+            XDG_SESSION_TYPE=x11 \
             dbus-run-session mate-session --display :8 > mate.log 2>&1;\
         kill -TERM $xtrace_pid $yserver_pid 2>/dev/null;\
-        wait $yserver_pid 2>/dev/null;\
-        rm -rf "$xdg_rd" 2>/dev/null;'
+        wait $yserver_pid 2>/dev/null;'
 
 # Counterpart to `yserver-mate-hw` with Vulkan validation + RADV
 # hang reporting wired in for tracking down GPU VM faults / device
@@ -386,7 +382,6 @@ yserver-xfce-hw-trace log="debug":
     cargo build --bin yserver
     rm -f xfce.xtrace
     bash -c '\
-        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
         RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-xfce.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
@@ -394,11 +389,39 @@ yserver-xfce-hw-trace log="debug":
         xtrace_pid=$!;\
         sleep 1;\
         env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:8 GDK_BACKEND=x11 \
-            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
+            XDG_SESSION_TYPE=x11 \
             dbus-run-session xfce4-session --display :8 > xfce.log 2>&1;\
         kill -TERM $xtrace_pid $yserver_pid 2>/dev/null;\
-        wait $yserver_pid 2>/dev/null;\
-        rm -rf "$xdg_rd" 2>/dev/null;'
+        wait $yserver_pid 2>/dev/null'
+
+# ============================== PLASMA ==============================
+yserver-plasma-hw log="info":
+    cargo build --release --bin yserver
+    bash -c '\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-plasma.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 \
+            XDG_SESSION_TYPE=x11 \
+            dbus-run-session startplasma-x11 > plasma.log 2>&1;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null'
+
+yserver-plasma-hw-trace log="debug":
+    cargo build --bin yserver
+    rm -f plasma.xtrace
+    bash -c '\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-plasma.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        x11trace -d :7 -D :8 -n -o plasma.xtrace &\
+        xtrace_pid=$!;\
+        sleep 1;\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:8 GDK_BACKEND=x11 \
+            XDG_SESSION_TYPE=x11 \
+            dbus-run-session startplasma-x11 > plasma.log 2>&1;\
+        kill -TERM $xtrace_pid $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null'
 
 # ============================== ENLIGHTENMENT ==============================
 

@@ -79,6 +79,7 @@ https://github.com/user-attachments/assets/dc266c55-e9ee-4649-a0c4-be3db2526713
 - MATE
 - XFCE
 - FVWM3
+- sonic (KDE plasma X11 fork)
 - wmaker
 - openbox
 - awesome
@@ -87,6 +88,7 @@ https://github.com/user-attachments/assets/dc266c55-e9ee-4649-a0c4-be3db2526713
 - icewm
 - blackbox
 - bspwm/sxhkd
+- i3/fastcompmgr
 - enlightenment e16 + e27
 
 ## Hardware tested
@@ -113,20 +115,20 @@ It requires a recent stable Rust toolchain and the following dependencies:
 #### Arch
 
 ```sh
-sudo pacman -S --needed just gcc libxshmfence libxkbcommon libinput shaderc systemd-libs fontconfig pkgconf
+sudo pacman -S --needed just gcc libxshmfence libxkbcommon libinput shaderc systemd-libs fontconfig pkgconf mesa
 ```
 
 #### Ubuntu
 
 ```sh
-sudo apt install just gcc libxshmfence-dev libxkbcommon-dev libinput-dev glslc libudev-dev libfontconfig-dev
+sudo apt install just gcc libxshmfence-dev libxkbcommon-dev libinput-dev glslc libudev-dev libfontconfig-dev libgbm-dev
 ```
 
 #### Alpine
 
 ```sh
 export RUSTFLAGS="-C target-feature=-crt-static"
-apk add gcc musl-dev fontconfig-dev freetype-dev libxshmfence-dev libxkbcommon-dev libinput-dev shaderc
+apk add gcc musl-dev fontconfig-dev freetype-dev libxshmfence-dev libxkbcommon-dev libinput-dev shaderc mesa-dev
 ```
 
 #### FreeBSD

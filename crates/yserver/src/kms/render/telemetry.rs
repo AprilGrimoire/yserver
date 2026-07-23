@@ -792,6 +792,14 @@ impl Telemetry {
         self.lifetime.compose_cb_record_ns = self.lifetime.compose_cb_record_ns.saturating_add(ns);
     }
 
+    /// Compose GPU-render time (ns) from the per-bo timestamp pool.
+    /// Summed per second; the emit divides by `frames_with_compose` for
+    /// `avg_gpu_render_ns`. Was hard-0 until timestamps were wired.
+    pub(crate) fn record_gpu_render_ns(&mut self, ns: u64) {
+        self.bucket.gpu_render_ns = self.bucket.gpu_render_ns.saturating_add(ns);
+        self.lifetime.gpu_render_ns = self.lifetime.gpu_render_ns.saturating_add(ns);
+    }
+
     // ── Stage 3a counter sites ──────────────────────────────────
 
     /// Bumped on every successful `intern` that pushed a new

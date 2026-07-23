@@ -190,6 +190,14 @@ pub enum HostInputEvent {
         y: i32,
         time: u32,
         relative: bool,
+        /// Raw, pre-clamp relative device delta for this motion (the
+        /// libinput dx/dy). Carried so XI2 RawMotion reports true relative
+        /// motion instead of the absolute position — SDL2 relative-mouse
+        /// apps (games) accumulate these deltas. For absolute devices this
+        /// is the change in mapped position; 0 when unknown. Coalesced
+        /// motions SUM these. (#96 follow-up: chromium-bsu)
+        dx: i32,
+        dy: i32,
     },
     PointerButton {
         /// Linux input button code (`BTN_LEFT = 0x110`, `BTN_RIGHT = 0x111`,

@@ -705,17 +705,18 @@ pub fn run_core(
                                 backend.mark_dirty();
                             }
                             Message::VtRelease => {
+                                // When VT switching isn't armed there is no
+                                // switch to service — ignore. (Deliberate
+                                // diagnostic dumps go through DumpScanout /
+                                // DumpDrawables via the Ctrl-Alt-Enter /
+                                // Ctrl-Alt-F12 hotkeys, not this path.)
                                 if backend.vt_switching_armed() {
                                     backend.on_vt_release(state);
-                                } else {
-                                    backend.dump_scanout();
                                 }
                             }
                             Message::VtAcquire => {
                                 if backend.vt_switching_armed() {
                                     backend.on_vt_acquire(state);
-                                } else {
-                                    backend.dump_drawables();
                                 }
                             }
                             Message::SwitchVt(vt) => {
@@ -778,8 +779,16 @@ pub fn run_core(
         // because an unrelated event arrived after the deadline),
         // fan out a synthetic KeyRelease+KeyPress pair.
         if state.repeat_state.is_some() {
-            fire_pending_repeats(state, backend);
-            backend.mark_dirty();
+            // Only poke the compositor when a repeat actually fired.
+            // `fire_pending_repeats` returns false when the armed key
+            // is merely not-yet-due (the common case every iteration
+            // while a key is held) — an unconditional `mark_dirty()`
+            // here re-dirtied the scene at the loop-iteration rate,
+            // busy-spinning the compositor (and never letting it idle
+            // when a phantom key is stuck armed).
+            if fire_pending_repeats(state, backend) {
+                backend.mark_dirty();
+            }
         }
 
         // DPMS: evaluate idle-cascade transitions.
@@ -1480,19 +1489,27 @@ fn update_repeat_state(state: &mut ServerState, ev: &HostInputEvent) {
 /// path the original press took, matching classic X11 auto-repeat
 /// (every client handles it without opting into XKB
 /// DetectableAutoRepeat).
-fn fire_pending_repeats(state: &mut ServerState, backend: &mut dyn Backend) {
+/// Returns `true` iff a repeat was actually fanned out this call. The
+/// caller uses this to decide whether to poke the compositor: a call
+/// that merely observes an armed-but-not-yet-due key (or disarms a
+/// no-longer-repeating one) produces no events and must NOT re-dirty
+/// the scene — doing so unconditionally every loop iteration while a
+/// key is held (or while a phantom key is stuck armed) busy-spins the
+/// compositor at the iteration rate instead of the repeat rate
+/// (idle free-run, [[project_idle_compositor_redraw_loop]] cut 2a).
+fn fire_pending_repeats(state: &mut ServerState, backend: &mut dyn Backend) -> bool {
     let Some(armed) = state.repeat_state else {
-        return;
+        return false;
     };
     // Repeat may have been disabled (ChangeKeyboardControl) after the
     // key was armed — disarm instead of firing.
     if !key_auto_repeats(&state.keyboard_control, armed.event.keycode) {
         state.repeat_state = None;
-        return;
+        return false;
     }
     let now = Instant::now();
     if now < armed.next_fire {
-        return;
+        return false;
     }
     let mut next_fire = armed.next_fire;
     while now >= next_fire {
@@ -1509,6 +1526,7 @@ fn fire_pending_repeats(state: &mut ServerState, backend: &mut dyn Backend) {
     press.pressed = true;
     backend.on_host_input(state, HostInputEvent::Key(release));
     backend.on_host_input(state, HostInputEvent::Key(press));
+    true
 }
 
 /// Post-poll screen-saver evaluator. Drives idle activation and the
@@ -2043,6 +2061,59 @@ mod tests {
         // Release B → clears.
         handle_host_input(&mut state, &mut backend, key(39, false));
         assert!(state.repeat_state.is_none());
+    }
+
+    /// Regression guard for the idle free-run fix (cut 2a): the caller
+    /// pokes the compositor (`mark_dirty`) only when a repeat actually
+    /// fires. `fire_pending_repeats` must return `false` on the
+    /// every-iteration "armed but not yet due" path (else a held/stuck
+    /// key busy-spins the compositor at the loop rate) and `true` only
+    /// when it fans out.
+    #[test]
+    fn fire_pending_repeats_reports_whether_it_fired() {
+        use std::time::{Duration, Instant};
+
+        use crate::{backend::recording::RecordingBackend, host_x11::HostKeyEvent};
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+
+        // Nothing armed → no fire.
+        assert!(!fire_pending_repeats(&mut state, &mut backend));
+
+        // Arm a repeatable key (keycode 38 auto-repeats by default —
+        // the sibling test relies on this too).
+        handle_host_input(
+            &mut state,
+            &mut backend,
+            HostInputEvent::Key(HostKeyEvent {
+                pressed: true,
+                keycode: 38,
+                time: 0,
+                root_x: 0,
+                root_y: 0,
+                event_x: 0,
+                event_y: 0,
+                state: 0,
+            }),
+        );
+        assert!(state.repeat_state.is_some());
+
+        // Freshly armed → `next_fire` is INITIAL_DELAY in the future →
+        // NOT due → must return false (the idle busy-spin case).
+        assert!(
+            !fire_pending_repeats(&mut state, &mut backend),
+            "armed-but-not-due must not report a fire",
+        );
+
+        // Force the deadline into the past → must fire.
+        if let Some(s) = state.repeat_state.as_mut() {
+            s.next_fire = Instant::now() - Duration::from_millis(1);
+        }
+        assert!(
+            fire_pending_repeats(&mut state, &mut backend),
+            "a due repeat must report a fire",
+        );
     }
 
     /// Helper: a touchpad `DeviceInfo` mirroring libinput's enumeration

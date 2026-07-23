@@ -149,9 +149,16 @@ impl LibinputThreadState {
                     y: self.cursor_y as i32,
                     time: time_ms,
                     relative: true,
+                    // Raw relative delta = the physical libinput motion
+                    // (pre-clamp) so XI2 RawMotion reports true deltas, as
+                    // Xorg's set_raw_valuators does. (Sub-pixel fraction is
+                    // rounded per-event; acceptable for relative-mode apps.)
+                    dx: dx.round() as i32,
+                    dy: dy.round() as i32,
                 }
             }
             InputEvent::PointerMotionAbsolute { x_norm, y_norm } => {
+                let (old_cx, old_cy) = (self.cursor_x, self.cursor_y);
                 self.cursor_x = x_norm.clamp(0.0, 1.0) * (f64::from(self.fb_w).max(1.0) - 1.0);
                 self.cursor_y = y_norm.clamp(0.0, 1.0) * (f64::from(self.fb_h).max(1.0) - 1.0);
                 HostInputEvent::PointerMotion {
@@ -159,6 +166,11 @@ impl LibinputThreadState {
                     y: self.cursor_y as i32,
                     time: time_ms,
                     relative: false,
+                    // Absolute devices have no native relative delta — report
+                    // the change in mapped position (Xorg does the same for
+                    // absolute-device raw events).
+                    dx: (self.cursor_x - old_cx).round() as i32,
+                    dy: (self.cursor_y - old_cy).round() as i32,
                 }
             }
             InputEvent::Button { code, pressed } => HostInputEvent::PointerButton {
@@ -529,8 +541,31 @@ pub fn process_batch(
         }
         let mapped = state.map(raw, time_ms);
         match mapped {
-            HostInputEvent::PointerMotion { .. } => {
-                *pending_motion = Some(mapped);
+            HostInputEvent::PointerMotion {
+                x,
+                y,
+                time,
+                relative,
+                dx,
+                dy,
+            } => {
+                // Coalesce consecutive motions: keep the latest absolute
+                // position, but SUM the raw relative deltas so XI2 RawMotion
+                // doesn't lose distance when merged into one event.
+                let (sum_dx, sum_dy) = match pending_motion.as_ref() {
+                    Some(HostInputEvent::PointerMotion {
+                        dx: pdx, dy: pdy, ..
+                    }) => (dx + pdx, dy + pdy),
+                    _ => (dx, dy),
+                };
+                *pending_motion = Some(HostInputEvent::PointerMotion {
+                    x,
+                    y,
+                    time,
+                    relative,
+                    dx: sum_dx,
+                    dy: sum_dy,
+                });
             }
             non_motion => {
                 if let Some(m) = pending_motion.take() {
@@ -1130,8 +1165,17 @@ mod tests {
             "expected 3 messages (motion, button, motion); got {}: {collected:?}",
             collected.len()
         );
+        // Coalesced raw deltas must SUM (5 motions of dx=dy=1 → 5,5), not
+        // collapse to the last one — else XI2 RawMotion loses distance and
+        // SDL2 relative-mouse apps under-track. (#96 follow-up: chromium-bsu)
         match &collected[0] {
-            Message::HostInput(HostInputEvent::PointerMotion { x: 405, y: 305, .. }) => {}
+            Message::HostInput(HostInputEvent::PointerMotion {
+                x: 405,
+                y: 305,
+                dx: 5,
+                dy: 5,
+                ..
+            }) => {}
             other => panic!("first message: {other:?}"),
         }
         match &collected[1] {
@@ -1143,7 +1187,13 @@ mod tests {
             other => panic!("second message: {other:?}"),
         }
         match &collected[2] {
-            Message::HostInput(HostInputEvent::PointerMotion { x: 408, y: 308, .. }) => {}
+            Message::HostInput(HostInputEvent::PointerMotion {
+                x: 408,
+                y: 308,
+                dx: 3,
+                dy: 3,
+                ..
+            }) => {}
             other => panic!("third message: {other:?}"),
         }
         // Silence unused warning on `poll` — we just need its waker

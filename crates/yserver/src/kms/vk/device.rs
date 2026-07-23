@@ -78,6 +78,10 @@ pub struct VkContext {
     /// for headless tests but NOT for real KMS scanout (see
     /// [`Self::is_software_rasterizer`]).
     pub device_type: vk::PhysicalDeviceType,
+    /// Nanoseconds per timestamp-query tick (`limits.timestampPeriod`).
+    /// `0.0` ⇒ no usable timestamp support; the compose GPU-render timer
+    /// (`gpu_render_ns` telemetry) is then skipped.
+    pub timestamp_period: f32,
 }
 
 impl VkContext {
@@ -362,6 +366,9 @@ impl VkContext {
         // Read from props2 (which mutably borrows driver_props) before
         // reading driver_props directly, so props2's borrow ends first.
         let device_type = props2.properties.device_type;
+        // ns per timestamp-query tick (0.0 ⇒ device has no usable timestamp
+        // support → gpu_render_ns telemetry stays 0). See `record_compose`.
+        let timestamp_period = props2.properties.limits.timestamp_period;
         let driver_id = driver_props.driver_id;
 
         Ok(Arc::new(VkContext {
@@ -380,6 +387,7 @@ impl VkContext {
             debug_messenger,
             driver_id,
             device_type,
+            timestamp_period,
         }))
     }
 

@@ -158,6 +158,8 @@ pub(super) fn decode_host_event(event: &[u8; 32]) -> Option<HostEvent> {
                 // encoders that want the host server's computed child
                 // can use it directly.
                 child: read_u32(&event[16..20]),
+                raw_dx: 0,
+                raw_dy: 0,
             }))
         }
         7 | 8 => {
@@ -180,6 +182,8 @@ pub(super) fn decode_host_event(event: &[u8; 32]) -> Option<HostEvent> {
                 state: read_u16(&event[28..30]),
                 crossing_mode: event[30],
                 child: read_u32(&event[16..20]),
+                raw_dx: 0,
+                raw_dy: 0,
             }))
         }
         12 => {
@@ -271,6 +275,13 @@ pub struct HostPointerEvent {
     /// since spec-correct child semantics aren't a function of the
     /// fanout walk.
     pub child: u32,
+    /// Raw relative device delta for a `MotionNotify` (libinput dx/dy,
+    /// pre-clamp; summed across coalesced motions). Emitted as the XI2
+    /// RawMotion valuator so relative-mouse apps (SDL2 games) get true
+    /// deltas instead of the absolute position. 0 for non-motion events.
+    /// (#96 follow-up: chromium-bsu ship-pins-to-corner bug)
+    pub raw_dx: i32,
+    pub raw_dy: i32,
 }
 
 #[derive(Clone, Copy, Debug)]

@@ -422,6 +422,20 @@ impl TickOutcome {
             Self::Composed | Self::Skipped(TickSkipReason::EmptyDamage)
         )
     }
+
+    /// True iff `build_scene` ran for this output (so its sampled ids
+    /// were recorded). The `PendingAcks`/`RetryDeadline` skips return
+    /// BEFORE the walk; everything else runs it. `tick` only reconciles
+    /// `offscreen_no_draw` when EVERY output walked — otherwise a
+    /// window visible only on a not-yet-walked (mid-flip) output would
+    /// be mis-flagged off-screen (cut 2b).
+    fn walked(self) -> bool {
+        !matches!(
+            self,
+            Self::Skipped(TickSkipReason::PendingAcks)
+                | Self::Skipped(TickSkipReason::RetryDeadline)
+        )
+    }
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -1030,6 +1044,13 @@ impl SceneCompositor {
         let n_outputs = inner.outputs.len();
         let mut composed = 0usize;
         let mut clear_dirty = true;
+        // Idle free-run fix (cut 2b): union of sampled sources drawn
+        // across all outputs, and whether every output actually walked
+        // `build_scene`. Only reconcile `offscreen_no_draw` when all
+        // walked — see `TickOutcome::walked`.
+        let mut drawn: std::collections::HashSet<super::store::DrawableId> =
+            std::collections::HashSet::new();
+        let mut all_walked = true;
         for output_idx in 0..n_outputs {
             match tick_one_output(
                 inner,
@@ -1042,18 +1063,27 @@ impl SceneCompositor {
                 hw_strategy,
                 cow_host_xid,
                 root_overlay,
+                &mut drawn,
             ) {
-                Ok(TickOutcome::Composed) => composed += 1,
                 Ok(outcome) => {
-                    clear_dirty &= outcome.clears_scene_structure_dirty();
+                    if outcome == TickOutcome::Composed {
+                        composed += 1;
+                    } else {
+                        clear_dirty &= outcome.clears_scene_structure_dirty();
+                    }
+                    all_walked &= outcome.walked();
                 }
                 Err(e) => {
                     clear_dirty = false;
+                    all_walked = false;
                     log::warn!(
                         "render scene tick: output {output_idx} compose failed: {e}; continuing",
                     );
                 }
             }
+        }
+        if all_walked {
+            store.reconcile_offscreen_no_draw(&drawn);
         }
         if clear_dirty {
             *scene_structure_dirty = false;
@@ -1559,6 +1589,18 @@ fn cursor_damage_for_frame(
     damage
 }
 
+/// True if any captured presentation-damage snapshot carries a
+/// NON-EMPTY region. Gates the empty-projection force-compose in
+/// `tick_one_output`: `peek_presentation_damage` returns `Some` even
+/// for a clean (empty) region, so a mere `!snapshots.is_empty()` check
+/// force-composes the whole output for every drawn window every vblank
+/// — the idle free-run bug. Only a window that actually painted
+/// (non-empty captured damage) whose projection landed empty needs the
+/// forced full compose (the xfce submenu case).
+fn snapshots_carry_damage(snaps: &[DamageSnapshot]) -> bool {
+    snaps.iter().any(|s| !s.region.is_empty())
+}
+
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)]
 fn tick_one_output(
@@ -1572,6 +1614,12 @@ fn tick_one_output(
     hw_strategy_enabled: bool,
     cow_host_xid: Option<u32>,
     root_overlay: &super::root_overlay::RootOverlay,
+    // Idle free-run fix (cut 2b): accumulator for the sampled-source
+    // ids `build_scene` actually drew on this output, unioned across
+    // outputs by `tick` to reconcile `offscreen_no_draw`. Only written
+    // once `build_scene` has run (after the pending-flip/retry gate),
+    // so a `PendingAcks`/`RetryDeadline` skip contributes nothing.
+    drawn: &mut std::collections::HashSet<super::store::DrawableId>,
 ) -> Result<TickOutcome, SceneError> {
     // 0. **Per-output flip-pending gate.** KMS only allows one
     //    pending atomic commit per CRTC at a time; a second
@@ -1656,6 +1704,13 @@ fn tick_one_output(
         hw_can_run,
     );
 
+    // Idle free-run fix (cut 2b): record the sampled sources this output
+    // actually drew, so `tick` can reconcile `offscreen_no_draw` from
+    // the union across outputs. Recorded unconditionally here (before
+    // the empty-damage / BO / pool skips below) so a window that WAS
+    // drawn is never mis-flagged just because its output later skips.
+    drawn.extend(built.sampled_ids.iter().copied());
+
     // Stage 5 Phase D — derive the per-output cursor transition
     // and new prev_pos from `built.cursor_assignment` and the
     // last-frame mode. Both are queued on the PendingAck below
@@ -1699,12 +1754,41 @@ fn tick_one_output(
         // Force a full-output repaint so the compose runs and the
         // captured snapshots ack at retire. Repaint is always-Full, so
         // the content composites correctly regardless of the empty
-        // projection. Self-limiting: once acked, `built.snapshots`
-        // comes back empty and the normal skip resumes → true idle.
-        // Keyed on `built.snapshots` (a window we actually drew), NOT
-        // `store.has_pending_presentation_damage()`, so damage on a
-        // window that isn't in the scene can't spin the compose.
-        if built.snapshots.is_empty() {
+        // projection. Self-limiting: once acked, no snapshot carries
+        // non-empty damage and the normal skip resumes → true idle.
+        //
+        // Gate on a snapshot with NON-EMPTY captured damage, NOT merely
+        // `!built.snapshots.is_empty()`: `peek_presentation_damage`
+        // returns `Some` even for an empty region (store.rs), so
+        // `built.snapshots` is non-empty for EVERY drawn
+        // scene-participating window — including perfectly clean idle
+        // ones. Gating on non-emptiness was the idle free-run bug: a
+        // clean drawn window force-composed the whole output every
+        // vblank forever. Only a window that actually painted (non-empty
+        // captured damage) whose projection landed empty needs the
+        // force (the xfce submenu case).
+        // DIAG (submenu regression, bee/eiger/air): the empty-damage
+        // path with snapshots is exactly where cut 1's region-gate
+        // decides force-vs-skip. Log what build_scene captured so we
+        // can see the submenu's actual snapshot state at the failing
+        // tick (present-but-empty region vs absent). Gated behind
+        // YSERVER_TICK_SKIP_LOG like the other tick diagnostics — it
+        // fires on EVERY empty-damage tick (~tens/s at idle), so leaving
+        // it unconditional floods the log and allocates a Vec per tick,
+        // defeating the idle goal.
+        if tick_skip_log_enabled() {
+            log::info!(
+                "empty-damage-diag: out{output_idx} draws={} carry={} snapshots={:?}",
+                built.scene.draws.len(),
+                snapshots_carry_damage(&built.snapshots),
+                built
+                    .snapshots
+                    .iter()
+                    .map(|s| (s.id.as_u64(), s.region.rects().len()))
+                    .collect::<Vec<_>>(),
+            );
+        }
+        if !snapshots_carry_damage(&built.snapshots) {
             let s = inner.outputs.get_mut(output_idx).expect("range");
             record_tick_skip(s, output_idx, TickSkipReason::EmptyDamage, 0);
             return Ok(TickOutcome::Skipped(TickSkipReason::EmptyDamage));
@@ -1716,8 +1800,12 @@ fn tick_one_output(
         });
         log::debug!(
             "render: output {output_idx} forcing full compose — {} presentation-damage \
-             snapshot(s) projected empty (paint would otherwise strand off-screen)",
-            built.snapshots.len(),
+             snapshot(s) with real damage projected empty (paint would otherwise strand off-screen)",
+            built
+                .snapshots
+                .iter()
+                .filter(|s| !s.region.is_empty())
+                .count(),
         );
     }
 
@@ -1835,10 +1923,12 @@ fn tick_one_output(
         (pl, inner.overlay_xor_cache.pipeline_layout())
     };
     let mut gpu_submitted = false;
+    let previous_gpu_render_ns;
     let record_start = std::time::Instant::now();
     let render_result = match pool {
         OutputScanout::Shared(pool) => {
             let bo = pool.bos.get_mut(token.bo_idx).ok_or(SceneError::NoVk)?;
+            previous_gpu_render_ns = read_previous_gpu_render_ns(&inner.vk, bo);
             submit_shared_scanout_frame(
                 &inner.vk,
                 &device.device,
@@ -1858,6 +1948,7 @@ fn tick_one_output(
         }
         OutputScanout::Copied(pool) => {
             let source = pool.sources.get(token.bo_idx).ok_or(SceneError::NoVk)?;
+            previous_gpu_render_ns = read_previous_gpu_render_ns(&inner.vk, source);
             let destination_state = &mut pool
                 .destinations
                 .bos
@@ -1891,6 +1982,9 @@ fn tick_one_output(
     };
     let record_ns = u64::try_from(record_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
     telemetry.record_compose_cb_record_ns(record_ns);
+    if let Some(gpu_ns) = previous_gpu_render_ns {
+        telemetry.record_gpu_render_ns(gpu_ns);
+    }
     telemetry
         .record_descriptor_allocations(u64::try_from(built.scene.draws.len()).unwrap_or(u64::MAX));
 
@@ -3063,9 +3157,39 @@ trait ComposeRenderTarget {
     fn image_view(&self) -> vk::ImageView;
     fn record_post_compose_commands(&self, device: &ash::Device, command_buffer: vk::CommandBuffer);
     fn command_buffer(&self) -> vk::CommandBuffer;
+    fn timestamp_pool(&self) -> vk::QueryPool;
     fn completion_semaphore(&self) -> vk::Semaphore;
     fn width(&self) -> u32;
     fn height(&self) -> u32;
+}
+
+fn read_previous_gpu_render_ns(
+    vk: &crate::kms::vk::device::VkContext,
+    target: &(impl ComposeRenderTarget + ?Sized),
+) -> Option<u64> {
+    let timestamp_pool = target.timestamp_pool();
+    if vk.timestamp_period <= 0.0 || timestamp_pool == vk::QueryPool::null() {
+        return None;
+    }
+
+    let mut timestamps = [0u64; 2];
+    unsafe {
+        vk.device
+            .get_query_pool_results(
+                timestamp_pool,
+                0,
+                &mut timestamps,
+                vk::QueryResultFlags::TYPE_64,
+            )
+            .ok()?;
+    }
+    let ticks = timestamps[1].saturating_sub(timestamps[0]);
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    Some((ticks as f64 * f64::from(vk.timestamp_period)) as u64)
 }
 
 fn color_subresource_range() -> vk::ImageSubresourceRange {
@@ -3111,6 +3235,10 @@ impl ComposeRenderTarget for ScanoutBo {
         self.vk_transfer.command_buffer
     }
 
+    fn timestamp_pool(&self) -> vk::QueryPool {
+        self.vk_transfer.timestamp_pool
+    }
+
     fn completion_semaphore(&self) -> vk::Semaphore {
         self.vk_semaphore
     }
@@ -3143,6 +3271,10 @@ impl ComposeRenderTarget for CopiedRenderSource {
 
     fn command_buffer(&self) -> vk::CommandBuffer {
         self.transfer.command_buffer
+    }
+
+    fn timestamp_pool(&self) -> vk::QueryPool {
+        self.transfer.timestamp_pool
     }
 
     fn completion_semaphore(&self) -> vk::Semaphore {
@@ -3356,6 +3488,8 @@ fn record_composite_command_buffer<T: ComposeRenderTarget + ?Sized>(
 ) -> Result<(), PresentError> {
     let device = &vk.device;
     let cb = bo.command_buffer();
+    let ts_pool = bo.timestamp_pool();
+    let ts_enabled = vk.timestamp_period > 0.0 && ts_pool != vk::QueryPool::null();
 
     let (load_op, render_area, old_layout) = match repaint {
         Repaint::Full(extent) => (
@@ -3397,6 +3531,14 @@ fn record_composite_command_buffer<T: ComposeRenderTarget + ?Sized>(
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         crate::vk_count!(begin_command_buffer);
         device.begin_command_buffer(cb, &begin)?;
+
+        // GPU-render timer: reset the pool (GPU-ordered, after the CPU
+        // read above) and stamp TOP-of-pipe before any compose work.
+        // See the corresponding BOTTOM stamp before end_command_buffer.
+        if ts_enabled {
+            device.cmd_reset_query_pool(cb, ts_pool, 0, 2);
+            device.cmd_write_timestamp(cb, vk::PipelineStageFlags::TOP_OF_PIPE, ts_pool, 0);
+        }
 
         let to_color_src_access = if matches!(load_op, vk::AttachmentLoadOp::LOAD) {
             // LOAD: previous KMS scanout left the BO in GENERAL.
@@ -3536,6 +3678,11 @@ fn record_composite_command_buffer<T: ComposeRenderTarget + ?Sized>(
 
         bo.record_post_compose_commands(device, cb);
 
+        // GPU-render timer: stamp BOTTOM-of-pipe after all compose work.
+        if ts_enabled {
+            device.cmd_write_timestamp(cb, vk::PipelineStageFlags::BOTTOM_OF_PIPE, ts_pool, 1);
+        }
+
         crate::vk_count!(end_command_buffer);
         device.end_command_buffer(cb)?;
     }
@@ -3652,6 +3799,46 @@ mod tests {
         );
         assert!(!TickOutcome::Skipped(TickSkipReason::NoBO).clears_scene_structure_dirty());
         assert!(!TickOutcome::Skipped(TickSkipReason::NoPool).clears_scene_structure_dirty());
+    }
+
+    /// Regression guard for the idle free-run fix: the empty-projection
+    /// force-compose must fire ONLY when a captured snapshot carries
+    /// non-empty damage. `peek_presentation_damage` returns `Some` even
+    /// for a clean (empty) region, so gating on `!snapshots.is_empty()`
+    /// force-composed every drawn window every vblank at idle. Gating on
+    /// real damage must (a) NOT force for a clean drawn window (→ idle
+    /// EmptyDamage skip) and (b) STILL force for a window that painted
+    /// but whose projection landed empty (the xfce submenu case).
+    #[test]
+    fn empty_projection_force_compose_gates_on_real_captured_damage() {
+        use crate::kms::render::store::{DamageSnapshot, DrawableId};
+        let id = DrawableId::for_tests(1);
+
+        // No snapshots at all → no force.
+        assert!(!snapshots_carry_damage(&[]));
+
+        // Clean drawn window: peeked snapshot with an EMPTY region →
+        // must NOT force (this was the idle free-run bug).
+        let clean = DamageSnapshot {
+            id,
+            epoch: 1,
+            region: RegionSet::new(),
+        };
+        assert!(!snapshots_carry_damage(std::slice::from_ref(&clean)));
+
+        // Window that actually painted, projection landed empty:
+        // non-empty captured damage → MUST still force (submenu case).
+        let mut painted_region = RegionSet::new();
+        painted_region.add(rect(0, 0, 4, 4));
+        let painted = DamageSnapshot {
+            id,
+            epoch: 2,
+            region: painted_region,
+        };
+        assert!(snapshots_carry_damage(std::slice::from_ref(&painted)));
+
+        // Mixed (a clean + a painted) still forces.
+        assert!(snapshots_carry_damage(&[clean, painted]));
     }
 
     /// Steady-state HW: no transition queued (the bytes path

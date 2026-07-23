@@ -412,8 +412,19 @@ pub fn seed_touchpad(
         return;
     };
 
+    // Rebuild the slot from scratch. The single slave-pointer entry is
+    // shared across whatever pointer libinput last reported (latest-wins),
+    // so a previous device's properties must not survive: reseeding a mouse
+    // over a touchpad would otherwise leave the touchpad's `Tapping` (etc.)
+    // advertised on the mouse. Only availability-gated rows are re-inserted
+    // below, so clearing first is what enforces the correct per-device set.
+    dev.properties.clear();
+
     dev.name = info.name.clone();
-    dev.is_touchpad = true;
+    // Reflect the real device kind. A mouse is a pointer, not a touchpad,
+    // even though it now carries libinput props (accel etc.); flagging it
+    // as a touchpad would misroute the T3 write-validation path.
+    dev.is_touchpad = info.is_touchpad;
     dev.device_node = Some(info.device_node.clone());
 
     // Fixed identity properties: Device Node + Device Product ID.
@@ -480,17 +491,26 @@ pub fn seed_touchpad(
     }
 }
 
-/// Remove touchpad properties from the slave-pointer device entry.
+/// Remove the seeded properties from the slave-pointer device entry when
+/// the device that currently owns the slot is removed.
 ///
-/// Reverts the slave-pointer name to the generic default and clears
-/// all properties.  `device_node` is used only for logging; the
-/// registry does not store a node→device mapping today (one touchpad
-/// assumed).
+/// The backend forwards EVERY `DeviceRemoved` here (keyboards included),
+/// so this must only reset the slot when `device_node` matches the device
+/// that last seeded it — otherwise unplugging an unrelated device (a
+/// keyboard, or an older mouse while a touchpad now owns id 4) would wipe
+/// the live pointer's properties, e.g. stranding the Mouse KCM without
+/// `libinput Accel Speed` again. A removal for a non-owning node is a
+/// no-op.
 pub fn clear_touchpad(devices: &mut [XiDevice], device_node: &str) {
     let Some(dev) = devices.iter_mut().find(|d| d.id == DEVICEID_SLAVE_POINTER) else {
         log::debug!("xi_clear_touchpad: slave pointer device not found (node={device_node})");
         return;
     };
+    if dev.device_node.as_deref() != Some(device_node) {
+        // Some other device was removed; the pointer slot is owned by a
+        // different (still-present) device. Leave it intact.
+        return;
+    }
     dev.name = NAME_SLAVE_POINTER.to_owned();
     dev.is_touchpad = false;
     dev.device_node = None;
@@ -1451,6 +1471,52 @@ mod tests {
         }
     }
 
+    /// A plain mouse whose libinput snapshot reports the knobs a real
+    /// relative pointer exposes (accel + accel-profile + left-handed +
+    /// natural-scroll + middle-emulation + send-events) but NOT tapping.
+    /// Mirrors what `libinput_config::gather` yields for a mouse and what
+    /// Xorg+libinput exposes (per the on-HW xtrace).
+    fn mouse_info_with_accel() -> DeviceInfo {
+        use crate::core_loop::message::{
+            BitFlags2, BoolSetting, FloatSetting, LibinputConfigSnapshot, OneHot2,
+        };
+        let avail_bool = BoolSetting {
+            available: true,
+            current: false,
+            default: false,
+        };
+        let config = LibinputConfigSnapshot {
+            accel: FloatSetting {
+                available: true,
+                current: 0.0,
+                default: 0.0,
+            },
+            accel_profile: OneHot2 {
+                available: true,
+                current: Some(0),
+                default: Some(0),
+            },
+            left_handed: avail_bool,
+            natural_scroll: avail_bool,
+            middle_emulation: avail_bool,
+            send_events: BitFlags2 {
+                available_mask: 0b01,
+                current_mask: 0,
+                default_mask: 0,
+            },
+            ..Default::default()
+        };
+        DeviceInfo {
+            name: "USB Mouse".into(),
+            device_node: "/dev/input/event1".into(),
+            sysname: "event1".into(),
+            vendor_id: 0x046d,
+            product_id: 0xc52f,
+            is_touchpad: false,
+            config,
+        }
+    }
+
     #[test]
     fn initial_devices_has_four_entries() {
         let devs = initial_xi_devices();
@@ -1686,6 +1752,178 @@ mod tests {
             .unwrap();
         assert_eq!(slave.name, NAME_SLAVE_POINTER);
         assert!(slave.properties.is_empty());
+    }
+
+    /// A configurable mouse (a pointer that is NOT a touchpad, e.g. accel
+    /// available) must have its libinput properties seeded — this is the
+    /// `libinput Accel Speed` the KDE Mouse KCM reads. The device must NOT
+    /// be flagged `is_touchpad`, and touchpad-only props (Tapping) must not
+    /// appear. Regression guard for the kcm_mouse SIGSEGV (missing
+    /// `libinput Accel Speed` atom → InternAtom None → client null-deref).
+    #[test]
+    fn seed_pointer_mouse_seeds_accel_and_keeps_mouse_flag() {
+        let mut devs = initial_xi_devices();
+        let mut atoms = AtomTable::new();
+        let float_atom = atoms.intern("FLOAT", false);
+        seed_touchpad(&mut devs, &mut atoms, float_atom, &mouse_info_with_accel());
+        let slave = devs
+            .iter()
+            .find(|d| d.id == DEVICEID_SLAVE_POINTER)
+            .unwrap();
+        // A mouse is not a touchpad, even though it now carries libinput props.
+        assert!(!slave.is_touchpad, "mouse must not be flagged is_touchpad");
+        // The accel property the Mouse KCM reads must be present.
+        let accel = atoms.intern("libinput Accel Speed", true);
+        assert!(
+            slave.properties.contains_key(&accel),
+            "libinput Accel Speed must be seeded on a configurable mouse"
+        );
+        // Touchpad-only props must NOT appear (tap unavailable on a mouse).
+        let tap = atoms.intern("libinput Tapping Enabled", true);
+        assert!(
+            !slave.properties.contains_key(&tap),
+            "Tapping must not be seeded on a mouse (tap unavailable)"
+        );
+    }
+
+    /// The `ServerState` gate must ADMIT a configurable mouse (accel
+    /// available) even though `is_touchpad == false`, so the KCM finds
+    /// `libinput Accel Speed`. Counterpart to the default-config mouse skip
+    /// test above (a mouse with no configurable knobs is still skipped).
+    #[test]
+    fn xi_seed_touchpad_gate_admits_configurable_mouse() {
+        let mut state = crate::server::ServerState::new();
+        state.xi_seed_touchpad(&mouse_info_with_accel());
+        let slave = state
+            .xi_devices
+            .iter()
+            .find(|d| d.id == DEVICEID_SLAVE_POINTER)
+            .unwrap();
+        assert_eq!(slave.name, "USB Mouse");
+        let accel = state.atoms.intern("libinput Accel Speed", true);
+        assert!(
+            slave.properties.contains_key(&accel),
+            "configurable mouse must pass the gate and seed libinput Accel Speed"
+        );
+        assert!(!slave.is_touchpad);
+    }
+
+    /// A phantom HID pointer collection (e.g. a keyboard's "Consumer
+    /// Control" — pointer-capable to libinput, some scroll knob, but NO
+    /// pointer acceleration) must be SKIPPED, so it can't clobber the
+    /// single latest-wins slave-pointer slot the real mouse owns. Regression
+    /// for the "left-handed does nothing" bug: such a device had overwritten
+    /// the Dell mouse's config on id 4, leaving only Natural Scrolling.
+    #[test]
+    fn xi_seed_touchpad_gate_skips_phantom_pointer_without_accel() {
+        use crate::core_loop::message::{BoolSetting, LibinputConfigSnapshot};
+        // Has a scroll knob but is NOT a real relative pointer (no accel).
+        let config = LibinputConfigSnapshot {
+            natural_scroll: BoolSetting {
+                available: true,
+                current: false,
+                default: false,
+            },
+            ..Default::default()
+        };
+        let phantom = DeviceInfo {
+            name: "Keychron K1 Pro Consumer Control".into(),
+            device_node: "/dev/input/event5".into(),
+            sysname: "event5".into(),
+            vendor_id: 0x3434,
+            product_id: 0x0311,
+            is_touchpad: false,
+            config,
+        };
+        let mut state = crate::server::ServerState::new();
+        // Seed the real mouse first, then the phantom must NOT overwrite it.
+        state.xi_seed_touchpad(&mouse_info_with_accel());
+        state.xi_seed_touchpad(&phantom);
+        let slave = state
+            .xi_devices
+            .iter()
+            .find(|d| d.id == DEVICEID_SLAVE_POINTER)
+            .unwrap();
+        assert_eq!(slave.name, "USB Mouse", "phantom must not seize the slot");
+        let accel = state.atoms.intern("libinput Accel Speed", true);
+        assert!(
+            slave.properties.contains_key(&accel),
+            "the real mouse's Accel Speed must survive the phantom device-add"
+        );
+    }
+
+    /// Reseeding the shared slave-pointer slot from a touchpad to a mouse
+    /// must NOT leave the touchpad's props behind. Regression for the
+    /// stale-property bug: `seed_touchpad` clears the map before re-seeding
+    /// the availability-gated subset, so a mouse never advertises `Tapping`.
+    #[test]
+    fn reseed_touchpad_to_mouse_drops_stale_touchpad_props() {
+        let mut devs = initial_xi_devices();
+        let mut atoms = AtomTable::new();
+        let float_atom = atoms.intern("FLOAT", false);
+        // First a touchpad (tap available → Tapping seeded).
+        seed_touchpad(&mut devs, &mut atoms, float_atom, &touchpad_info(true));
+        let tap = atoms.intern("libinput Tapping Enabled", false);
+        assert!(
+            devs.iter()
+                .find(|d| d.id == DEVICEID_SLAVE_POINTER)
+                .unwrap()
+                .properties
+                .contains_key(&tap),
+            "touchpad should have Tapping seeded"
+        );
+        // Then a mouse replaces it on the same slot.
+        seed_touchpad(&mut devs, &mut atoms, float_atom, &mouse_info_with_accel());
+        let slave = devs
+            .iter()
+            .find(|d| d.id == DEVICEID_SLAVE_POINTER)
+            .unwrap();
+        assert!(!slave.is_touchpad, "now a mouse");
+        let accel = atoms.intern("libinput Accel Speed", true);
+        assert!(
+            slave.properties.contains_key(&accel),
+            "mouse has Accel Speed"
+        );
+        assert!(
+            !slave.properties.contains_key(&tap),
+            "stale touchpad Tapping must be gone after reseeding a mouse"
+        );
+    }
+
+    /// A `DeviceRemoved` for a device that does NOT own the slave-pointer
+    /// slot must be a no-op — otherwise unplugging a keyboard (or an older
+    /// mouse while another device owns id 4) would wipe the live pointer's
+    /// `libinput Accel Speed` and re-strand the Mouse KCM.
+    #[test]
+    fn clear_touchpad_ignores_non_owning_node() {
+        let mut devs = initial_xi_devices();
+        let mut atoms = AtomTable::new();
+        let float_atom = atoms.intern("FLOAT", false);
+        // event4 owns the slot now.
+        seed_touchpad(&mut devs, &mut atoms, float_atom, &mouse_info_with_accel());
+        let accel = atoms.intern("libinput Accel Speed", true);
+        // Some other device (a keyboard at event9) is unplugged → no-op.
+        clear_touchpad(&mut devs, "/dev/input/event9");
+        let slave = devs
+            .iter()
+            .find(|d| d.id == DEVICEID_SLAVE_POINTER)
+            .unwrap();
+        assert!(
+            slave.properties.contains_key(&accel),
+            "unrelated removal must not wipe the live pointer's props"
+        );
+        assert_eq!(slave.name, "USB Mouse");
+        // The owning device is unplugged → slot reset.
+        clear_touchpad(&mut devs, "/dev/input/event1");
+        let slave = devs
+            .iter()
+            .find(|d| d.id == DEVICEID_SLAVE_POINTER)
+            .unwrap();
+        assert!(
+            slave.properties.is_empty(),
+            "owning removal resets the slot"
+        );
+        assert_eq!(slave.name, NAME_SLAVE_POINTER);
     }
 
     #[test]

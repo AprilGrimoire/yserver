@@ -2181,8 +2181,10 @@ pub fn encode_xi2_motion_with_scroll(
 
 /// Encode an XInput2 raw device event (XI_RawKeyPress / XI_RawKeyRelease /
 /// XI_RawButtonPress / XI_RawButtonRelease / XI_RawMotion / XI_RawTouch*).
-/// Includes X and Y valuators with the supplied root-coordinate values
-/// stored as FP3232 (signed 32-bit integer + unsigned 32-bit fraction).
+/// Motion and touch events include X and Y valuators with the supplied
+/// root-coordinate values stored as FP3232 (signed 32-bit integer + unsigned
+/// 32-bit fraction). Xorg emits key and button events with a padded, all-zero
+/// valuator mask and no values.
 /// xeyes selects XI_RawMotion as a "cursor moved" notification and then
 /// calls XIQueryPointer for the actual position; we only need to supply
 /// enough payload to wake the client.
@@ -2200,40 +2202,46 @@ pub fn encode_xi2_raw_event(
     raw_x: i32,
     raw_y: i32,
 ) {
+    let start = out.len();
+    let carries_valuators = matches!(evtype, 17 | 22 | 23 | 24);
     out.push(35); // GenericEvent
     out.push(major_opcode);
     write_u16(byte_order, out, sequence.0);
     // length in 4-byte units beyond the 32-byte header.
-    // Tail = valuator_mask(4) + axisvalues(2 * 8) + axisvalues_raw(2 * 8) = 36 bytes = 9 units.
-    write_u32(byte_order, out, 9);
+    // Xorg always pads the valuator mask to two CARD32 words. Motion/touch
+    // then append normal and raw FP3232 values for each set mask bit.
+    write_u32(byte_order, out, if carries_valuators { 10 } else { 2 });
 
     write_u16(byte_order, out, evtype);
     write_u16(byte_order, out, deviceid);
     write_u32(byte_order, out, time);
     write_u32(byte_order, out, detail);
     write_u16(byte_order, out, sourceid);
-    write_u16(byte_order, out, 2); // valuators_len: X and Y
+    write_u16(byte_order, out, 2); // valuators_len: two CARD32 mask words
     write_u32(byte_order, out, 0); // flags
     out.extend_from_slice(&[0; 4]); // pad to 32-byte fixed area
 
-    debug_assert_eq!(out.len(), 32);
+    debug_assert_eq!(out.len() - start, 32);
 
     // Variable tail: valuator_mask + axisvalues + axisvalues_raw.
-    write_u32(byte_order, out, 0x3); // valuator_mask: bits 0+1 (X, Y)
+    write_u32(byte_order, out, if carries_valuators { 0x3 } else { 0 }); // valuator_mask: bits 0+1 (X, Y)
+    write_u32(byte_order, out, 0); // Xorg-width second mask word
 
-    // FP3232 values: integer part (i32) + fractional part (u32 = 0).
-    write_u32(byte_order, out, raw_x as u32);
-    write_u32(byte_order, out, 0); // X fractional
-    write_u32(byte_order, out, raw_y as u32);
-    write_u32(byte_order, out, 0); // Y fractional
+    if carries_valuators {
+        // FP3232 values: integer part (i32) + fractional part (u32 = 0).
+        write_u32(byte_order, out, raw_x as u32);
+        write_u32(byte_order, out, 0); // X fractional
+        write_u32(byte_order, out, raw_y as u32);
+        write_u32(byte_order, out, 0); // Y fractional
 
-    // axisvalues_raw — same as axisvalues for our purposes.
-    write_u32(byte_order, out, raw_x as u32);
-    write_u32(byte_order, out, 0);
-    write_u32(byte_order, out, raw_y as u32);
-    write_u32(byte_order, out, 0);
+        // axisvalues_raw — same as axisvalues for our purposes.
+        write_u32(byte_order, out, raw_x as u32);
+        write_u32(byte_order, out, 0);
+        write_u32(byte_order, out, raw_y as u32);
+        write_u32(byte_order, out, 0);
+    }
 
-    debug_assert_eq!(out.len(), 68);
+    debug_assert_eq!(out.len() - start, if carries_valuators { 72 } else { 40 });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4778,6 +4786,59 @@ mod tests {
         // Valuator mask at offset 112 (after 32-byte buttons mask): 0 — button
         // events change no axes.
         assert_eq!(u32::from_le_bytes(out[112..116].try_into().unwrap()), 0);
+    }
+
+    #[test]
+    fn xi2_raw_button_event_matches_xorg_empty_valuator_payload() {
+        let mut out = vec![0xaa; 4];
+        let start = out.len();
+        encode_xi2_raw_event(
+            &mut out,
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(7),
+            137,
+            15,
+            4,
+            0x5436,
+            1,
+            4,
+            1483,
+            449,
+        );
+
+        let event = &out[start..];
+        assert_eq!(event.len(), 40);
+        let length = u32::from_le_bytes(event[4..8].try_into().unwrap());
+        assert_eq!(length, 2);
+        assert_eq!(event.len(), 32 + length as usize * 4);
+        assert_eq!(u16::from_le_bytes(event[22..24].try_into().unwrap()), 2);
+        assert_eq!(u32::from_le_bytes(event[32..36].try_into().unwrap()), 0);
+        assert_eq!(u32::from_le_bytes(event[36..40].try_into().unwrap()), 0);
+    }
+
+    #[test]
+    fn xi2_raw_motion_event_carries_xy_valuators() {
+        let mut event = Vec::new();
+        encode_xi2_raw_event(
+            &mut event,
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(7),
+            137,
+            17,
+            4,
+            0x5436,
+            0,
+            4,
+            1483,
+            449,
+        );
+
+        assert_eq!(event.len(), 72);
+        assert_eq!(u32::from_le_bytes(event[4..8].try_into().unwrap()), 10);
+        assert_eq!(u16::from_le_bytes(event[22..24].try_into().unwrap()), 2);
+        assert_eq!(u32::from_le_bytes(event[32..36].try_into().unwrap()), 0x3);
+        assert_eq!(u32::from_le_bytes(event[36..40].try_into().unwrap()), 0);
+        assert_eq!(i32::from_le_bytes(event[40..44].try_into().unwrap()), 1483);
     }
 
     #[test]

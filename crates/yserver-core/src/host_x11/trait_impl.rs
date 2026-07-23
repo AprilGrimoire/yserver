@@ -99,6 +99,12 @@ impl Backend for HostX11Backend {
                     state: 0,
                     crossing_mode: 0,
                     child: 0,
+                    // Nested (host-X11) backend has no libinput relative
+                    // delta — the host delivers absolute coords. ynest is
+                    // deprecated, so XI2 raw relative motion is unsupported
+                    // here (0). Real relative deltas come from the KMS path.
+                    raw_dx: 0,
+                    raw_dy: 0,
                 }));
             }
             // ynest is a nested backend fed by the parent X server's input,
@@ -147,6 +153,8 @@ impl Backend for HostX11Backend {
                     state: 0,
                     crossing_mode: 0,
                     child: 0,
+                    raw_dx: 0,
+                    raw_dy: 0,
                 }));
             }
             // Device add/remove are plumbing-only in the host-X11 backend;

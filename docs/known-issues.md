@@ -233,6 +233,67 @@ from.
       release. Smoke harness: `tools/barrier-smoke.c` /
       `just yserver-barrier-smoke-hw`; barrier trace logging under
       `yserver_core::barriers`.
+- [ ] **`AllowEvents` admission can replay a stale frozen event after an
+      out-of-band thaw (2026-07-15, residual after the Steam input-wedge
+      fix `06b3e9d8`).** The core `AllowEvents` admission check in
+      `apply_allow_events` (`process_request.rs`, the `frozen_strict`
+      guard) ORs `core_frozen` (`frozen_pointer_event.is_some()` /
+      `frozen_keyboard_event.is_some()`) into the gate. If the unified
+      per-device freeze state (`xi1_frozen[dev]`, Xorg's `sync.frozen`) is
+      thawed out-of-band — e.g. an unrelated async grab activation or an
+      `UngrabKeyboard` — while the legacy `frozen_pointer_event` slot
+      still lingers, a late `ReplayPointer`/`ReplayDevice` is still
+      admitted and replays a now-stale activating event. Xorg's
+      `AllowSome` (dix/events.c:1847-1851) gates only on the single sync
+      state / `sync.other`. Caveat: naively dropping `core_frozen` from
+      the check breaks 3 tuned replay tests
+      (`core_replay_keyboard_releases_grab_and_replays_to_focus`,
+      `xi_allow_events_replay_device_drains_queued_release_after_press`,
+      `xi_allow_events_replay_device_replays_frozen_button_press_to_target`)
+      — `core_frozen` is a legitimate admission signal in flows where the
+      core replay slot is set but the unified state is not yet
+      `FrozenNoEvent` at AllowEvents time. A correct fix must distinguish
+      a legit core-frozen replay from a stale post-thaw slot. Low priority
+      — the input-wedge that made this desync reachable is fixed; this is
+      a narrow stale-replay edge case.
+- [ ] **Out-of-band pointer thaw drops the frozen queue instead of
+      replaying it (2026-07-15, residual after `06b3e9d8`).** When the
+      unified pointer freeze clears via a path other than `AllowEvents`
+      (e.g. an unrelated async grab thaw), `xi1_compute_freezes`
+      (`pointer_fanout.rs`, the stale-queue cleanup) *drops*
+      `frozen_pointer_queue` (once `frozen_pointer_event` is gone) rather
+      than replaying it. Xorg's `ComputeFreezes` calls
+      `PlayReleasedEvents` as soon as a device is no longer frozen
+      (dix/events.c:1369-1372). Concrete risk: a press activates a sync
+      passive grab → the release is queued during the freeze → an
+      unrelated async thaw lands before `ReplayPointer` → yserver loses
+      the queued release instead of delivering it under the still-active
+      grab. Narrow edge case. Fix needs `backend`/`xid_map` plumbed into
+      the `ComputeFreezes` port (currently a pure-state function) so it
+      can replay rather than drop.
+- [ ] **wine/Proton `XOpenDevice(0)` → fatal `XI_BadDevice` (2026-07-15,
+      reported on #94 by VictorVoltzz, SEPARATE from the freeze/replay
+      wedge).** During Proton/wine game launches the client issues XI 1.x
+      `X_OpenDevice` (major 137, minor 3) for device id `0x0` and treats
+      the reply as fatal:
+      `XI_BadDevice (invalid Device parameter) ... Minor opcode 3
+      (X_OpenDevice), Device id 0x0`. yserver's handler
+      (`process_request.rs` XI1 minor-3 branch, ~line 12616) correctly
+      rejects id 0: `xi1_device_valid(0)` is false and masters are also
+      refused, matching Xorg `Xi/opendev.c` (XOpenDevice only opens
+      extension devices; unknown/master ids → `BadDevice`). So the reply
+      is arguably spec/Xorg-correct — the open question is *why wine reaches
+      for device 0 at all* and whether real Xorg answers differently.
+      Investigation leads: diff what `XListInputDevices` (minor 2) /
+      `XIQueryDevice` report against a real Xorg trace on the same wine
+      launch — wine likely enumerates devices and then opens one it thinks
+      has id 0, or probes id 0 as a wildcard that Xorg tolerates. NOT
+      addressed by the freeze-state unification work
+      (`docs/superpowers/plans/2026-07-15-freeze-state-unification.md`),
+      which touches only the sync-grab freeze/replay path, not device
+      enumeration/open. (The accompanying `libextest.so ... ELFCLASS32`
+      LD_PRELOAD line in the report is Steam/wine's own 32-bit runtime,
+      not a yserver error.)
 
 ## Drawing / rendering artifacts
 

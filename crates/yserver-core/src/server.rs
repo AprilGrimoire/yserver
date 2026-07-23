@@ -325,16 +325,45 @@ pub struct Xi1Freeze {
     /// The event stored when `state == FrozenWithEvent` — the replay
     /// source for AllowDeviceEvents(ReplayThisDevice) (Xorg
     /// `sync.event`).
-    pub stored: Option<Xi1QueuedEvent>,
-    /// Device events queued while frozen, replayed on thaw (Xorg
-    /// `syncEvents.pending`, kept per-device here).
-    pub queue: std::collections::VecDeque<Xi1QueuedEvent>,
-    /// CORE key events withheld while the keyboard device is frozen —
-    /// in Xorg the freeze switches the whole device to the enqueue
-    /// proc, so core delivery stops too. Only the keyboard device uses
-    /// this (core POINTER events deliberately keep flowing for now —
-    /// desktop interactivity risk outweighs XTS fidelity there).
-    pub core_key_queue: std::collections::VecDeque<crate::host_x11::HostKeyEvent>,
+    pub stored: Option<QueuedInputEvent>,
+}
+
+/// A withheld input event awaiting replay. Each variant retains the form in
+/// which the event was already processed, so replay can enter its native
+/// routing path without reconstructing coordinates or XI1 focus metadata.
+#[derive(Debug, Clone)]
+pub enum QueuedInputEvent {
+    HostPointer(crate::host_x11::HostPointerEvent),
+    HostKey(crate::host_x11::HostKeyEvent),
+    Xi1Routed(Xi1QueuedEvent),
+}
+
+/// One device-tagged entry in Xorg's global `syncEvents.pending` equivalent.
+#[derive(Debug, Clone)]
+pub struct PendingSyncEvent {
+    pub device: u16,
+    pub event: QueuedInputEvent,
+}
+
+/// Clears `ServerState::playing_sync_events` even if replay returns early or
+/// unwinds. The pointer is valid for the local call scope that arms it.
+pub(crate) struct SyncReplayGuard(*mut bool);
+
+impl SyncReplayGuard {
+    /// # Safety
+    /// `flag` must outlive the returned guard and must not be concurrently
+    /// accessed. The server is single-threaded and callers keep this local.
+    pub(crate) unsafe fn arm(flag: &mut bool) -> Self {
+        *flag = true;
+        Self(std::ptr::from_mut(flag))
+    }
+}
+
+impl Drop for SyncReplayGuard {
+    fn drop(&mut self) {
+        // SAFETY: guaranteed by `arm`'s caller contract.
+        unsafe { *self.0 = false };
+    }
 }
 
 impl Xi1Freeze {
@@ -503,6 +532,30 @@ pub struct ActivePointerGrab {
     /// GrabPointer — see [`PassiveButtonGrab::via_xi2`] for the
     /// delivery-protocol rule.
     pub via_xi2: bool,
+    /// True when this grab was established implicitly by a delivered
+    /// ButtonPress (Xorg `ActivateImplicitGrab`, dix/events.c:2150-2193:
+    /// `grabinfo->implicitGrab`), rather than by GrabPointer/XIGrabDevice
+    /// or a passive button grab. An implicit grab is a REAL active grab —
+    /// request handlers (GrabPointer AlreadyGrabbed, UngrabPointer,
+    /// ChangeActivePointerGrab, AllowEvents, disconnect) treat it exactly
+    /// like an owned grab, which is Xorg's shared-`deviceGrab.grab` model.
+    /// Only the auto-release path keys on it: the pointer fanout tears it
+    /// down after the final ButtonRelease is delivered under it
+    /// (Xi/exevents.c:1931-1958).
+    pub implicit: bool,
+    /// True when this grab was activated by a passive button grab
+    /// (Xorg `grabinfo->fromPassiveGrab`). Passive and implicit grabs
+    /// share the auto-release lifetime; explicit grabs live until ungrabbed.
+    pub passive: bool,
+    /// XI2 evtype mask (bit = evtype) gating XI2 delivery under this grab
+    /// — Xorg `GrabRec.xi2mask`. Snapshot semantics: for an implicit grab
+    /// this is the event window's MERGED xi2 selection captured at
+    /// activation (Xorg ActivateImplicitGrab: xi2mask_merge(tempGrab->
+    /// xi2mask, inputMasks->xi2mask), events.c:2183-2189). XIGrabDevice
+    /// sets `u32::MAX` — its wire mask is not parsed (pre-existing
+    /// permissive delivery); core GrabPointer sets 0 (never consulted:
+    /// the XI2 redirect delivers nothing for via_xi2=false grabs).
+    pub xi2_mask: u32,
 }
 
 /// XComposite redirect mode. Both wire constants are accepted —
@@ -769,9 +822,6 @@ pub struct ServerState {
     /// `XFixesSelectionNotify` events (Xorg `xfixes/select.c:89` reads
     /// `selection->lastTimeChanged`).
     pub selections: HashMap<AtomId, (ResourceId, u32)>,
-    /// Active pointer grab: (grab owner, grab window). When set, all pointer
-    /// events are redirected to the grab owner regardless of where the cursor is.
-    pub pointer_grab: Option<(ClientId, ResourceId)>,
     /// Last known pointer position in root coordinates, cached from the
     /// pointer fanout. XI2 focus events (FocusIn/FocusOut share the
     /// `xXIEnterEvent` layout and carry the pointer position) are emitted
@@ -779,31 +829,13 @@ pub struct ServerState {
     /// pointer; without this cache they ship at (0,0).
     pub pointer_root: (i16, i16),
     /// Active pointer grab record (full state including event_mask/cursor/time).
-    /// When set, mirrors `pointer_grab` and supersedes it for spec-correct
-    /// `ChangeActivePointerGrab` semantics.
     pub active_pointer_grab: Option<ActivePointerGrab>,
     /// Registered passive button grabs.
     pub button_grabs: Vec<PassiveButtonGrab>,
-    /// True when `pointer_grab` was activated by a passive button grab.
-    pub pointer_grab_is_passive: bool,
-    /// Frozen pointer event held by a sync passive grab. This is the
-    /// *activating* press that triggered the grab; replayed on
-    /// `AllowEvents(ReplayPointer)` / `XIAllowEvents(ReplayDevice)`.
-    pub frozen_pointer_event: Option<crate::host_x11::HostPointerEvent>,
-    /// Pointer events that arrived while a sync passive grab was frozen
-    /// (between the activating press and `AllowEvents`). Mirrors
-    /// Xorg's `syncEvents.pending` (`dix/events.c:1320` —
-    /// `ComputeFreezes` then `PlayReleasedEvents`). Drained in arrival
-    /// order on replay AllowEvents; cleared without delivery on
-    /// async/disconnect.
-    /// Holding these in a queue (instead of delivering through to the
-    /// natural target) is load-bearing for slow-WM cases like MATE's
-    /// marco, which does ~10 round-trips of focus/property work
-    /// between the press and `AllowEvents(ReplayPointer)` — without
-    /// the queue, a fast user release races marco's AllowEvents and
-    /// the app sees Release before the replayed Press, malforming the
-    /// gesture and breaking menus and titlebar drags.
-    pub frozen_pointer_queue: std::collections::VecDeque<crate::host_x11::HostPointerEvent>,
+    /// Global withheld-event queue, in arrival order across devices.
+    pub sync_pending: std::collections::VecDeque<PendingSyncEvent>,
+    /// Xorg `syncEvents.playingEvents`: prevents nested replay passes.
+    pub playing_sync_events: bool,
     /// Registered passive key grabs.
     pub key_grabs: Vec<KeyGrab>,
     /// XI 1.x passive device grabs (GrabDeviceKey / GrabDeviceButton).
@@ -915,11 +947,6 @@ pub struct ServerState {
     pub xi1_resolution: HashMap<u16, Vec<[i32; 3]>>,
     /// Active keyboard grab (explicit or passive-induced).
     pub active_keyboard_grab: Option<ActiveKeyboardGrab>,
-    /// Frozen key event held by a sync passive key grab, awaiting
-    /// `AllowEvents(ReplayKeyboard)` / `XIAllowEvents(ReplayDevice)`.
-    /// Mirrors `frozen_pointer_event`; its presence marks the active
-    /// keyboard grab as a synchronous freeze.
-    pub frozen_keyboard_event: Option<crate::host_x11::HostKeyEvent>,
     /// XFIXES regions owned by clients.
     pub xfixes_regions: HashMap<u32, XFixesRegion>,
     /// XFIXES/XInput pointer barriers owned by clients.
@@ -1124,6 +1151,16 @@ pub struct GlxDrawable {
 }
 
 impl ServerState {
+    /// Install the complete active pointer-grab snapshot.
+    pub fn set_pointer_grab(&mut self, grab: ActivePointerGrab) {
+        self.active_pointer_grab = Some(grab);
+    }
+
+    /// Tear down the active pointer grab.
+    pub fn clear_pointer_grab(&mut self) {
+        self.active_pointer_grab = None;
+    }
+
     #[must_use]
     pub fn new() -> Self {
         Self::with_geometry(800, 600)
@@ -1163,13 +1200,11 @@ impl ServerState {
             randr_select_masks: HashMap::new(),
             xkb_select_event_masks: HashMap::new(),
             selections: HashMap::new(),
-            pointer_grab: None,
             pointer_root: (0, 0),
             active_pointer_grab: None,
             button_grabs: Vec::new(),
-            pointer_grab_is_passive: false,
-            frozen_pointer_queue: std::collections::VecDeque::new(),
-            frozen_pointer_event: None,
+            sync_pending: std::collections::VecDeque::new(),
+            playing_sync_events: false,
             key_grabs: Vec::new(),
             xi1_passive_grabs: Vec::new(),
             xi1_active_grabs: HashMap::new(),
@@ -1196,7 +1231,6 @@ impl ServerState {
             xi1_modifier_map: HashMap::new(),
             xi1_resolution: HashMap::new(),
             active_keyboard_grab: None,
-            frozen_keyboard_event: None,
             xfixes_regions: HashMap::new(),
             pointer_barriers: HashMap::new(),
             xfixes_selection_masks: HashMap::new(),
@@ -1270,17 +1304,29 @@ impl ServerState {
         s
     }
 
-    /// Seed the XI2 device-property registry from a libinput touchpad
+    /// Seed the XI2 device-property registry from a libinput pointer
     /// device-add event.
     ///
-    /// When `info.is_touchpad` is true, the slave-pointer entry (id 4)
-    /// receives the real device name and a set of libinput-style
-    /// properties.  Non-touchpad devices are silently ignored.
+    /// The single slave-pointer entry (id 4) receives the real device name
+    /// and the libinput-style properties for whichever knobs libinput
+    /// reports available. Admitted for a touchpad OR a **real relative
+    /// pointer** — one that reports pointer acceleration (`accel.available`,
+    /// the hallmark of a mouse/trackpoint). This deliberately EXCLUDES the
+    /// phantom HID "Consumer Control" / "System Control" collections that a
+    /// keyboard or wireless receiver exposes: libinput tags them
+    /// pointer-capable but they carry almost no config, and — because id 4
+    /// is a single latest-wins slot — one of them would otherwise clobber
+    /// the real mouse's rich config (left-handed, middle-emulation, …),
+    /// leaving the KDE Mouse KCM unable to configure the mouse.
+    ///
+    /// Seeding a real mouse is required because the KDE Mouse KCM reads
+    /// `libinput Accel Speed` on the pointer; a missing atom made it
+    /// SIGSEGV (see `project_kcm_mouse_crash_libinput_accel`).
     ///
     /// Property-name atoms are interned via `self.atoms` so they share
     /// the same atom namespace as all other server atoms.
     pub fn xi_seed_touchpad(&mut self, info: &crate::core_loop::DeviceInfo) {
-        if !info.is_touchpad {
+        if !info.is_touchpad && !info.config.accel.available {
             return;
         }
         crate::xinput::seed_touchpad(&mut self.xi_devices, &mut self.atoms, self.float_atom, info);
@@ -2508,21 +2554,17 @@ fn pointer_event_fanout_inner(
     // root coordinates and can't match them against its menu-item children.
     let grab_state = if handle_grabs {
         match state.lock() {
-            Ok(g) => g.pointer_grab.and_then(|(client_id, grab_window)| {
-                let target = g.client_target(client_id)?;
-                let (gx, gy) = g.resources.window_absolute_position(grab_window);
-                let owner_events = if g.pointer_grab_is_passive {
-                    g.button_grabs
-                        .iter()
-                        .rev()
-                        .find(|grab| grab.owner == client_id && grab.grab_window == grab_window)
-                        .is_some_and(|grab| grab.owner_events)
-                } else {
-                    g.active_pointer_grab
-                        .filter(|grab| grab.owner == client_id)
-                        .is_some_and(|grab| grab.owner_events)
-                };
-                Some((grab_window, client_id, target, gx, gy, owner_events))
+            Ok(g) => g.active_pointer_grab.and_then(|grab| {
+                let target = g.client_target(grab.owner)?;
+                let (gx, gy) = g.resources.window_absolute_position(grab.grab_window);
+                Some((
+                    grab.grab_window,
+                    grab.owner,
+                    target,
+                    gx,
+                    gy,
+                    grab.owner_events,
+                ))
             }),
             Err(_) => return,
         }
@@ -2616,12 +2658,14 @@ fn pointer_event_fanout_inner(
 
     if event.kind == PointerEventKind::ButtonRelease
         && let Ok(mut s) = state.lock()
-        && s.pointer_grab_is_passive
+        && s.active_pointer_grab.is_some_and(|grab| grab.passive)
     {
-        s.pointer_grab = None;
-        s.pointer_grab_is_passive = false;
-        s.frozen_pointer_event = None;
-        s.frozen_pointer_queue.clear();
+        s.clear_pointer_grab();
+        if let Some(freeze) = s.xi1_frozen.get_mut(&crate::xinput::DEVICEID_SLAVE_POINTER) {
+            freeze.stored = None;
+            freeze.state = Xi1SyncState::Thawed;
+            freeze.other = None;
+        }
     }
 
     // Passive button grab matching for ButtonPress events.
@@ -2650,10 +2694,23 @@ fn pointer_event_fanout_inner(
                 Ok(mut s) => {
                     let target = s.client_target(grab.owner);
                     if grab.pointer_mode == 0 {
-                        s.frozen_pointer_event = Some(event);
+                        s.xi1_frozen
+                            .entry(crate::xinput::DEVICEID_SLAVE_POINTER)
+                            .or_default()
+                            .stored = Some(QueuedInputEvent::HostPointer(event));
                     }
-                    s.pointer_grab = Some((grab.owner, grab.grab_window));
-                    s.pointer_grab_is_passive = true;
+                    s.set_pointer_grab(ActivePointerGrab {
+                        owner: grab.owner,
+                        grab_window: grab.grab_window,
+                        event_mask: (grab.event_mask & u32::from(u16::MAX)) as u16,
+                        cursor: ResourceId(0),
+                        time: event.time,
+                        owner_events: grab.owner_events,
+                        via_xi2: grab.via_xi2,
+                        implicit: false,
+                        passive: true,
+                        xi2_mask: if grab.via_xi2 { grab.event_mask } else { 0 },
+                    });
                     target
                 }
                 Err(_) => return,
@@ -2921,12 +2978,13 @@ fn pointer_event_fanout_inner(
             seq,
             137, // XI2 major opcode
             raw_evtype,
-            2, // deviceid: Master Pointer
+            4, // deviceid: source Slave Pointer
             event.time,
             u32::from(event.detail),
-            2, // sourceid: Master Pointer
-            i32::from(event.root_x),
-            i32::from(event.root_y),
+            4, // sourceid: source Slave Pointer
+            // Relative device delta, not absolute position (see pointer_fanout).
+            event.raw_dx,
+            event.raw_dy,
         );
         if let Ok(mut w) = target.writer.lock() {
             let _ = w.write_all(&buf);
@@ -3680,8 +3738,18 @@ mod tests {
                     reader_control: None,
                 },
             );
-            s.pointer_grab = Some((ClientId(1), grab_window));
-            s.pointer_grab_is_passive = true;
+            s.set_pointer_grab(ActivePointerGrab {
+                owner: ClientId(1),
+                grab_window,
+                event_mask: u16::MAX,
+                cursor: ResourceId(0),
+                time: 0,
+                owner_events: false,
+                via_xi2: false,
+                implicit: false,
+                passive: true,
+                xi2_mask: 0,
+            });
             assert_eq!(s.subscribers(grab_window, 0x0000_0004).len(), 1);
             assert_eq!(s.subscribers(target_window, 0x0000_0004).len(), 1);
             assert!(s.resources.window(target_window).is_some());
@@ -3715,6 +3783,8 @@ mod tests {
                 state: 0,
                 crossing_mode: 0,
                 child: 0,
+                raw_dx: 0,
+                raw_dy: 0,
             },
         );
 
@@ -3827,8 +3897,18 @@ mod tests {
                     reader_control: None,
                 },
             );
-            s.pointer_grab = Some((ClientId(1), grab_window));
-            s.pointer_grab_is_passive = true;
+            s.set_pointer_grab(ActivePointerGrab {
+                owner: ClientId(1),
+                grab_window,
+                event_mask: u16::MAX,
+                cursor: ResourceId(0),
+                time: 0,
+                owner_events: true,
+                via_xi2: true,
+                implicit: false,
+                passive: true,
+                xi2_mask: u32::MAX,
+            });
             s.button_grabs.push(PassiveButtonGrab {
                 owner: ClientId(1),
                 grab_window,
@@ -3862,6 +3942,8 @@ mod tests {
                 state: 0,
                 crossing_mode: 0,
                 child: 0,
+                raw_dx: 0,
+                raw_dy: 0,
             },
         );
 
@@ -3975,8 +4057,18 @@ mod tests {
                     reader_control: None,
                 },
             );
-            s.pointer_grab = Some((ClientId(1), grab_window));
-            s.pointer_grab_is_passive = true;
+            s.set_pointer_grab(ActivePointerGrab {
+                owner: ClientId(1),
+                grab_window,
+                event_mask: u16::MAX,
+                cursor: ResourceId(0),
+                time: 0,
+                owner_events: true,
+                via_xi2: true,
+                implicit: false,
+                passive: true,
+                xi2_mask: u32::MAX,
+            });
             s.button_grabs.push(PassiveButtonGrab {
                 owner: ClientId(1),
                 grab_window,
@@ -4010,6 +4102,8 @@ mod tests {
                 state: 0,
                 crossing_mode: 0,
                 child: 0,
+                raw_dx: 0,
+                raw_dy: 0,
             },
         );
 
@@ -4123,6 +4217,8 @@ mod tests {
                 state: 0,
                 crossing_mode: 0,
                 child: 0,
+                raw_dx: 0,
+                raw_dy: 0,
             },
         );
 
@@ -4241,6 +4337,8 @@ mod tests {
                 state: 0x0100,
                 crossing_mode: 0,
                 child: 0,
+                raw_dx: 0,
+                raw_dy: 0,
             },
         );
 
@@ -4274,6 +4372,8 @@ mod tests {
                 state: 0,
                 crossing_mode: 0,
                 child: 0,
+                raw_dx: 0,
+                raw_dy: 0,
             },
         );
         let a_read2 = a_reader_remote.read(&mut buf);
@@ -4333,6 +4433,8 @@ mod tests {
                 state: 0,
                 crossing_mode: 0,
                 child: 0,
+                raw_dx: 0,
+                raw_dy: 0,
             },
         );
 

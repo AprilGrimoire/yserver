@@ -465,17 +465,17 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     // signalfd → Message bridge. yserver-core deliberately doesn't
     // depend on nix; a tiny thread wraps the SignalFd read so run_core
     // only sees channel-side messages. SIGINT/SIGTERM map to
-    // `Shutdown`; SIGUSR1/SIGUSR2 map to VT release/acquire messages,
-    // which fall back to diagnostic dumps when VT switching is not
-    // armed.
+    // `Shutdown`; SIGUSR1/SIGUSR2 map to VT release/acquire messages
+    // (a no-op when VT switching is not armed).
     //
     // SIGUSR1 carries three distinct, non-conflicting meanings here:
     // (1) the *inherited disposition* read once at startup
     // (`sigusr1_was_ignored` above) drives the readiness handshake
     // *to the parent* DM (`launch::signal_ready`); (2) masked-and-
-    // signalfd-consumed *delivery to self* triggers the scanout dump
-    // below; (3) we *send* SIGUSR1 outward to the parent at readiness.
-    // Disposition-in, delivery-to-self, and signal-out are separate.
+    // signalfd-consumed *delivery to self* drives the VT release/
+    // acquire handshake; (3) we *send* SIGUSR1 outward to the parent
+    // at readiness. Disposition-in, delivery-to-self, and signal-out
+    // are separate.
     let signal_sender = sender.clone_handle();
     thread::Builder::new()
         .name("yserver-signalfd".into())

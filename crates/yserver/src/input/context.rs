@@ -69,20 +69,22 @@ impl LibinputInterface for Interface {
 pub struct Context {
     libinput: Libinput,
     /// Live libinput device handles keyed by evdev devnode (e.g.
-    /// `/dev/input/event4`). Populated at `DeviceAdded` for touchpads
-    /// (`is_touchpad == true`); cleared at `DeviceRemoved`. Consumed
-    /// by [`Context::apply_device_config`] so decoded `xinput set-prop`
-    /// writes can be routed through to the
-    /// matching `config_*_set_*` setter on the live device.
+    /// `/dev/input/event4`). Populated at `DeviceAdded` for any pointer
+    /// device (touchpad OR mouse — the ones whose libinput properties we
+    /// seed); cleared at `DeviceRemoved`. Consumed by
+    /// [`Context::apply_device_config`] so decoded `xinput set-prop`
+    /// writes (e.g. the KDE Mouse KCM setting `libinput Accel Speed`) can
+    /// be routed through to the matching `config_*_set_*` setter on the
+    /// live device.
     ///
     /// `input::Device` is refcounted at the C level (`libinput_device_ref`)
     /// and the Rust wrapper exposes that via `Clone` — stashing the handle
     /// here keeps the device alive even after libinput's own iterator
     /// drops its borrow, and the entry's eventual `remove(...)` drops
     /// the last ref.
-    touchpad_devices: HashMap<String, Device>,
+    pointer_devices: HashMap<String, Device>,
     /// Live handles for keyboard-capability devices, same keying and
-    /// refcount semantics as `touchpad_devices`. Consumed by
+    /// refcount semantics as `pointer_devices`. Consumed by
     /// [`Context::update_leds`] — the XKB lock state (Caps/Num/Scroll)
     /// lives in the server core, so the server must push LED changes
     /// down to the hardware via `libinput_device_led_update`; nothing
@@ -186,7 +188,7 @@ impl Context {
         })?;
         Ok(Self {
             libinput,
-            touchpad_devices: HashMap::new(),
+            pointer_devices: HashMap::new(),
             keyboard_devices: HashMap::new(),
             last_leds: Led::empty(),
             usable_input_nodes: HashSet::new(),
@@ -239,27 +241,38 @@ impl Context {
                             .and_then(|ud| ud.devnode().map(|p| p.to_string_lossy().into_owned()));
                         node.unwrap_or_else(|| device_node_from_sysname(&sysname))
                     };
-                    // T4: gather the live config snapshot for touchpads so the
-                    // XI2 property registry exposes which libinput knobs are
-                    // available / current / default on this device. Non-
-                    // touchpads still get a default snapshot — the property
-                    // descriptors gate creation off `is_touchpad`, so the
-                    // contents are unused there.
-                    let config = if is_tp {
+                    // T4: gather the live config snapshot for any pointer
+                    // device (touchpad OR mouse) so the XI2 property registry
+                    // exposes which libinput knobs are available / current /
+                    // default on it. A mouse still has accel / left-handed /
+                    // natural-scroll / send-events knobs — the KDE Mouse KCM
+                    // reads `libinput Accel Speed` and SIGSEGVs if the atom is
+                    // absent. Non-pointer devices (keyboards) keep the
+                    // all-`false` default snapshot.
+                    let is_pointer = dev.has_capability(DeviceCapability::Pointer);
+                    let config = if is_tp || is_pointer {
                         libinput_config::gather(&dev)
                     } else {
                         LibinputConfigSnapshot::default()
                     };
-                    // T4: stash the live device handle keyed by devnode so
-                    // `apply_device_config` (the `xinput set-prop` write path)
-                    // can later route to the matching `config_*_set_*` setter.
+                    // A *real* relative pointer reports pointer acceleration.
+                    // The phantom HID "Consumer Control" / "System Control"
+                    // collections a keyboard or wireless receiver exposes are
+                    // pointer-capable to libinput but have no accel; excluding
+                    // them here keeps them from clobbering the single
+                    // slave-pointer slot (id 4, latest-wins) that the real
+                    // mouse must own, and keeps the write map to real devices.
+                    let is_real_pointer = is_tp || config.accel.available;
+                    // Stash the live device handle keyed by devnode so
+                    // `apply_device_config` (the KCM XIChangeProperty write
+                    // path) can route to the `config_*_set_*` setter.
                     // `Device: Clone` is libinput's C-level refcount bump
-                    // (`libinput_device_ref`), so the handle survives even
-                    // after this event's borrow drops. Only stored for
-                    // touchpads — the writable property table only targets
-                    // touchpads at T4 scope.
-                    if is_tp {
-                        self.touchpad_devices
+                    // (`libinput_device_ref`), so the handle survives after
+                    // this event's borrow drops. Stored for every real pointer
+                    // we seed props for — otherwise a mouse's write (accel,
+                    // left-handed, …) would silently no-op.
+                    if is_real_pointer {
+                        self.pointer_devices
                             .insert(device_node.clone(), dev.clone());
                     }
                     // Keyboard-capability devices are stashed for LED
@@ -312,7 +325,7 @@ impl Context {
                     };
                     // T4: drop the stashed handle (libinput unref via Drop).
                     // No-op if the device wasn't a touchpad (never inserted).
-                    self.touchpad_devices.remove(&device_node);
+                    self.pointer_devices.remove(&device_node);
                     self.keyboard_devices.remove(&device_node);
                     self.usable_input_nodes.remove(&device_node);
                     out.push(InputEvent::DeviceRemoved { device_node });
@@ -337,12 +350,22 @@ impl Context {
         }
     }
 
-    /// Route a decoded `xinput set-prop` write through to the live
-    /// libinput device. Returns `Ok(())` when no
-    /// matching device is stashed for `device_node` (a property write
-    /// on a non-touchpad / unplugged device is a no-op from the user's
-    /// perspective; the property registry stays writable and the X11
-    /// reply path doesn't surface a "device gone" error to clients).
+    /// Route a decoded `xinput set-prop` / KCM `XIChangeProperty` write
+    /// through to the live libinput device it targets, keyed by the XI
+    /// device's `device_node`. Config is per-device (as on Xorg, where each
+    /// physical pointer is its own XI slave): a write to the mouse must not
+    /// touch a touchpad, so this applies ONLY to the matching device.
+    ///
+    /// LIMITATION: yserver currently exposes a single slave-pointer entry
+    /// (id 4) that whichever real pointer seeded last owns, so only that one
+    /// device is configurable per-session. The correct long-term fix is to
+    /// expose one XI slave per physical pointer like Xorg
+    /// (see `project_kcm_mouse_crash_libinput_accel`).
+    ///
+    /// Returns `Ok(())` when no matching device is stashed for
+    /// `device_node` (an unplugged / non-real-pointer target is a no-op; the
+    /// property registry stays writable and the X11 reply path doesn't
+    /// surface a "device gone" error to clients).
     ///
     /// Errors map libinput's [`input::DeviceConfigError`] onto the
     /// X-layer's [`DeviceConfigError`]: `Unsupported` → BadMatch,
@@ -359,7 +382,7 @@ impl Context {
         device_node: &str,
         change: DeviceConfigChange,
     ) -> Result<(), DeviceConfigError> {
-        self.touchpad_devices
+        self.pointer_devices
             .get_mut(device_node)
             .map_or(Ok(()), |dev| libinput_config::apply(dev, change))
     }
@@ -402,7 +425,7 @@ impl Context {
     /// Suspend libinput: closes all open input device fds. The context remains
     /// valid and can be resumed with [`Context::resume`].
     ///
-    /// `touchpad_devices` is intentionally left as-is — the stashed
+    /// `pointer_devices` is intentionally left as-is — the stashed
     /// handles point at devices whose fds are now closed, but
     /// libinput's own `DeviceRemoved` (or a fresh `DeviceAdded` after
     /// `resume`) will replace each entry the next time `dispatch()`

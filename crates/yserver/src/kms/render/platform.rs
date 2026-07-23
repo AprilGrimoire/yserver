@@ -906,7 +906,12 @@ fn probe_scanout_setup(
 
     let planning_vk = VkContext::new_for_drm(renderer_device_key, renderer_render_node_key)
         .map_err(|err| io::Error::other(format!("disposable Vulkan device: {err}")))?;
-    let plans = ScanoutBoPool::renderer_owned_plans(&planning_vk, &output.scanout_modifiers);
+    let plans = ScanoutBoPool::renderer_owned_plans(
+        &planning_vk,
+        &output.scanout_modifiers,
+        u32::from(width),
+        true,
+    );
     drop(planning_vk);
 
     let selected = select_renderer_owned_plan(plans, |plan| {

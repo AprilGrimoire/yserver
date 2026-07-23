@@ -18,6 +18,7 @@ crossbeam-channel = "0.5"
 drm = "0.15"
 env_logger = "0.11"
 freetype-rs = "0.38"
+gbm = { version = "0.18", default-features = false, features = ["drm-support"] }
 gpu-allocator = { version = "0.28", default-features = false, features = [
   "std",
   "vulkan"
