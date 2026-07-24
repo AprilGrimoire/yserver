@@ -401,7 +401,7 @@ pub fn process_request(
             attached_fd,
         ),
         // ── GLX extension dispatcher ──
-        148 => handle_glx_request(state, backend, client_id, sequence, header, body),
+        148 => handle_glx_request(state, backend, origin, client_id, sequence, header, body),
         // ── X-Resource (XRes) extension dispatcher ──
         149 => handle_x_resource_request(state, client_id, sequence, header, body),
         // ── MIT-SCREEN-SAVER extension dispatcher ──
@@ -8039,6 +8039,11 @@ fn handle_present_request(
             let pixmap_exists = state.resources.pixmap(ResourceId(req.pixmap)).is_some();
             let src = state.resources.host_drawable_target(ResourceId(req.pixmap));
             let dst = state.resources.host_drawable_target(ResourceId(req.window));
+            let dst_window_host_xid = state
+                .resources
+                .window(ResourceId(req.window))
+                .and_then(|window| window.host_xid)
+                .map(|host_xid| host_xid.as_raw());
             if !window_exists {
                 return emit_x11_error_with_minor(
                     state,
@@ -8150,6 +8155,13 @@ fn handle_present_request(
                 Some(dst),
             ) = (src, dst)
             {
+                // Keep the destination's window identity for the paint. A
+                // redirected window's HostDrawableTarget names its backing
+                // pixmap, which is useful for completion fencing but loses
+                // ClipByChildren and hierarchy stacking. The backend resolves
+                // this window xid to that same backing after computing the
+                // correct window clip.
+                let paint_dst_host_xid = dst_window_host_xid.unwrap_or_else(|| dst.host_xid());
                 if src_depth != dst.depth() {
                     return emit_x11_error_with_minor(
                         state,
@@ -8240,7 +8252,7 @@ fn handle_present_request(
                             backend.copy_area(
                                 origin,
                                 host_xid.as_raw(),
-                                dst.host_xid(),
+                                paint_dst_host_xid,
                                 rect.x,
                                 rect.y,
                                 req.x_off.saturating_add(rect.x),
@@ -8253,7 +8265,7 @@ fn handle_present_request(
                         backend.copy_area(
                             origin,
                             host_xid.as_raw(),
-                            dst.host_xid(),
+                            paint_dst_host_xid,
                             0,
                             0,
                             req.x_off,
@@ -8266,7 +8278,7 @@ fn handle_present_request(
                     backend.copy_area(
                         origin,
                         host_xid.as_raw(),
-                        dst.host_xid(),
+                        paint_dst_host_xid,
                         0,
                         0,
                         req.x_off,
@@ -8280,9 +8292,9 @@ fn handle_present_request(
                 // and `req.window` are CLIENT xids, but backends
                 // (notably v2's DrawableStore) key on the host xid
                 // the resources layer assigned. Using the resolved
-                // `host_xid.as_raw()` / `dst.host_xid()` keeps the
+                // `host_xid.as_raw()` / `paint_dst_host_xid` keeps the
                 // lookup symmetric with `copy_area` above.
-                backend.note_present_pixmap(host_xid.as_raw(), dst.host_xid());
+                backend.note_present_pixmap(host_xid.as_raw(), paint_dst_host_xid);
                 if req.update != 0 {
                     if let Some(region) = state.xfixes_regions.get(&req.update) {
                         let rects = region.rects.clone();
@@ -8466,6 +8478,11 @@ fn handle_present_request(
             let pixmap_exists = state.resources.pixmap(ResourceId(req.pixmap)).is_some();
             let src = state.resources.host_drawable_target(ResourceId(req.pixmap));
             let dst = state.resources.host_drawable_target(ResourceId(req.window));
+            let dst_window_host_xid = state
+                .resources
+                .window(ResourceId(req.window))
+                .and_then(|window| window.host_xid)
+                .map(|host_xid| host_xid.as_raw());
             if !window_exists {
                 return emit_x11_error_with_minor(
                     state,
@@ -8553,12 +8570,13 @@ fn handle_present_request(
                 Some(dst),
             ) = (src, dst)
             {
+                let paint_dst_host_xid = dst_window_host_xid.unwrap_or_else(|| dst.host_xid());
                 src_depth == dst.depth()
                     && backend
                         .copy_area(
                             origin,
                             host_xid.as_raw(),
-                            dst.host_xid(),
+                            paint_dst_host_xid,
                             req.x_off,
                             req.y_off,
                             0,
@@ -9732,11 +9750,13 @@ fn handle_dri3_request(
 }
 
 /// Build the FBConfig list returned by `GetFBConfigs`. We synthesise
-/// from each X visual (depth-24 RGB and depth-32 ARGB) × single/
-/// double buffered, both with depth=24 stencil=8 (the universal
-/// default for OpenGL apps). 4 configs × 25 properties is enough
-/// for Mesa to pick a match for any common glXChooseFBConfig call
-/// without paying for the full ~30-cell sweep the design mentions.
+/// from each X visual (depth-24 RGB and depth-32 ARGB), double buffered,
+/// both with depth=24 stencil=8 (the universal
+/// default for OpenGL apps). 2 configs × 28 properties (+5 bind-to-
+/// texture pairs when TFP is supported) is enough for Mesa to pick a
+/// match for any common glXChooseFBConfig call without paying for the
+/// full ~30-cell sweep the design mentions. All configs advertise
+/// GLX_PBUFFER_BIT so Chromium/ANGLE can allocate its offscreen surface.
 /// Resolve the attribute list for a `GetDrawableAttributes` reply.
 /// Looks up the GlxDrawable resource by XID; falls back to canonical
 /// defaults when Mesa's `loader_dri3` queries directly against the X
@@ -9796,38 +9816,45 @@ fn drawable_attributes_for(state: &ServerState, xid: u32) -> Vec<(u32, u32)> {
 /// GLX 1.2 visual configs in the legacy untagged form Mesa parses
 /// via `__glXInitializeVisualConfigFromTags(!tagged_only)`. Mirrors
 /// the visuals our setup-reply advertises (ROOT_VISUAL depth-24
-/// TrueColor RGB, ARGB_VISUAL depth-32 TrueColor RGBA), each in
-/// double-buffered and single-buffered flavours.
+/// TrueColor RGB, ARGB_VISUAL depth-32 TrueColor RGBA).
+///
+/// An X visual describes one GLX visual configuration. Do not publish the
+/// same visual ID once as double-buffered and again as single-buffered: Mesa
+/// cannot preserve that ambiguity when a context and window are selected
+/// independently. ANGLE selected yserver's single-buffered config for its
+/// context/pbuffer but the double-buffered config carrying the same visual for
+/// its windows. Mesa then allocated a fake front buffer for every window. Xorg
+/// gives those configurations distinct X visuals; until yserver exposes more
+/// setup visuals, associate only the double-buffered configuration with each
+/// real visual.
 fn synthesise_glx_visual_configs() -> Vec<yserver_protocol::x11::glx::VisualConfig> {
     use yserver_protocol::x11::glx::VisualConfig;
     // X11 visual class 4 == TrueColor, matching the class we put in the
     // setup-reply visual list.
     const TRUE_COLOR: u32 = 4;
-    let mut out: Vec<VisualConfig> = Vec::with_capacity(4);
+    let mut out: Vec<VisualConfig> = Vec::with_capacity(2);
     for &(visual_id, alpha_bits, rgb_bits) in &[
         // Must match the client driver's configs (see synthesise_glx_fb_configs):
         // radeonsi advertises alpha-8 / 32-bit-buffer for both depths.
         (0x102_u32, 8_u32, 32_u32), // ROOT_VISUAL — TrueColor (GL alpha 8)
         (0x103_u32, 8_u32, 32_u32), // ARGB_VISUAL — TrueColor RGBA
     ] {
-        for &double_buffer in &[true, false] {
-            out.push(VisualConfig {
-                visual_id,
-                visual_class: TRUE_COLOR,
-                rgba: true,
-                red_bits: 8,
-                green_bits: 8,
-                blue_bits: 8,
-                alpha_bits,
-                double_buffer,
-                stereo: false,
-                rgb_bits,
-                depth_bits: 24,
-                stencil_bits: 8,
-                aux_buffers: 0,
-                level: 0,
-            });
-        }
+        out.push(VisualConfig {
+            visual_id,
+            visual_class: TRUE_COLOR,
+            rgba: true,
+            red_bits: 8,
+            green_bits: 8,
+            blue_bits: 8,
+            alpha_bits,
+            double_buffer: true,
+            stereo: false,
+            rgb_bits,
+            depth_bits: 24,
+            stencil_bits: 8,
+            aux_buffers: 0,
+            level: 0,
+        });
     }
     out
 }
@@ -9853,12 +9880,11 @@ fn glx_extension_string(tfp_supported: bool) -> String {
 
 fn synthesise_glx_fb_configs(tfp_supported: bool) -> Vec<Vec<(u32, u32)>> {
     use yserver_protocol::x11::glx as g;
-    let mut out = Vec::with_capacity(4);
+    let mut out = Vec::with_capacity(2);
     let depth = 24;
     let stencil = 8;
-    let mut next_fbconfig_id: u32 = 0x101;
-    for &(visual_id, alpha_size, total_buffer_size) in &[
-        // (X visual id, alpha bits, total color buffer bits)
+    for &(visual_id, fbconfig_id, alpha_size, total_buffer_size) in &[
+        // (X visual id, FBConfig id, alpha bits, total color buffer bits)
         //
         // These MUST match the client driver's __DRIconfig attributes
         // exactly, or mesa's driConfigEqual rejects them all and GLX dri3
@@ -9868,65 +9894,78 @@ fn synthesise_glx_fb_configs(tfp_supported: bool) -> Vec<Vec<(u32, u32)>> {
         // 32-bit-buffer (the GL backbuffer is BGRA8 regardless of the X
         // visual's opacity), so we mirror that for both. The depth-24 X
         // visual stays opaque on screen; the alpha is GL-side only.
-        (0x102_u32, 8_u32, 32_u32), // ROOT_VISUAL — TrueColor (GL alpha 8)
-        (0x103_u32, 8_u32, 32_u32), // ARGB_VISUAL — TrueColor RGBA
+        (0x102_u32, 0x101_u32, 8_u32, 32_u32), // ROOT_VISUAL — TrueColor
+        // Preserve the IDs of the two double-buffered configurations while
+        // dropping the ambiguous single-buffered 0x102 and 0x104 entries.
+        (0x103_u32, 0x103_u32, 8_u32, 32_u32), // ARGB_VISUAL — TrueColor RGBA
     ] {
-        for &double_buffered in &[1u32, 0u32] {
-            let fbconfig_id = next_fbconfig_id;
-            next_fbconfig_id += 1;
-            let mut config = vec![
-                (g::GLX_VISUAL_ID, visual_id),
-                (g::GLX_FBCONFIG_ID, fbconfig_id),
-                (g::GLX_X_VISUAL_TYPE, g::GLX_TRUE_COLOR),
-                (g::GLX_DRAWABLE_TYPE, g::GLX_WINDOW_BIT | g::GLX_PIXMAP_BIT),
-                (g::GLX_RENDER_TYPE, g::GLX_RGBA_BIT),
-                (g::GLX_X_RENDERABLE, 1),
-                (g::GLX_BUFFER_SIZE, total_buffer_size),
-                (g::GLX_LEVEL, 0),
-                (g::GLX_DOUBLEBUFFER, double_buffered),
-                (g::GLX_STEREO, 0),
-                (g::GLX_AUX_BUFFERS, 0),
-                (g::GLX_RED_SIZE, 8),
-                (g::GLX_GREEN_SIZE, 8),
-                (g::GLX_BLUE_SIZE, 8),
-                (g::GLX_ALPHA_SIZE, alpha_size),
-                (g::GLX_DEPTH_SIZE, depth),
-                (g::GLX_STENCIL_SIZE, stencil),
-                (g::GLX_ACCUM_RED_SIZE, 0),
-                (g::GLX_ACCUM_GREEN_SIZE, 0),
-                (g::GLX_ACCUM_BLUE_SIZE, 0),
-                (g::GLX_ACCUM_ALPHA_SIZE, 0),
-                (g::GLX_CONFIG_CAVEAT, g::GLX_NONE),
-                (g::GLX_TRANSPARENT_TYPE, g::GLX_NONE),
-                (g::GLX_SAMPLE_BUFFERS, 0),
-                (g::GLX_SAMPLES, 0),
-            ];
-            // Append bind-to-texture pairs in Xorg's exact reply order
-            // (glxcmds.c:1094-1100 / glxdricommon.c:165) when TFP is supported.
-            //
-            // These attributes are scalar-compared by mesa's driConfigEqual
-            // against the client driver's __DRIconfig (attribMap in
-            // src/glx/dri_common.c), so they MUST match what radeonsi
-            // advertises or the whole config is rejected and dri3 screen
-            // creation fails ("No matching fbConfigs or visuals found").
-            // HW-verified on bee (radeonsi via Xwayland): every TFP config
-            // reports BIND_RGB=1, BIND_RGBA=1, and BIND_TARGETS=GLX_DONT_CARE.
-            // So advertise RGBA=1 for BOTH depths (depth-24 windows are
-            // opaque; the sample_view forces α=1, so an RGBA bind reads as
-            // opaque — correct) and DONT_CARE for targets (matches any
-            // driver target bitmask, as Xwayland itself does).
-            if tfp_supported {
-                config.push((g::GLX_BIND_TO_TEXTURE_RGB_EXT, 1));
-                config.push((g::GLX_BIND_TO_TEXTURE_RGBA_EXT, 1));
-                // MIPMAP: not backed, but pair MUST be present for contract.
-                config.push((g::GLX_BIND_TO_MIPMAP_TEXTURE_EXT, 0));
-                config.push((g::GLX_BIND_TO_TEXTURE_TARGETS_EXT, g::GLX_DONT_CARE));
-                // Y_INVERTED in FBConfig = GLX_DONT_CARE (differs from drawable-attributes
-                // where it is 0/GL_FALSE — do not confuse them; glxcmds.c:1093).
-                config.push((g::GLX_Y_INVERTED_EXT, g::GLX_DONT_CARE));
-            }
-            out.push(config);
+        let mut config = vec![
+            (g::GLX_VISUAL_ID, visual_id),
+            (g::GLX_FBCONFIG_ID, fbconfig_id),
+            (g::GLX_X_VISUAL_TYPE, g::GLX_TRUE_COLOR),
+            // PBUFFER_BIT is load-bearing for Chromium/ANGLE: it allocates
+            // its offscreen GL surface as a pbuffer and filters configs on
+            // this bit. Without it ANGLE's HW GL init fails and Chromium
+            // drops to SwiftShader (no WebGL accel → no Maps 3D). Firefox
+            // uses window surfaces and is unaffected either way. (#96)
+            (
+                g::GLX_DRAWABLE_TYPE,
+                g::GLX_WINDOW_BIT | g::GLX_PIXMAP_BIT | g::GLX_PBUFFER_BIT,
+            ),
+            (g::GLX_RENDER_TYPE, g::GLX_RGBA_BIT),
+            (g::GLX_X_RENDERABLE, 1),
+            (g::GLX_BUFFER_SIZE, total_buffer_size),
+            (g::GLX_LEVEL, 0),
+            (g::GLX_DOUBLEBUFFER, 1),
+            (g::GLX_STEREO, 0),
+            (g::GLX_AUX_BUFFERS, 0),
+            (g::GLX_RED_SIZE, 8),
+            (g::GLX_GREEN_SIZE, 8),
+            (g::GLX_BLUE_SIZE, 8),
+            (g::GLX_ALPHA_SIZE, alpha_size),
+            (g::GLX_DEPTH_SIZE, depth),
+            (g::GLX_STENCIL_SIZE, stencil),
+            (g::GLX_ACCUM_RED_SIZE, 0),
+            (g::GLX_ACCUM_GREEN_SIZE, 0),
+            (g::GLX_ACCUM_BLUE_SIZE, 0),
+            (g::GLX_ACCUM_ALPHA_SIZE, 0),
+            (g::GLX_CONFIG_CAVEAT, g::GLX_NONE),
+            (g::GLX_TRANSPARENT_TYPE, g::GLX_NONE),
+            (g::GLX_SAMPLE_BUFFERS, 0),
+            (g::GLX_SAMPLES, 0),
+            // Pbuffer size caps — required alongside PBUFFER_BIT so ANGLE's
+            // glXGetFBConfigAttrib(GLX_MAX_PBUFFER_*) validation passes.
+            // 16384 comfortably exceeds any browser offscreen surface
+            // (ANGLE's init pbuffer is 1×1). Not compared by driConfigEqual.
+            (g::GLX_MAX_PBUFFER_WIDTH, 16384),
+            (g::GLX_MAX_PBUFFER_HEIGHT, 16384),
+            (g::GLX_MAX_PBUFFER_PIXELS, 16384 * 16384),
+        ];
+        // Append bind-to-texture pairs in Xorg's exact reply order
+        // (glxcmds.c:1094-1100 / glxdricommon.c:165) when TFP is supported.
+        //
+        // These attributes are scalar-compared by mesa's driConfigEqual
+        // against the client driver's __DRIconfig (attribMap in
+        // src/glx/dri_common.c), so they MUST match what radeonsi
+        // advertises or the whole config is rejected and dri3 screen
+        // creation fails ("No matching fbConfigs or visuals found").
+        // HW-verified on bee (radeonsi via Xwayland): every TFP config
+        // reports BIND_RGB=1, BIND_RGBA=1, and BIND_TARGETS=GLX_DONT_CARE.
+        // So advertise RGBA=1 for BOTH depths (depth-24 windows are
+        // opaque; the sample_view forces α=1, so an RGBA bind reads as
+        // opaque — correct) and DONT_CARE for targets (matches any
+        // driver target bitmask, as Xwayland itself does).
+        if tfp_supported {
+            config.push((g::GLX_BIND_TO_TEXTURE_RGB_EXT, 1));
+            config.push((g::GLX_BIND_TO_TEXTURE_RGBA_EXT, 1));
+            // MIPMAP: not backed, but pair MUST be present for contract.
+            config.push((g::GLX_BIND_TO_MIPMAP_TEXTURE_EXT, 0));
+            config.push((g::GLX_BIND_TO_TEXTURE_TARGETS_EXT, g::GLX_DONT_CARE));
+            // Y_INVERTED in FBConfig = GLX_DONT_CARE (differs from drawable-attributes
+            // where it is 0/GL_FALSE — do not confuse them; glxcmds.c:1093).
+            config.push((g::GLX_Y_INVERTED_EXT, g::GLX_DONT_CARE));
         }
+        out.push(config);
     }
     out
 }
@@ -10052,6 +10091,7 @@ fn handle_x_resource_request(
 fn handle_glx_request(
     state: &mut ServerState,
     backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
     header: RequestHeader,
@@ -10348,6 +10388,37 @@ fn handle_glx_request(
                         glx_export_host_xid: None,
                     },
                 );
+                // #96 tier-2: back the pbuffer with a real GPU pixmap under its
+                // own XID, so DRI3 BuffersFromPixmap can export a dmabuf for it.
+                // ANGLE (Chromium) renders WebGL into this surface; with no BO
+                // it gets BadDrawable and WebGL produces nothing → Google Maps
+                // hides the 3D button. Depth comes from the fbconfig's visual.
+                let depth = glx_fbconfig_depth(req.fbconfig);
+                let pw = u16::try_from(req.width).unwrap_or(1).max(1);
+                let ph = u16::try_from(req.height).unwrap_or(1).max(1);
+                match backend.create_pixmap(origin, depth, pw, ph) {
+                    Ok(handle) => {
+                        state.resources.create_pixmap(
+                            client_id,
+                            x11::CreatePixmapRequest {
+                                depth,
+                                pixmap: ResourceId(req.pbuffer),
+                                drawable: ROOT_WINDOW,
+                                width: pw,
+                                height: ph,
+                            },
+                        );
+                        let updated = state
+                            .resources
+                            .set_pixmap_host_xid(ResourceId(req.pbuffer), handle);
+                        debug_assert!(updated, "pbuffer backing pixmap was just inserted");
+                    }
+                    Err(err) => log::warn!(
+                        "client {} #{} GLX::CreatePbuffer host pixmap alloc failed: {err}",
+                        client_id.0,
+                        sequence.0
+                    ),
+                }
                 debug!(
                     "client {} #{} GLX::CreatePbuffer pbuffer=0x{:x} \
                      fbconfig=0x{:x} {}x{}",
@@ -10383,6 +10454,14 @@ fn handle_glx_request(
                 backend.release_glx_pixmap_export(host_xid);
             }
             state.glx_drawables.remove(&xid);
+            // #96 tier-2: release the GPU pixmap that backed a pbuffer (allocated
+            // at CreatePbuffer under the pbuffer's own XID).
+            if minor == x11glx::DESTROY_PBUFFER
+                && let Some(pixmap) = state.resources.free_pixmap(ResourceId(xid))
+                && let Some(host) = pixmap.host_xid
+            {
+                backend.free_pixmap(origin, host.as_raw())?;
+            }
             debug!(
                 "client {} #{} GLX::DestroyDrawable minor={minor} glx_xid=0x{:x}",
                 client_id.0, sequence.0, xid
@@ -16684,6 +16763,15 @@ fn handle_configure_window(
             .map(|w| (w.x, w.y, w.width, w.height, w.border_width));
         let configure_changed = before_geom != after_geom || before_above != above_sibling;
         if configure_changed {
+            // Xorg calls the screen's ConfigNotify hook before it delivers
+            // the core ConfigureNotify (dix/window.c::ConfigureWindow).
+            // Present wraps that hook, so a client selecting both events
+            // observes Present::ConfigureNotify first. Keep this wire order:
+            // Mesa/CEF consume both streams for the same DRI3 window, and
+            // reversing them briefly left Steam's popup surface with its
+            // parent-relative coordinates while the native root child had
+            // already moved.
+            fire_present_configure_notify_for_window(state, window_id, geometry);
             let _dropped =
                 emit_window_event_to_state(state, window_id, 0x0002_0000, |buf, seq, order| {
                     x11::encode_configure_notify_event(
@@ -16768,24 +16856,6 @@ fn handle_configure_window(
                 geometry.height,
                 false,
             );
-            // Present::ConfigureNotify. Tells DRI3+Present consumers
-            // (Mesa's loader_dri3_helper) that the window resized and
-            // they must reallocate the swap buffer. Without this, Mesa
-            // keeps presenting at the size of its first allocation —
-            // which for Firefox's profile chooser (window created 1×1,
-            // SelectInput'd, then ConfigureWindow'd to 800×800 before
-            // first PixmapFromBuffers had a chance to see the final
-            // size) means every present stays 1×1 over an 800×800
-            // window → blank content. Race-determined: when Mesa's
-            // first PixmapFromBuffers happens AFTER the configure, no
-            // ConfigureNotify is needed and FF renders; when Mesa
-            // allocates BEFORE the configure, no ConfigureNotify
-            // means it never reallocates. See mate.xtrace fail-vs-pass
-            // diff (2026-05-29): fail run had 8× `src=pixmap 1x1`
-            // PRESENT-INSTRs, pass run had 3× `src=pixmap 800x800` —
-            // same binary, same FF launch, pure timing race that this
-            // event closes.
-            fire_present_configure_notify_for_window(state, window_id, geometry);
         }
         // NOTE (Issue 2 — 2026-07-01): a pure move MUST NOT rotate the
         // redirected backing. picom glx holds a one-time `NameWindowPixmap`
@@ -18807,7 +18877,13 @@ fn handle_get_geometry(
         .resources
         .window(drawable)
         .map(window_geometry)
-        .or_else(|| state.resources.pixmap(drawable).map(pixmap_geometry));
+        .or_else(|| state.resources.pixmap(drawable).map(pixmap_geometry))
+        // #96: a GLX pbuffer is a drawable but lives only in glx_drawables,
+        // not the core resource store. Mesa's loader_dri3 calls GetGeometry on
+        // the pbuffer XID to size its DRI3 backing; without this it gets
+        // BadDrawable → "failed to create drawable" → ANGLE (Chromium) can't
+        // create its init pbuffer → GPU process dies.
+        .or_else(|| glx_pbuffer_geometry(state, drawable));
     let Some(geometry) = geometry else {
         // Spec: BadDrawable on unknown drawable. xts probes
         // destroyed/stale IDs and expects the protocol error.
@@ -25286,6 +25362,53 @@ fn pixmap_geometry(pixmap: &Pixmap) -> x11::Geometry {
     }
 }
 
+/// Geometry of a GLX pbuffer (#96). Pbuffers are tracked in `glx_drawables`
+/// with their `CreatePbuffer` size but are absent from the core resource
+/// store, so `GetGeometry` must resolve them here. Only pbuffers carry a
+/// non-zero size in the record — GLX window/pixmap drawables store 0×0 and
+/// resolve via the real X resource above, so a 0×0 record is not a pbuffer.
+fn glx_pbuffer_geometry(state: &ServerState, drawable: ResourceId) -> Option<x11::Geometry> {
+    let d = state.glx_drawables.get(&drawable.0)?;
+    if d.width == 0 && d.height == 0 {
+        return None;
+    }
+    Some(x11::Geometry {
+        root: ROOT_WINDOW,
+        x: 0,
+        y: 0,
+        width: u16::try_from(d.width).unwrap_or(u16::MAX),
+        height: u16::try_from(d.height).unwrap_or(u16::MAX),
+        border_width: 0,
+        depth: glx_fbconfig_depth(d.fbconfig),
+    })
+}
+
+/// Depth (24 or 32) of a synthesised GLX FBConfig, derived from the X visual
+/// it maps to (`ROOT_VISUAL` depth-24 / `ARGB_VISUAL` depth-32) — the single
+/// source of truth is `synthesise_glx_fb_configs`, so this stays correct if
+/// the config table changes. Defaults to 24 for an unknown fbconfig.
+fn glx_fbconfig_depth(fbconfig: u32) -> u8 {
+    use yserver_protocol::x11::glx as g;
+    synthesise_glx_fb_configs(false)
+        .iter()
+        .find(|cfg| {
+            cfg.iter()
+                .any(|(a, v)| *a == g::GLX_FBCONFIG_ID && *v == fbconfig)
+        })
+        .and_then(|cfg| {
+            cfg.iter()
+                .find(|(a, _)| *a == g::GLX_VISUAL_ID)
+                .map(|(_, v)| *v)
+        })
+        .map_or(24, |visual| {
+            if visual == crate::resources::ARGB_VISUAL.0 {
+                32
+            } else {
+                24
+            }
+        })
+}
+
 #[allow(clippy::cast_possible_truncation)]
 fn handle_translate_coordinates(
     state: &mut ServerState,
@@ -25304,9 +25427,12 @@ fn handle_translate_coordinates(
         let (dst_abs_x, dst_abs_y) = state.resources.window_absolute_position(dst_window);
         let dst_x = (abs_x - dst_abs_x) as i16;
         let dst_y = (abs_y - dst_abs_y) as i16;
+        // Xorg ProcTranslateCoords checks both bounding and input shapes
+        // while walking the destination's direct children.  Reuse the
+        // server's shape-aware hit test so the Composite Overlay Window's
+        // empty input shape does not hide a mapped popup beneath it.
         let child = state
-            .resources
-            .child_containing_point(dst_window, abs_x, abs_y)
+            .direct_child_at(dst_window, dst_x, dst_y)
             .unwrap_or(ResourceId(0));
         (
             child,
@@ -25712,6 +25838,68 @@ mod tests {
         server::{ClientState, ScreenSaverActive, ServerState},
     };
 
+    // #96: every synthesised GLX FBConfig must advertise GLX_PBUFFER_BIT plus
+    // the three GLX_MAX_PBUFFER_* caps, or Chromium/ANGLE can't allocate its
+    // offscreen pbuffer surface and falls back to software (no WebGL/Maps 3D).
+    // Property counts must stay uniform across configs (GetFBConfigs encodes a
+    // single num_properties for all of them).
+    #[test]
+    fn glx_fb_configs_advertise_pbuffer() {
+        use yserver_protocol::x11::glx as g;
+        for tfp in [false, true] {
+            let configs = synthesise_glx_fb_configs(tfp);
+            assert!(!configs.is_empty());
+            let prop_count = configs[0].len();
+            for config in &configs {
+                assert_eq!(config.len(), prop_count, "non-uniform property count");
+                let get = |attr: u32| config.iter().find(|(a, _)| *a == attr).map(|(_, v)| *v);
+                let drawable = get(g::GLX_DRAWABLE_TYPE).expect("DRAWABLE_TYPE present");
+                assert_ne!(
+                    drawable & g::GLX_PBUFFER_BIT,
+                    0,
+                    "config must advertise GLX_PBUFFER_BIT (tfp={tfp})"
+                );
+                let max_w = get(g::GLX_MAX_PBUFFER_WIDTH).expect("MAX_PBUFFER_WIDTH present");
+                let max_h = get(g::GLX_MAX_PBUFFER_HEIGHT).expect("MAX_PBUFFER_HEIGHT present");
+                assert!(max_w > 0 && max_h > 0, "pbuffer caps must be non-zero");
+                assert!(get(g::GLX_MAX_PBUFFER_PIXELS).is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn glx_visuals_have_one_unambiguous_double_buffered_config() {
+        use yserver_protocol::x11::glx as g;
+
+        let visuals = synthesise_glx_visual_configs();
+        assert_eq!(visuals.len(), 2);
+        assert!(visuals.iter().all(|visual| visual.double_buffer));
+
+        let configs = synthesise_glx_fb_configs(false);
+        assert_eq!(configs.len(), 2);
+        let mut visual_ids = HashSet::new();
+        for config in configs {
+            let get = |attr: u32| config.iter().find(|(a, _)| *a == attr).map(|(_, v)| *v);
+            let visual_id = get(g::GLX_VISUAL_ID).expect("VISUAL_ID present");
+            assert!(
+                visual_ids.insert(visual_id),
+                "duplicate visual 0x{visual_id:x}"
+            );
+            assert_eq!(get(g::GLX_DOUBLEBUFFER), Some(1));
+        }
+    }
+
+    // #96: pbuffer GetGeometry must report the fbconfig's true depth so Mesa's
+    // loader_dri3 backs it correctly. fbconfig 0x101 maps to ROOT_VISUAL
+    // (depth 24), while 0x103 maps to ARGB_VISUAL (depth 32).
+    #[test]
+    fn glx_fbconfig_depth_tracks_visual() {
+        assert_eq!(glx_fbconfig_depth(0x101), 24);
+        assert_eq!(glx_fbconfig_depth(0x103), 32);
+        // Unknown fbconfig falls back to the depth-24 default.
+        assert_eq!(glx_fbconfig_depth(0xDEAD), 24);
+    }
+
     fn install_client(state: &mut ServerState, id: u32) -> UnixStream {
         let (a, b) = UnixStream::pair().unwrap();
         state.clients.insert(
@@ -25909,6 +26097,127 @@ mod tests {
             1,
             "a real restack must emit exactly one ConfigureNotify"
         );
+    }
+
+    /// Xorg's Present screen hook receives every real ConfigNotify, including
+    /// a pure move. Steam's DRI3 popup windows select this event and use its
+    /// x/y to keep the presentation surface synchronized with the native
+    /// override-redirect window.
+    #[test]
+    fn configure_window_pure_move_emits_present_configure_notify() {
+        use crate::server::PresentEventSelection;
+        use yserver_protocol::x11::present as x11present;
+
+        const WINDOW: ResourceId = ResourceId(0x200);
+        const PRESENT_EID: u32 = 0x0010_0042;
+
+        let (mut state, mut peer) = two_children_under_root();
+        state
+            .clients
+            .get_mut(&1)
+            .unwrap()
+            .event_masks
+            .insert(WINDOW, 0x0002_0000);
+        state.present_event_selections.insert(
+            PRESENT_EID,
+            PresentEventSelection {
+                owner: ClientId(1),
+                window: WINDOW,
+                event_mask: x11present::EVENT_MASK_CONFIGURE_NOTIFY,
+            },
+        );
+        let _ = read_all_available(&mut peer);
+
+        let body = cw_restack_body(WINDOW.0, 0x0003, &[610, 250]); // CWX|CWY
+        let mut backend = RecordingBackend::new();
+        handle_configure_window(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            &body,
+        )
+        .expect("handle_configure_window");
+
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes.len(), 72, "Present XGE plus core ConfigureNotify");
+        // Xorg dix/window.c invokes the Present ConfigNotify screen hook
+        // before DeliverEvents sends the core ConfigureNotify. This ordering
+        // matters to clients which merge the two configure streams.
+        assert_eq!(bytes[0], 35, "GenericEvent");
+        assert_eq!(bytes[1], 145, "PRESENT major opcode");
+        assert_eq!(
+            u16::from_le_bytes(bytes[8..10].try_into().unwrap()),
+            u16::from(x11present::EVENT_CONFIGURE_NOTIFY),
+        );
+        assert_eq!(
+            u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+            PRESENT_EID,
+        );
+        assert_eq!(
+            u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
+            WINDOW.0,
+        );
+        assert_eq!(i16::from_le_bytes(bytes[20..22].try_into().unwrap()), 610);
+        assert_eq!(i16::from_le_bytes(bytes[22..24].try_into().unwrap()), 250);
+        assert_eq!(u16::from_le_bytes(bytes[24..26].try_into().unwrap()), 50);
+        assert_eq!(u16::from_le_bytes(bytes[26..28].try_into().unwrap()), 50);
+        assert_eq!(bytes[40] & 0x7f, 22, "core ConfigureNotify follows Present");
+        assert_eq!(
+            u32::from_le_bytes(bytes[48..52].try_into().unwrap()),
+            WINDOW.0,
+        );
+    }
+
+    /// ProcTranslateCoords applies child input shapes. The Composite Overlay
+    /// Window is the top root child but has an empty input shape by default,
+    /// so a mapped popup below it must be returned as `child`, as on Xorg.
+    #[test]
+    fn translate_coordinates_skips_empty_input_shaped_cow() {
+        use crate::{backend::WindowHandle, resources::COMPOSITE_OVERLAY_WINDOW};
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let popup = ResourceId(0x200);
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: popup,
+                parent: ROOT_WINDOW,
+                x: 715,
+                y: 327,
+                width: 132,
+                height: 165,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(popup);
+        state
+            .resources
+            .materialize_cow_resource(WindowHandle::from_raw_for_test(COMPOSITE_OVERLAY_WINDOW.0));
+        state.materialize_cow_input_shape();
+        let _ = read_all_available(&mut peer);
+
+        let mut body = Vec::with_capacity(12);
+        body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+        body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+        body.extend_from_slice(&715i16.to_le_bytes());
+        body.extend_from_slice(&327i16.to_le_bytes());
+        handle_translate_coordinates(&mut state, ClientId(1), SequenceNumber(1), &body)
+            .expect("handle_translate_coordinates");
+
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes.len(), 32);
+        assert_eq!(bytes[0], 1, "reply");
+        assert_eq!(
+            u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+            popup.0,
+            "empty-input COW must not hide the popup child",
+        );
+        assert_eq!(i16::from_le_bytes(bytes[12..14].try_into().unwrap()), 715);
+        assert_eq!(i16::from_le_bytes(bytes[14..16].try_into().unwrap()), 327);
     }
 
     #[test]
@@ -32175,13 +32484,14 @@ mod tests {
     }
 
     #[test]
-    fn present_pixmap_copy_without_update_uses_dst_offset_not_src_offset() {
+    fn present_pixmap_copy_to_redirected_window_preserves_window_destination() {
         use crate::backend::recording::RecordedCall;
         use yserver_protocol::x11::{CreatePixmapRequest, CreateWindowRequest};
 
         const CLIENT: u32 = 16;
         const WINDOW_XID: u32 = 0x00e0_0303;
         const PIXMAP_XID: u32 = 0x00e0_0304;
+        const BACKING_XID: u32 = 0x0040_03ff;
 
         let mut state = ServerState::new();
         let _peer = install_client(&mut state, CLIENT);
@@ -32206,6 +32516,12 @@ mod tests {
         let _ = state.resources.map_window(ResourceId(WINDOW_XID));
         if let Some(w) = state.resources.window_mut(ResourceId(WINDOW_XID)) {
             w.host_xid = crate::backend::WindowHandle::from_raw(0x400303);
+            w.redirected_backing = Some(crate::resources::RedirectedBacking {
+                host_pixmap: crate::backend::PixmapHandle::from_raw_for_test(BACKING_XID),
+                width: 640,
+                height: 480,
+                depth: 24,
+            });
         }
 
         state.resources.create_pixmap(
@@ -32274,7 +32590,7 @@ mod tests {
         assert_eq!(
             copies,
             vec![(0x400304, 0x400303, 0, 0, 13, 17, 640, 480)],
-            "PresentPixmap Copy without an update region must copy the whole pixmap to dst at x_off/y_off",
+            "PresentPixmap must paint through the destination window xid, not its redirected backing xid, so the backend can retain ClipByChildren and hierarchy stacking while resolving that window to the backing",
         );
     }
 

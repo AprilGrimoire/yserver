@@ -627,6 +627,32 @@ Surfaced while bringing up xeyes / xterm / xclock and fvwm3 against
 instead of a host X server, so gaps in our rasterisation surface here
 that the host hides for us.
 
+- [ ] **Raspberry Pi 4 / 400 (Broadcom v3d + vc4): no working scanout.**
+      These machines split rendering and display between the v3d GPU
+      (`v3dv` Vulkan) and the vc4 KMS driver. The tested paths provide no
+      buffer that both sides can use:
+      - v3d exposes `BROADCOM_UIF` as its renderable BGRA8 modifier, while
+        the vc4 plane accepts `VC4_T_TILED` or `LINEAR`;
+      - a v3d-allocated LINEAR dma-buf fails vc4
+        `prime_fd_to_buffer` with `EINVAL` because it is not suitable for
+        vc4 display DMA; and
+      - vc4 GBM and dumb buffers fail import into v3dv with
+        `ERROR_INVALID_EXTERNAL_HANDLE`.
+
+      Mesa's GL/Gallium `kmsro` renderonly layer bridges this split for
+      Xorg and wlroots, but raw `v3dv` Vulkan has no equivalent bridge.
+      A practical support path would require composing into a v3d-native
+      image, copying it to host-visible memory, and then copying into a
+      CPU-mapped vc4 dumb buffer every frame. That is a substantial,
+      device-specific fallback and remains deferred.
+
+      The investigation did yield general fixes retained by yserver:
+      optional Vulkan features are enabled only when supported, scanout
+      modifier probes now use the image's real render-and-transfer usage,
+      and startup fails with a clear error when no connected output can
+      allocate a scanout pool. The underlying changes were smoke-tested on
+      air, bee, and silence.
+
 - [ ] **Crash before `console::Drop` leaves the host TTY unusable.**
       yserver's startup grabs the VT with `KDSKBMODE=K_OFF +
       KD_GRAPHICS` (kernel keystroke→TTY translation suppressed) and

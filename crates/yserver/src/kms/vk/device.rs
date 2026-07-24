@@ -82,6 +82,12 @@ pub struct VkContext {
     /// `0.0` ⇒ no usable timestamp support; the compose GPU-render timer
     /// (`gpu_render_ns` telemetry) is then skipped.
     pub timestamp_period: f32,
+    /// Whether the device supports the optional `dualSrcBlend` feature,
+    /// required by the RENDER `component_alpha` (subpixel/LCD text AA)
+    /// path's SRC1_* blend factors. `false` on Broadcom V3D (RPi 4/400,
+    /// v3dv); component-alpha masks then fall back to grayscale AA
+    /// instead of requesting an unavailable feature.
+    pub component_alpha_supported: bool,
 }
 
 impl VkContext {
@@ -281,38 +287,49 @@ impl VkContext {
             .dynamic_rendering(compositor_features)
             .synchronization2(true);
 
-        // `scalarBlockLayout` lets push-constant (and uniform/storage)
-        // blocks use scalar packing rather than std140/std430's
-        // 16-byte vec4 alignment, so a `vec4` after a stretch of
-        // `vec2` fields lands directly after them — matching what
-        // a `#[repr(C)]` Rust struct produces with no padding. This
-        // sidesteps the alignment-mismatch bug class that produced
-        // green text in `TextPushConsts` (vec4 expected at offset
-        // 48 by std430, sat at offset 40 in Rust). The shaders that
-        // rely on this declare `layout(scalar)` on the
-        // `push_constant` block; the legacy `LogicFillPushConsts`
-        // pad and the natural alignment of `RenderPushConsts` /
-        // `CompositePushConsts` keep std430 layout intact and stay
-        // compatible.
         // `timelineSemaphore` is core in Vulkan 1.2 and is required by
         // Phase 4.2.2's `import_drm_syncobj` (DRI3 ImportSyncobj path).
-        // Harmless when the syncobj cap is false because the dispatcher
-        // gate rejects requests before they reach the import call.
-        let mut features12 = vk::PhysicalDeviceVulkan12Features::default()
-            .scalar_block_layout(compositor_features)
-            .timeline_semaphore(compositor_features);
+        // Sink-only devices used for copied reverse-PRIME scanout do not
+        // expose the compositor/DRI3 surface, so they do not request it.
+        let mut features12 =
+            vk::PhysicalDeviceVulkan12Features::default().timeline_semaphore(compositor_features);
 
-        // `logicOp` enables the per-attachment logical-op state used
-        // by the Phase 4.1.5 GC-function fill path (Xor / And / Or
-        // / Invert / etc. — all 16 X11 GcFunction variants map 1:1
-        // to `VkLogicOp`). `dualSrcBlend` enables the SRC1_* family
-        // of blend factors used by the RENDER `component_alpha`
-        // path (per-channel src alpha emitted from a second
-        // fragment-shader output). Both are core Vulkan 1.0 and
-        // universally supported on conformant drivers.
-        let enabled_features = vk::PhysicalDeviceFeatures::default()
-            .logic_op(compositor_features)
-            .dual_src_blend(compositor_features);
+        // `logicOp` (the X11 GcFunction Xor/And/Or/Invert fill path —
+        // all 16 variants map 1:1 to `VkLogicOp`) and `dualSrcBlend`
+        // (the SRC1_* blend factors used by the RENDER `component_alpha`
+        // subpixel-text path) are *optional* Vulkan 1.0 features, NOT
+        // universally supported: Broadcom V3D (RPi 4/400, v3dv) ships
+        // without `dualSrcBlend`, so requesting it unconditionally made
+        // `vkCreateDevice` fail with `ERROR_FEATURE_NOT_PRESENT`. Query
+        // what the device supports and enable only that; a missing
+        // `dualSrcBlend` degrades component-alpha to grayscale AA
+        // (`component_alpha_supported`), a missing `logicOp` (no
+        // fallback yet) is a hard, named error.
+        let (enabled_features, component_alpha_supported) = if compositor_features {
+            let supported_features =
+                unsafe { instance.get_physical_device_features(physical_device) };
+            let selected = match select_device_features(&supported_features) {
+                Ok(s) => s,
+                Err(e) => {
+                    unsafe {
+                        if let Some(m) = debug_messenger {
+                            debug_utils_instance.destroy_debug_utils_messenger(m, None);
+                        }
+                        instance.destroy_instance(None);
+                    }
+                    return Err(e);
+                }
+            };
+            if !selected.component_alpha {
+                log::warn!(
+                    "vulkan: device lacks dualSrcBlend — RENDER component-alpha \
+                     (subpixel text AA) falls back to grayscale AA"
+                );
+            }
+            (selected.enabled, selected.component_alpha)
+        } else {
+            (vk::PhysicalDeviceFeatures::default(), false)
+        };
 
         let device_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_info)
@@ -388,6 +405,7 @@ impl VkContext {
             driver_id,
             device_type,
             timestamp_period,
+            component_alpha_supported,
         }))
     }
 
@@ -572,6 +590,8 @@ pub enum VkInitError {
     NoMatchingDrmDevice(String),
     #[error("multiple Vulkan physical devices match DRM device {0}")]
     AmbiguousDrmDevice(String),
+    #[error("physical device lacks required Vulkan feature `{0}` (no fallback implemented for it)")]
+    MissingRequiredFeature(&'static str),
 }
 
 impl From<vk::Result> for VkInitError {
@@ -586,6 +606,49 @@ struct PhysicalDeviceCandidate {
     graphics_queue_family: Option<u32>,
     score: u32,
     drm_identity: Option<VulkanDrmIdentity>,
+}
+
+/// Outcome of matching yserver's wanted `VkPhysicalDeviceFeatures`
+/// against what the picked device actually reports.
+pub(crate) struct SelectedFeatures {
+    /// The `enabledFeatures` to hand to `vkCreateDevice` — a subset of
+    /// the wanted set, pruned to what the device supports.
+    pub enabled: vk::PhysicalDeviceFeatures,
+    /// Whether the RENDER `component_alpha` (subpixel/LCD text AA) path
+    /// may use dual-source blending. `false` on devices without the
+    /// optional `dualSrcBlend` feature (e.g. Broadcom V3D / v3dv on the
+    /// Raspberry Pi 4/400); those masks fall back to grayscale AA.
+    pub component_alpha: bool,
+}
+
+/// Choose the `VkPhysicalDeviceFeatures` to enable, given what the
+/// device reports as supported.
+///
+/// `logicOp` and `dualSrcBlend` are *optional* Vulkan 1.0 features, not
+/// "universally supported" — the Broadcom V3D tiler (RPi 4/400, v3dv)
+/// ships without `dualSrcBlend` (and `scalarBlockLayout`), so requesting
+/// them unconditionally made `vkCreateDevice` fail with
+/// `ERROR_FEATURE_NOT_PRESENT`.
+///
+/// `dualSrcBlend` has a fallback (grayscale component-alpha), so it is
+/// enabled only when present. `logicOp` (the X11 `GcFunction`
+/// Xor/And/Or/Invert fill path) has no fallback yet, so its absence is a
+/// hard error with a message that names the feature rather than the
+/// opaque `FEATURE_NOT_PRESENT`.
+fn select_device_features(
+    supported: &vk::PhysicalDeviceFeatures,
+) -> Result<SelectedFeatures, VkInitError> {
+    if supported.logic_op == vk::FALSE {
+        return Err(VkInitError::MissingRequiredFeature("logicOp"));
+    }
+    let component_alpha = supported.dual_src_blend == vk::TRUE;
+    let enabled = vk::PhysicalDeviceFeatures::default()
+        .logic_op(true)
+        .dual_src_blend(component_alpha);
+    Ok(SelectedFeatures {
+        enabled,
+        component_alpha,
+    })
 }
 
 fn pick_physical_device(
@@ -949,5 +1012,57 @@ mod tests {
         .unwrap();
 
         assert_eq!(selected.physical_device.as_raw(), 2);
+    }
+
+    /// Real V3D 4.2 (v3dv) feature mask observed via `vulkaninfo` on an
+    /// RPi 400: `logicOp` supported, `dualSrcBlend` NOT supported. This
+    /// is the mask that made `vkCreateDevice` fail with
+    /// `ERROR_FEATURE_NOT_PRESENT`. Ground truth, not inferred.
+    #[test]
+    fn v3d_drops_unsupported_dual_src_blend() {
+        let supported = vk::PhysicalDeviceFeatures::default()
+            .logic_op(true)
+            .dual_src_blend(false);
+        let sel = select_device_features(&supported).expect("logicOp present ⇒ Ok");
+        assert_eq!(
+            sel.enabled.dual_src_blend,
+            vk::FALSE,
+            "must NOT request dualSrcBlend on a device that lacks it (V3D ⇒ FEATURE_NOT_PRESENT)"
+        );
+        assert_eq!(
+            sel.enabled.logic_op,
+            vk::TRUE,
+            "logicOp is supported here and is required"
+        );
+        assert!(
+            !sel.component_alpha,
+            "component_alpha capability must be off without dualSrcBlend"
+        );
+    }
+
+    /// A conformant desktop GPU (RADV / NVIDIA / lavapipe) supports both
+    /// optional features; nothing is pruned and component-alpha is on.
+    #[test]
+    fn full_device_enables_both() {
+        let supported = vk::PhysicalDeviceFeatures::default()
+            .logic_op(true)
+            .dual_src_blend(true);
+        let sel = select_device_features(&supported).expect("both present ⇒ Ok");
+        assert_eq!(sel.enabled.dual_src_blend, vk::TRUE);
+        assert_eq!(sel.enabled.logic_op, vk::TRUE);
+        assert!(sel.component_alpha);
+    }
+
+    /// `logicOp` has no fallback path, so its absence is a hard error
+    /// that names the feature (not the opaque FEATURE_NOT_PRESENT).
+    #[test]
+    fn missing_logic_op_is_fatal() {
+        let supported = vk::PhysicalDeviceFeatures::default()
+            .logic_op(false)
+            .dual_src_blend(true);
+        assert!(matches!(
+            select_device_features(&supported),
+            Err(VkInitError::MissingRequiredFeature("logicOp"))
+        ));
     }
 }

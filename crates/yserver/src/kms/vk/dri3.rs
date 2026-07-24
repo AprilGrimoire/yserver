@@ -35,15 +35,29 @@ pub const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 /// modifier is always implicitly supported by the import path —
 /// `VK_IMAGE_TILING_LINEAR` plus a plain `VkExternalMemoryImageCreateInfo`
 /// chain (no explicit-modifier struct) is the fallback.
+///
+/// `usage` is the image usage the imported buffer must satisfy, and it
+/// materially changes the result on some drivers: Broadcom V3D (v3dv)
+/// grants `SAMPLED` only for its tiled (UIF) layout — its texture unit
+/// cannot sample a linear 2D image — so a `SAMPLED` probe excludes
+/// LINEAR, while a scanout probe (color attachment plus transfer source and
+/// destination, never sampled) keeps it. Callers therefore pass the usage that matches how
+/// the buffer will actually be used: [`CLIENT_IMPORT_USAGE`] for
+/// DRI3 client pixmaps (composited as sampled textures), or the scanout
+/// render-target usage for the display buffer.
 #[must_use]
-pub fn supported_modifiers(vk: &VkContext, format: vk::Format) -> Vec<u64> {
+pub fn supported_modifiers(
+    vk: &VkContext,
+    format: vk::Format,
+    usage: vk::ImageUsageFlags,
+) -> Vec<u64> {
     if !vk.image_drm_format_modifier {
         return vec![DRM_FORMAT_MOD_LINEAR];
     }
 
     let modifier_count = match list_modifier_count(vk, format) {
         Ok(n) if n > 0 => n,
-        _ => return vec![DRM_FORMAT_MOD_LINEAR],
+        _ => return Vec::new(),
     };
 
     let mut props_storage =
@@ -62,14 +76,11 @@ pub fn supported_modifiers(vk: &VkContext, format: vk::Format) -> Vec<u64> {
 
     let mut accepted = Vec::with_capacity(entries);
     for prop in props_storage.iter().take(entries) {
-        if can_import_modifier(vk, format, prop.drm_format_modifier) {
+        if can_import_modifier(vk, format, prop.drm_format_modifier, usage) {
             accepted.push(prop.drm_format_modifier);
         }
     }
 
-    if accepted.is_empty() {
-        accepted.push(DRM_FORMAT_MOD_LINEAR);
-    }
     accepted
 }
 
@@ -89,7 +100,25 @@ fn list_modifier_count(vk: &VkContext, format: vk::Format) -> Result<u32, vk::Re
 /// Probe whether `(format, modifier)` is importable as a DMA_BUF
 /// `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT` image with the
 /// usage flags Phase 4.2 needs.
-fn can_import_modifier(vk: &VkContext, format: vk::Format, modifier: u64) -> bool {
+/// Usage flags a DRI3 *client* buffer import must satisfy: a client
+/// pixmap (e.g. a GL/Vulkan app's dma-buf) is composited as a window
+/// texture, so it must be `SAMPLED`, and may also be a render/transfer
+/// target. `SAMPLED` here is load-bearing — it is what (correctly)
+/// excludes LINEAR on v3dv, whose texture unit can't sample a linear
+/// layout, steering clients to a tiled modifier.
+pub const CLIENT_IMPORT_USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
+    vk::ImageUsageFlags::SAMPLED.as_raw()
+        | vk::ImageUsageFlags::TRANSFER_SRC.as_raw()
+        | vk::ImageUsageFlags::TRANSFER_DST.as_raw()
+        | vk::ImageUsageFlags::COLOR_ATTACHMENT.as_raw(),
+);
+
+fn can_import_modifier(
+    vk: &VkContext,
+    format: vk::Format,
+    modifier: u64,
+    usage: vk::ImageUsageFlags,
+) -> bool {
     // Build the chain manually: format_info.pNext -> external_info,
     // external_info.pNext -> modifier_info, modifier_info.pNext -> null.
     // ash's `push_next` builder isn't implemented for
@@ -109,12 +138,7 @@ fn can_import_modifier(vk: &VkContext, format: vk::Format, modifier: u64) -> boo
         .format(format)
         .ty(vk::ImageType::TYPE_2D)
         .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
-        .usage(
-            vk::ImageUsageFlags::SAMPLED
-                | vk::ImageUsageFlags::TRANSFER_SRC
-                | vk::ImageUsageFlags::TRANSFER_DST
-                | vk::ImageUsageFlags::COLOR_ATTACHMENT,
-        );
+        .usage(usage);
     format_info.p_next = std::ptr::from_mut(&mut external_info).cast::<c_void>();
 
     let mut external_props = vk::ExternalImageFormatProperties::default();
@@ -131,10 +155,13 @@ fn can_import_modifier(vk: &VkContext, format: vk::Format, modifier: u64) -> boo
     if result.is_err() {
         return false;
     }
-    external_props
-        .external_memory_properties
-        .compatible_handle_types
-        .contains(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
+    let props = external_props.external_memory_properties;
+    props
+        .external_memory_features
+        .contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
+        && props
+            .compatible_handle_types
+            .contains(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
 }
 
 /// DRM format modifiers the driver can **export** as a single-plane

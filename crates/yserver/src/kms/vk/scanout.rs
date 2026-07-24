@@ -1889,7 +1889,12 @@ fn scanout_modifier_candidates(vk: &VkContext, kms_scanout_modifiers: &[u64]) ->
         return Vec::new();
     }
 
-    let vulkan = super::dri3::supported_modifiers(vk, vk::Format::B8G8R8A8_UNORM);
+    // Probe with the scanout image's actual usage (color attachment and
+    // transfers, never sampled) so LINEAR survives on drivers that only
+    // withhold it for SAMPLED (v3dv). Must stay in sync with
+    // `scanout_image_usage()`.
+    let vulkan =
+        super::dri3::supported_modifiers(vk, vk::Format::B8G8R8A8_UNORM, scanout_image_usage());
     let prefer_linear = scanout_prefers_linear(vk.driver_id);
     let candidates = order_scanout_modifier_candidates(
         kms_scanout_modifiers,
@@ -2084,9 +2089,15 @@ fn drm_modifier_plane_count(vk: &VkContext, modifier: u64) -> Option<u32> {
 }
 
 fn scanout_image_usage() -> vk::ImageUsageFlags {
+    // The scanout image is only ever a compose render target (color
+    // attachment), a transfer destination (initial clear / upload), and a
+    // transfer source (root screenshots and diagnostic scanout dumps).
+    // It is NEVER sampled — RENDER PictOps target pixmap/window mirrors,
+    // not the scanout BO, and the compose pass samples those mirrors and
+    // blends into this attachment.
     vk::ImageUsageFlags::COLOR_ATTACHMENT
+        | vk::ImageUsageFlags::TRANSFER_SRC
         | vk::ImageUsageFlags::TRANSFER_DST
-        | vk::ImageUsageFlags::SAMPLED
 }
 
 fn addfb_flags_for_modifier(modifier: Option<u64>) -> FbCmd2Flags {
@@ -2427,9 +2438,9 @@ fn allocate_gbm_scanout_image(
     let vk_fd_raw = vk_fd_owned.into_raw_fd();
 
     // 3. Create the VkImage against GBM's stride/offset via the
-    //    explicit-modifier layout struct. Same tuple as the
-    //    IMPORTABLE gate above (COLOR_ATTACHMENT|TRANSFER_DST|SAMPLED
-    //    + DMA_BUF external memory + DRM_FORMAT_MODIFIER_EXT tiling).
+    //    explicit-modifier layout struct. Same usage tuple as the
+    //    IMPORTABLE gate above (`scanout_image_usage()` + DMA_BUF external
+    //    memory + DRM_FORMAT_MODIFIER_EXT tiling).
     let plane_layouts = [vk::SubresourceLayout {
         offset: u64::from(offset),
         size: 0,
@@ -2900,6 +2911,15 @@ mod tests {
         assert!(!probe_teardown_wait_completed(Err(
             vk::Result::ERROR_OUT_OF_HOST_MEMORY
         )));
+    }
+
+    #[test]
+    fn scanout_usage_matches_render_and_readback_paths() {
+        let usage = scanout_image_usage();
+        assert!(usage.contains(vk::ImageUsageFlags::COLOR_ATTACHMENT));
+        assert!(usage.contains(vk::ImageUsageFlags::TRANSFER_SRC));
+        assert!(usage.contains(vk::ImageUsageFlags::TRANSFER_DST));
+        assert!(!usage.contains(vk::ImageUsageFlags::SAMPLED));
     }
 
     #[test]

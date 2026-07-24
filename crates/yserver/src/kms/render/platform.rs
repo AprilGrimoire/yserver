@@ -995,15 +995,16 @@ fn require_copied_sink_explicit_dmabuf_layout_import(supported: bool) -> io::Res
 impl PlatformBackend {
     /// Backend constructor. Opens DRM, initialises Vk,
     /// allocates per-output scanout pools, builds the fence pool.
-    /// All-or-nothing: any failure tears down already-allocated resources
-    /// and returns `Err`.
+    /// Fatal initialization failures tear down already-allocated resources
+    /// and return `Err`.
     ///
     /// # Errors
     ///
     /// Propagates platform-init failures from `core_platform_init`,
     /// Vk init failures from `VkContext::new`, command-pool allocation
-    /// failures from `OpsCommandPool::new`. `ScanoutBoPool` failures
-    /// per-output are non-fatal — that output is marked `None` and skipped.
+    /// failures from `OpsCommandPool::new`. An individual `ScanoutBoPool`
+    /// failure is non-fatal while another output remains displayable; startup
+    /// fails if every connected output lacks a live pool.
     pub(crate) fn open_with_commit(
         device_paths: &[PathBuf],
         commit: fn(
@@ -1122,6 +1123,7 @@ impl PlatformBackend {
         // One ScanoutBoPool per output, 3-BO depth (matches v1).
         let mut scanout_pools = Vec::with_capacity(active_outputs.len());
         let mut bo_generations = Vec::with_capacity(active_outputs.len());
+        let mut scanout_alloc_errors: Vec<String> = Vec::new();
         for (i, active_output) in active_outputs.iter().enumerate() {
             let w = u32::from(active_output.width);
             let h = u32::from(active_output.height);
@@ -1154,10 +1156,21 @@ impl PlatformBackend {
                         w,
                         h,
                     );
+                    scanout_alloc_errors.push(format!("output {i} ({w}x{h}): {e}"));
                     scanout_pools.push(None);
                     bo_generations.push(Vec::new());
                 }
             }
+        }
+        // Refuse to run invisibly: if there are connected outputs but none
+        // got a scanout pool, there is nothing to display — fail loudly
+        // instead of leaving a silent black screen. (Split-GPU scanout
+        // with no shared modifier, e.g. RPi 4/400, lands here.)
+        let live_pool_count = scanout_pools.iter().filter(|p| p.is_some()).count();
+        if let Err(msg) =
+            check_scanout_liveness(active_outputs.len(), live_pool_count, &scanout_alloc_errors)
+        {
+            return Err(io::Error::other(format!("render PlatformBackend: {msg}")));
         }
         let first_pageflip_logged = vec![false; active_outputs.len()];
 
@@ -4140,6 +4153,31 @@ fn cursor_footprint_intersects_output(dx: i32, dy: i32, cw: i32, ch: i32, w: i32
     dx < w && dx + cw > 0 && dy < h && dy + ch > 0
 }
 
+/// Decide whether KMS bring-up may proceed, given how many outputs were
+/// enumerated versus how many got a live scanout pool.
+///
+/// Refuse only when there is at least one connected output but *none* of
+/// them can be driven (`output_count > 0 && live_pool_count == 0`) — that
+/// is the "display attached but we can't put anything on it" case, which
+/// otherwise manifests as a silent black screen (e.g. RPi 4/400 split-GPU
+/// scanout with no shared modifier). Zero outputs is not a failure
+/// (headless start; runtime hotplug may attach one later), and partial
+/// success (some outputs live) proceeds on the ones that work.
+fn check_scanout_liveness(
+    output_count: usize,
+    live_pool_count: usize,
+    errors: &[String],
+) -> Result<(), String> {
+    if output_count > 0 && live_pool_count == 0 {
+        return Err(format!(
+            "no displayable output: all {output_count} connected output(s) failed scanout \
+             buffer allocation, so nothing can be shown. Per-output errors: [{}]",
+            errors.join("; ")
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4303,6 +4341,39 @@ mod tests {
 
         assert_eq!(platform.ust_msc, HashMap::from([(live, (3, 30))]));
         assert_eq!(platform.software_msc, HashMap::from([(live, 3)]));
+    }
+
+    /// A connected output that yielded no scanout pool must abort
+    /// bring-up rather than run invisibly (the RPi 4/400 split-GPU
+    /// black-screen case).
+    #[test]
+    fn one_output_no_live_pool_refuses() {
+        let err = check_scanout_liveness(1, 0, &["output 0 (1360x768): boom".to_string()])
+            .expect_err("1 output, 0 live pools must refuse");
+        assert!(err.contains("no displayable output"), "message: {err}");
+        assert!(
+            err.contains("boom"),
+            "must surface the per-output error: {err}"
+        );
+    }
+
+    /// A working output proceeds.
+    #[test]
+    fn one_output_one_live_pool_proceeds() {
+        assert!(check_scanout_liveness(1, 1, &[]).is_ok());
+    }
+
+    /// Partial success (one of two outputs live) proceeds on the good one.
+    #[test]
+    fn partial_liveness_proceeds() {
+        assert!(check_scanout_liveness(2, 1, &["output 1: nope".to_string()]).is_ok());
+    }
+
+    /// Zero outputs is a headless start, not a failure — runtime hotplug
+    /// may attach a display later.
+    #[test]
+    fn zero_outputs_is_not_fatal() {
+        assert!(check_scanout_liveness(0, 0, &[]).is_ok());
     }
 
     /// HW-cursor auto-fallback policy: an ioctl error that means the

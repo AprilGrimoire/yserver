@@ -32,6 +32,15 @@ Cross-cutting bugs and followups that don't fit a stage live in
 
 ## Where we are
 
+- **2026-07-24 Raspberry Pi 4/400 bring-up:** raw Vulkan scanout remains
+  unsupported because v3d rendering and vc4 display expose no mutually usable
+  buffer path. The investigation produced three general improvements:
+  optional Vulkan features are selected from the physical-device feature
+  mask, modifier probes use the image's actual render-and-transfer usage, and
+  startup fails clearly when every connected output fails scanout allocation.
+  The retained behavior was smoke-tested on air, bee, and silence. The
+  hardware limitation and deferred CPU-copy fallback are documented in
+  [`known-issues.md`](known-issues.md).
 - Baseline branch: `graphics-followups` (working — xfce + mate
   verified 2026-05-15). HEAD includes five cherry-picks from the
   abandoned `render-convolution-filter` branch: QueryFilters
@@ -4999,3 +5008,107 @@ ReplayDevice dialog sequence, XFCE XI2 release delivery, matched passive-grab
 snapshot selection, multi-button final-release lifetime, and foreign
 implicit-grab AlreadyGrabbed behavior. `cargo test -p yserver-core`: 919
 passed.
+
+## Steam/CEF redirected hierarchy clipping (2026-07-23)
+
+**Status: IMPLEMENTED; VERIFIED ON RX580.** The post-failure
+drawable dump was captured while both the Steam body and a submenu were
+blank. The imported Present source and the top-level redirect backing were
+almost identical: both contained valid Steam chrome around a black body. At
+the same time, other CEF redirect backings contained correctly rendered menu
+pixels. This places the corruption before Marco/scanout and rules out deferred
+composition as the missing mechanism.
+
+Steam's accelerated CEF tree puts the full-window Present target several
+wrapper levels down one branch, while the separately rendered browser body is
+a higher-stacked cousin in another branch. Both flatten into the same
+top-level redirect backing. yserver's shared-backing clip emulation only
+subtracted higher siblings of the immediate destination window, so the outer
+1280x800 Present missed the 1278x657 cousin and repeatedly overwrote it with
+the black placeholder carried in the outer buffer. Cursor activity caused the
+body branch to repaint temporarily, explaining the cursor-in flicker and
+cursor-out black state.
+
+The KMS clipper now walks every ancestor branch that resolves to the shared
+backing and subtracts higher siblings at each level, translating their
+resolved backing offsets into destination-local coordinates. Present also
+passes the original destination window xid to the backend instead of replacing
+a directly redirected window with its backing pixmap xid; completion fencing
+still uses the resolved backing. This preserves ClipByChildren and stacking
+identity for CEF popup/submenu top levels. Regression tests cover the nested
+higher-cousin Steam shape and direct Present-to-redirected-window routing.
+
+RX580 verification confirmed that this fix makes the Steam browser body stable
+with the cursor both inside and outside the window. Popup menus required the
+separate GLX visual fix below.
+
+The drawable dumps also ruled out deferred composition as the missing
+mechanism; the deferred-Present experiment is not part of this branch.
+
+## GLX buffer-age capability correction (2026-07-23)
+
+**Status: IMPLEMENTED; DID NOT BY ITSELF RESOLVE STEAM POPUPS.** yserver
+advertised `GLX_EXT_buffer_age` despite implementing neither per-drawable
+back-buffer history nor the `GLX_BACK_BUFFER_AGE_EXT` query value. Xorg on the
+same Radeon stack does not advertise that extension. yserver now omits the
+unsupported extension so clients cannot rely on preservation semantics the
+server does not provide.
+
+## Steam/CEF GLX visual configuration (2026-07-23)
+
+**Status: IMPLEMENTED; VERIFIED ON RX580.** A matching Xorg trace showed that
+Xorg creates Steam's GPU context, initialization pbuffer, and every CEF window
+with the same FBConfig, so each popup owns one DRI3 pixmap.
+
+yserver instead advertised the same X visual ID twice, once double-buffered
+and once single-buffered. ANGLE selected the single-buffered entry for its
+context/pbuffer and the
+double-buffered entry carrying that same visual for its windows. Mesa then
+allocated a fake front buffer, issued preservation CopyAreas, and alternated
+it with the Present back buffer. This is exactly the extra two-pixmap path seen
+only on yserver.
+
+The fix removes that invalid ambiguity. Until the setup reply exposes distinct
+X visuals for additional GLX configurations, each real visual is associated
+only with its double-buffered FBConfig. The existing IDs remain stable (`0x101`
+RGB and `0x103` ARGB), so Steam uses one compatible config for its context,
+pbuffer, and windows as it does on Xorg. Focused tests enforce unique visual
+IDs and double buffering. RX580 testing confirms stable browser content,
+working CEF and GTK menus, and functional windowed and fullscreen rendering
+with WebGL enabled. A residual issue remains: hovering menus can occasionally
+produce brief ghost-menu flashes elsewhere on screen. This does not prevent
+menu interaction; the positioning/input follow-up is recorded below.
+
+## Steam popup positioning and XI2 routing follow-up (2026-07-24)
+
+**Status: IMPLEMENTED; VERIFIED ON XFCE, MATE, AND CINNAMON.** Longer WebGL
+testing exposed two related failures after popup use: a menu could briefly map
+at a stale/root-adjacent position before moving into place, and clicking a
+menu could sometimes attach the main Steam window to the pointer as a move.
+
+The position path now follows Xorg in three places. Present ConfigureNotify is
+emitted for every real window configuration, including pure moves, and precedes
+the core ConfigureNotify as Xorg's screen hook does. Core and XI2 crossing
+coordinates are derived independently for every event window from root
+coordinates and the authoritative server window tree; XI2 crossings also
+preserve their crossing mode/detail. TranslateCoordinates uses the same
+bounding/input-shape-aware direct-child test as pointer hit testing, so the
+Composite Overlay Window's empty input shape cannot hide a popup below it.
+
+The remaining apparent grab failure was isolated by comparing identical Steam
+clicks in yserver and Xorg traces. Steam's GTK child and CEF top-level both
+selected XI2 ButtonPress. Xorg delivered each slave/master device form only at
+the first selected window in its leaf-to-root walk; yserver independently
+delivered another copy to the selected top-level. CEF interpreted that duplicate
+top-level press as a client-side-decoration drag and sent `_NET_WM_MOVERESIZE`.
+XI2 device routing now stops globally at the first selected window per device
+form, while slave and master forms still route independently. Passive-grab
+fallback coordinates are likewise recomputed relative to the grab window, as
+in Xorg.
+
+Hardware verification could no longer reproduce either misplaced menus or the
+unintended window grabs on XFCE, MATE, or Cinnamon, and found no other
+regressions. The final cleanup removed redundant KMS-side crossing-coordinate
+plumbing; core fanout is the single coordinate authority. The deferred-Present
+experiment remains absent. `cargo test -p yserver-core` passes 928 tests and
+`cargo clippy --all-targets -- -D warnings` is clean.

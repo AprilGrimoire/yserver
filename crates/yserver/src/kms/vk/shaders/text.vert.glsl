@@ -1,7 +1,5 @@
 #version 450
 
-#extension GL_EXT_scalar_block_layout : require
-
 // Batched glyph quad vertex shader (#1 glyph draw batching). One
 // `vkCmdDraw(4, N_glyphs, ..)` with TRIANGLE_STRIP topology draws the
 // whole run: the 4-vertex quad comes from `gl_VertexIndex`, and each
@@ -15,16 +13,21 @@
 // NDC convention matches `composite.vert.glsl`: y increases
 // downward; pixel `(0, 0)` lands at NDC `(-1, -1)` (top-left).
 //
-// `layout(scalar)` packs the push-constant block without std140/std430
-// vec4 alignment so the offsets match the host `TextPushConsts`
-// `repr(C)` struct directly — no 16-byte pad before `foreground`.
+// Push-constant layout is plain std430. This block is `vec2, vec2,
+// vec4`: the two `vec2`s exactly fill bytes 0..16, so `foreground`
+// lands at offset 16 under std430 — identical to what scalar layout
+// would give, and matching the host `TextPushConsts` `repr(C)` struct
+// (whose compile-time asserts lock size==32 / atlas_extent@8 /
+// foreground@16). No `GL_EXT_scalar_block_layout` needed, which lets
+// the shader run on devices without the optional `scalarBlockLayout`
+// feature (Broadcom V3D / v3dv on the RPi 4/400).
 
 layout(location = 0) in vec2 dst_origin;  // pixels
 layout(location = 1) in vec2 dst_size;     // pixels
 layout(location = 2) in vec2 atlas_xy;     // texels
 layout(location = 3) in vec2 atlas_wh;     // texels
 
-layout(scalar, push_constant) uniform PushConsts {
+layout(push_constant) uniform PushConsts {
     vec2 viewport;
     vec2 atlas_extent;  // texels
     vec4 foreground;    // RGB used by fragment shader; alpha is 1.0

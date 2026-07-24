@@ -48,14 +48,11 @@ const FRAGMENT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/text.frag.
 /// (sub-phase #1 glyph batching): 32 bytes = two `vec2` + one
 /// `vec4`. Per-glyph dst rect + atlas coords moved to
 /// [`GlyphInstanceData`] (instance-rate vertex attributes). The
-/// shader's `push_constant` block is declared `layout(scalar)` (via
-/// `GL_EXT_scalar_block_layout`, enabled at device init by
-/// `scalarBlockLayout`), so the GLSL offsets match `repr(C)`
-/// directly without std430's 16-byte `vec4` padding rule. If the
-/// shader's layout qualifier is ever reverted to plain std430,
-/// `foreground` at offset 16 would no longer line up with what the
-/// shader reads at offset 32 and black text turns green; the
-/// `offset_of!` assert below catches any Rust-side regression.
+/// shader's push-constant block uses std430 layout. Two consecutive
+/// `vec2` values occupy bytes 0..16, so the following `vec4` naturally
+/// starts at offset 16, exactly matching this `repr(C)` structure.
+/// The `offset_of!` assertions below guard that contract without
+/// requiring the optional `scalarBlockLayout` Vulkan feature.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct TextPushConsts {

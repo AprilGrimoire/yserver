@@ -424,6 +424,17 @@ impl RenderPipelineCache {
         dst_has_alpha: bool,
         component_alpha: bool,
     ) -> Result<vk::Pipeline, RenderPipelineError> {
+        // `dualSrcBlend` is an *optional* Vulkan feature, absent on some
+        // tilers (Broadcom V3D / v3dv on the RPi 4/400). Without it the
+        // SRC1_* blend factors the component-alpha path relies on are
+        // unavailable, so clamp component-alpha off and build the
+        // standard single-source pipeline: the mask is applied through
+        // its alpha channel (the well-exercised non-component-alpha
+        // path), degrading subpixel/LCD AA to grayscale AA. Clamping
+        // here — the single pipeline choke point — keeps the cache key,
+        // the fragment shader's COMPONENT_ALPHA spec constant, and the
+        // blend factors consistent.
+        let component_alpha = component_alpha && self.vk.component_alpha_supported;
         let key = (op, dst_format, dst_has_alpha, component_alpha);
         if let Some(p) = self.pipelines.get(&key) {
             return Ok(*p);

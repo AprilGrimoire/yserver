@@ -192,7 +192,7 @@ pub const VENDOR_NAMES: &str = "mesa";
 /// advertises it; without it libglvnd's fallback returns no vendor on
 /// Asahi/ALARM → NULL `glXQueryExtensionsString` → Cinnamon/cogl SIGSEGV.
 pub const SERVER_EXTENSIONS: &str = "GLX_ARB_create_context GLX_ARB_create_context_profile \
-    GLX_EXT_create_context_es2_profile GLX_EXT_buffer_age GLX_EXT_swap_control \
+    GLX_EXT_create_context_es2_profile GLX_EXT_swap_control \
     GLX_ARB_fbconfig_float GLX_EXT_visual_info \
     GLX_EXT_visual_rating GLX_EXT_import_context GLX_EXT_libglvnd";
 
@@ -366,7 +366,25 @@ pub const GLX_TRUE_COLOR: u32 = 0x8002;
 pub const GLX_NONE: u32 = 0x8000;
 pub const GLX_WINDOW_BIT: u32 = 0x1;
 pub const GLX_PIXMAP_BIT: u32 = 0x2;
+/// `GLX_PBUFFER_BIT` (glxtokens.h, 0x4) — `GLX_DRAWABLE_TYPE` bit marking a
+/// config usable for pbuffers. ANGLE (Chromium's GL layer) filters
+/// `glXChooseFBConfig` on this bit to allocate its offscreen surface; if no
+/// config advertises it, ANGLE's hardware GL init fails and Chromium falls
+/// back to SwiftShader (software) — no WebGL acceleration, so Google Maps
+/// 3D disappears. Firefox uses window surfaces and never needs it. (#96)
+pub const GLX_PBUFFER_BIT: u32 = 0x4;
 pub const GLX_RGBA_BIT: u32 = 0x1;
+
+/// `GLX_MAX_PBUFFER_WIDTH` / `_HEIGHT` / `_PIXELS` (glxtokens.h, 0x8016–0x8018).
+/// Xorg emits these three pairs for every config whose `GLX_DRAWABLE_TYPE`
+/// carries `GLX_PBUFFER_BIT` (glxcmds.c:1101-1104); ANGLE reads the max via
+/// `glXGetFBConfigAttrib` to validate its pbuffer fits, so a config that sets
+/// the bit but reports max 0 is still rejected. Not part of mesa's
+/// `driConfigEqual` compare set (proven: yserver's pre-#96 configs omitted
+/// them yet still matched radeonsi, which advertises them).
+pub const GLX_MAX_PBUFFER_WIDTH: u32 = 0x8016;
+pub const GLX_MAX_PBUFFER_HEIGHT: u32 = 0x8017;
+pub const GLX_MAX_PBUFFER_PIXELS: u32 = 0x8018;
 
 /// Encode `GetFBConfigsReply`. `configs` is a slice of (attrib,
 /// value) pair lists — one list per FBConfig. All lists must have
@@ -892,6 +910,11 @@ mod tests {
         // be advertised until glXSelectEvent + GLX_BufferSwapComplete
         // delivery exist — cogl parks its frame clock on the event otherwise.
         assert!(!SERVER_EXTENSIONS.contains("GLX_INTEL_swap_event"));
+        // GLX_EXT_buffer_age promises that GLX_BACK_BUFFER_AGE_EXT reports
+        // how many swaps ago the current back buffer was displayed. yserver
+        // does not track that history, so advertising the extension lets
+        // clients preserve only partial damage in an undefined buffer.
+        assert!(!SERVER_EXTENSIONS.contains("GLX_EXT_buffer_age"));
         // Regression (cinnamon SIGSEGV on Asahi): GLX_EXT_libglvnd is what
         // makes libglvnd query GLX_VENDOR_NAMES_EXT instead of guessing a
         // default vendor — without it libglvnd resolves no vendor on

@@ -1054,7 +1054,7 @@ impl KmsBackend {
                 // no sibling clip — stomps them flat (decoration buttons
                 // "briefly show then vanish; reappear on hover"). copy_area
                 // already guards this exact shared-backing case via
-                // `copy_area_higher_sibling_occluders`; mirror it here so
+                // `copy_area_shared_backing_occluders`; mirror it here so
                 // ClearArea / background tiling honours the same clip.
                 // Coords are dst-window-local (the occluder rects' space);
                 // `dst_target.offset` shifts each surviving piece into the
@@ -1070,7 +1070,7 @@ impl KmsBackend {
                     },
                 };
                 let surviving: Vec<ash::vk::Rect2D> = if self.windows.contains_key(&host_xid) {
-                    let occ = self.copy_area_higher_sibling_occluders(host_xid, dst_target.id);
+                    let occ = self.copy_area_shared_backing_occluders(host_xid, &dst_target);
                     if occ.is_empty() {
                         vec![clear_rect]
                     } else {
@@ -2404,48 +2404,57 @@ impl KmsBackend {
         }
     }
 
-    /// When sibling windows share one redirected backing, painting the
-    /// lower sibling must not overwrite the higher siblings' visible
-    /// pixels in that backing. Return the mapped higher-sibling rects
-    /// in `dst_host_xid` local coordinates so `copy_area` can subtract
-    /// them from the destination rects before dispatch.
-    fn copy_area_higher_sibling_occluders(
+    /// When window branches share one redirected backing, painting a lower
+    /// branch must not overwrite higher siblings' visible pixels in that
+    /// backing. Walk from the destination through every ancestor: a higher
+    /// sibling at any level is an occluder for the whole descendant branch.
+    ///
+    /// Return those mapped higher-sibling rects in `dst_host_xid` local
+    /// coordinates so `copy_area` can subtract them before dispatch. Using
+    /// each sibling's resolved backing offset, rather than just its immediate
+    /// `(x, y)`, also handles cousins reached through wrapper windows.
+    fn copy_area_shared_backing_occluders(
         &self,
         dst_host_xid: u32,
-        dst_target_id: super::store::DrawableId,
+        dst_target: &PaintTarget,
     ) -> Vec<ash::vk::Rect2D> {
-        let Some(dst_geom) = self.windows.get(&dst_host_xid) else {
-            return Vec::new();
-        };
-        let mut occluders: Vec<(u64, ash::vk::Rect2D)> = self
-            .windows
-            .iter()
-            .filter_map(|(sib_host_xid, sib_geom)| {
-                if *sib_host_xid == dst_host_xid
-                    || !sib_geom.mapped
-                    || sib_geom.parent != dst_geom.parent
-                    || sib_geom.stack_rank <= dst_geom.stack_rank
-                    || sib_geom.width == 0
-                    || sib_geom.height == 0
-                {
-                    return None;
-                }
-                let sib_target = self.resolve_paint_target(*sib_host_xid)?;
-                (sib_target.id == dst_target_id).then_some((
-                    sib_geom.stack_rank,
-                    ash::vk::Rect2D {
-                        offset: ash::vk::Offset2D {
-                            x: i32::from(sib_geom.x) - i32::from(dst_geom.x),
-                            y: i32::from(sib_geom.y) - i32::from(dst_geom.y),
-                        },
-                        extent: ash::vk::Extent2D {
-                            width: u32::from(sib_geom.width),
-                            height: u32::from(sib_geom.height),
-                        },
-                    },
-                ))
-            })
-            .collect();
+        let mut branch_xid = dst_host_xid;
+        let mut occluders = Vec::new();
+        while let Some(branch_geom) = self.windows.get(&branch_xid) {
+            occluders.extend(
+                self.windows
+                    .iter()
+                    .filter_map(|(sibling_host_xid, sibling_geom)| {
+                        if *sibling_host_xid == branch_xid
+                            || !sibling_geom.mapped
+                            || sibling_geom.parent != branch_geom.parent
+                            || sibling_geom.stack_rank <= branch_geom.stack_rank
+                            || sibling_geom.width == 0
+                            || sibling_geom.height == 0
+                        {
+                            return None;
+                        }
+                        let sibling_target = self.resolve_paint_target(*sibling_host_xid)?;
+                        (sibling_target.id == dst_target.id).then_some((
+                            sibling_geom.stack_rank,
+                            ash::vk::Rect2D {
+                                offset: ash::vk::Offset2D {
+                                    x: sibling_target.offset.0 - dst_target.offset.0,
+                                    y: sibling_target.offset.1 - dst_target.offset.1,
+                                },
+                                extent: ash::vk::Extent2D {
+                                    width: u32::from(sibling_geom.width),
+                                    height: u32::from(sibling_geom.height),
+                                },
+                            },
+                        ))
+                    }),
+            );
+            let Some(parent_xid) = branch_geom.parent else {
+                break;
+            };
+            branch_xid = parent_xid;
+        }
         occluders.sort_by_key(|(rank, _)| *rank);
         occluders.into_iter().map(|(_, rect)| rect).collect()
     }
@@ -2698,8 +2707,7 @@ impl KmsBackend {
                 post_gc_clip
             };
         if self.windows.contains_key(&dst_host_xid) {
-            let sibling_rects =
-                self.copy_area_higher_sibling_occluders(dst_host_xid, dst_target.id);
+            let sibling_rects = self.copy_area_shared_backing_occluders(dst_host_xid, dst_target);
             if sibling_rects.is_empty() {
                 child_clipped_rects
             } else {
@@ -17575,14 +17583,20 @@ impl Backend for KmsBackend {
             (24 | 32, 32) => ash::vk::Format::B8G8R8A8_UNORM,
             _ => return (vec![0], vec![0]),
         };
-        let screen = crate::kms::vk::dri3::supported_modifiers(vk, format);
+        // Client pixmaps are composited as sampled window textures, so
+        // probe with the sampled client-import usage (keeps SAMPLED, which
+        // correctly steers v3dv clients to a tiled modifier).
+        let screen = crate::kms::vk::dri3::supported_modifiers(
+            vk,
+            format,
+            crate::kms::vk::dri3::CLIENT_IMPORT_USAGE,
+        );
         // Window-modifier list is the subset that the window's
         // output can flip-scanout. Phase 4.1 always uses LINEAR
         // for scanout, so the window list collapses to LINEAR
         // here. A follow-up populates `output.scanout_format_set`
         // from the real add_fb2 probe and widens this.
         let window: Vec<u64> = screen.iter().copied().filter(|&m| m == 0).collect();
-        let window = if window.is_empty() { vec![0] } else { window };
         (window, screen)
     }
 
@@ -23340,6 +23354,211 @@ mod tests {
             "a higher sibling overlapping the middle of the lower sibling \
              must split the copy into the two uncovered side bands; pre-fix \
              v2 emitted one full unsplit copy into the shared redirected backing"
+        );
+    }
+
+    /// Steam CEF nests its full-window Present target below several wrapper
+    /// windows while putting the browser body in a separate, higher-stacked
+    /// branch. Both branches flatten into the top-level redirect backing. A
+    /// clip walk limited to the Present target's immediate siblings therefore
+    /// misses the body and lets every full-window Present overwrite it.
+    #[test]
+    fn copy_area_excludes_higher_cousin_in_shared_redirect_backing() {
+        use crate::kms::render::store::{DrawableKind, Storage};
+        use yserver_core::backend::Backend;
+
+        let mut b = KmsBackend::for_tests();
+
+        let owner_xid = 0x310_0001;
+        let lower_branch_xid = 0x310_0002;
+        let present_window_xid = 0x310_0003;
+        let upper_cousin_xid = 0x310_0004;
+        let backing_xid = 0x310_0005;
+        let src_pixmap_xid = 0x310_0006;
+
+        let owner_rank = b.alloc_window_stack_rank();
+        b.windows.insert(
+            owner_xid,
+            super::WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 80,
+                depth: 24,
+                mapped: true,
+                parent: None,
+                bg_pixel: None,
+                bg_pixmap: None,
+                stack_rank: owner_rank,
+                cursor: None,
+            },
+        );
+        b.store
+            .allocate(
+                owner_xid,
+                DrawableKind::Window,
+                24,
+                true,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 100,
+                        height: 80,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("alloc redirect owner");
+        b.store
+            .allocate(
+                backing_xid,
+                DrawableKind::Pixmap,
+                24,
+                false,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 100,
+                        height: 80,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("alloc redirect backing");
+        assert!(b.test_set_redirected_target(owner_xid, backing_xid));
+
+        let lower_rank = b.alloc_window_stack_rank();
+        b.windows.insert(
+            lower_branch_xid,
+            super::WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 80,
+                depth: 24,
+                mapped: true,
+                parent: Some(owner_xid),
+                bg_pixel: None,
+                bg_pixmap: None,
+                stack_rank: lower_rank,
+                cursor: None,
+            },
+        );
+        b.store
+            .allocate(
+                lower_branch_xid,
+                DrawableKind::Window,
+                24,
+                true,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 100,
+                        height: 80,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("alloc lower wrapper branch");
+
+        let present_rank = b.alloc_window_stack_rank();
+        b.windows.insert(
+            present_window_xid,
+            super::WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 80,
+                depth: 24,
+                mapped: true,
+                parent: Some(lower_branch_xid),
+                bg_pixel: None,
+                bg_pixmap: None,
+                stack_rank: present_rank,
+                cursor: None,
+            },
+        );
+        b.store
+            .allocate(
+                present_window_xid,
+                DrawableKind::Window,
+                24,
+                true,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 100,
+                        height: 80,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("alloc nested Present window");
+
+        let upper_rank = b.alloc_window_stack_rank();
+        b.windows.insert(
+            upper_cousin_xid,
+            super::WindowGeometry {
+                x: 1,
+                y: 20,
+                width: 98,
+                height: 40,
+                depth: 24,
+                mapped: true,
+                parent: Some(owner_xid),
+                bg_pixel: None,
+                bg_pixmap: None,
+                stack_rank: upper_rank,
+                cursor: None,
+            },
+        );
+        b.store
+            .allocate(
+                upper_cousin_xid,
+                DrawableKind::Window,
+                24,
+                true,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 98,
+                        height: 40,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("alloc higher CEF body cousin");
+
+        b.store
+            .allocate(
+                src_pixmap_xid,
+                DrawableKind::Pixmap,
+                24,
+                false,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 100,
+                        height: 80,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("alloc Present source pixmap");
+
+        let calls_before = b.engine_copy_area_calls;
+        b.copy_area(
+            None,
+            src_pixmap_xid,
+            present_window_xid,
+            0,
+            0,
+            0,
+            0,
+            100,
+            80,
+        )
+        .expect("copy_area must not return Err");
+
+        assert_eq!(
+            b.engine_copy_area_calls,
+            calls_before + 4,
+            "the higher cousin must split the full-window Present into top, \
+             bottom, left, and right strips instead of overwriting its body"
         );
     }
 
