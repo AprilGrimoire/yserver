@@ -397,11 +397,11 @@ Cross-cutting bugs and followups that don't fit a stage live in
   render/source card while retaining secondary KMS sink providers. Empty and
   duplicate entries fail explicitly. The singular `YSERVER_DRM_DEVICE` keeps
   its existing one-device-only behavior for compatibility.
-- **2026-07-23 stable-path multi-device profiles**: `YSERVER_DRM_DEVICES` now
-  uses a comma-separated list so udev by-path names containing PCI-address
-  colons remain intact. The local `env/nvidia-to-intel.env` profile orders the
-  NVIDIA card as the Vulkan render/source device and the Intel iGPU as the KMS
-  output sink.
+- **2026-07-23 stable-path multi-device override**: `YSERVER_DRM_DEVICES` uses
+  a comma-separated list so udev by-path names containing PCI-address colons
+  remain intact. Device ordering stays deployment configuration supplied
+  through the environment; yserver does not embed a machine-specific GPU
+  profile.
 - **2026-07-11 unique backend-fd event routing**: the core poller now assigns a
   distinct indexed token to every fd returned by `Backend::poll_fds`, retaining
   both its raw fd and `BackendFdKind` for dispatch. DRM readiness passes the
