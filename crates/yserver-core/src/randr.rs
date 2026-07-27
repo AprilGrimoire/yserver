@@ -2,6 +2,43 @@ use std::collections::HashSet;
 
 use yserver_protocol::x11::randr as proto;
 
+use crate::properties::PropertyValue;
+
+/// A client-settable RANDR output property (`RRChangeOutputProperty` /
+/// `RRConfigureOutputProperty` / `RRDeleteOutputProperty`,
+/// randr/rrproperty.c `RRPropertyRec`). Distinct from the backend-
+/// synthesized `EDID` / `EDID_DATA` / `ConnectorType` identity properties,
+/// which stay resolved live from `Backend::output_identity` and only fall
+/// back to this store when no real entry shadows them (see
+/// `process_request::handle_randr_request`).
+///
+/// Lives in `ServerState::randr_output_properties` (keyed by output id)
+/// rather than on `RandrOutput` itself, because hotplug rebuilds
+/// `RandrState` wholesale via `RandrState::from_outputs*` while output ids
+/// stay stable — the property store must survive that rebuild.
+#[derive(Debug, Clone, Default)]
+pub struct RandrOutputProperty {
+    /// The value currently visible to `RRGetOutputProperty(pending=false)`.
+    /// `None` for a property that has only been `Configure`d, never
+    /// `Change`d.
+    pub current: Option<PropertyValue>,
+    /// The value staged via `RRChangeOutputProperty` while `is_pending` is
+    /// set, visible only via `RRGetOutputProperty(pending=true)`.
+    pub pending: Option<PropertyValue>,
+    /// Set via `RRConfigureOutputProperty`. When true, `ChangeOutputProperty`
+    /// writes land in `pending` (no notify) instead of `current`.
+    pub is_pending: bool,
+    /// Set via `RRConfigureOutputProperty`: `valid_values` are `(min, max)`
+    /// pairs rather than an enumeration.
+    pub range: bool,
+    /// Always `false` for a store entry created by a client request — Xorg's
+    /// wire-level `RRConfigureOutputProperty` hardcodes `immutable = FALSE`
+    /// (only driver-internal callers can mark a property immutable).
+    pub immutable: bool,
+    /// Set via `RRConfigureOutputProperty`.
+    pub valid_values: Vec<i32>,
+}
+
 /// One RANDR output (1 connector, 1 CRTC, 1 mode in the current model).
 #[derive(Debug, Clone)]
 pub struct RandrOutput {

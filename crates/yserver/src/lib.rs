@@ -251,8 +251,13 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
                 // pool is being consulted (takes_hit+takes_miss),
                 // whether mirrors return to it (returns_accepted),
                 // and which rejection path fires (bucket_full means
-                // PIXMAP_POOL_BUCKET_CAP is too small; oversize
-                // means MAX_POOLED_DIM is too small).
+                // PIXMAP_POOL_BUCKET_BUDGET_BYTES is too small for
+                // this key's working set; oversize means
+                // MAX_POOLED_DIM is too small).
+                //
+                // bucket_full tracking takes_miss 1:1 is the signature
+                // of a cap-bound pool: every rejected return becomes a
+                // kernel allocation on the next take.
                 if let Some(cur) = crate::kms::vk::pixmap_pool::telemetry_snapshot() {
                     let d_hit = cur.total_takes_hit.wrapping_sub(prev_pool.total_takes_hit);
                     let d_miss = cur

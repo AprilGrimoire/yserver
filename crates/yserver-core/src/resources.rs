@@ -1371,6 +1371,28 @@ impl ResourceTable {
         .collect()
     }
 
+    /// Storage occupied by live pixmap resources owned by `owner`, for
+    /// X-Resource `QueryClientPixmapBytes`. X11 pixmap scanlines are padded
+    /// to 32 bits; depth 24 and 32 both use 32 storage bits per pixel.
+    #[must_use]
+    pub fn pixmap_bytes_by_owner(&self, owner: ClientId) -> u64 {
+        self.pixmaps
+            .values()
+            .filter(|pixmap| pixmap.owner == owner)
+            .map(|pixmap| {
+                let bits_per_pixel = match pixmap.depth {
+                    1 => 1u64,
+                    2..=8 => 8,
+                    9..=16 => 16,
+                    _ => 32,
+                };
+                let row_bits = u64::from(pixmap.width).saturating_mul(bits_per_pixel);
+                let row_bytes = row_bits.div_ceil(32).saturating_mul(4);
+                row_bytes.saturating_mul(u64::from(pixmap.height))
+            })
+            .fold(0u64, u64::saturating_add)
+    }
+
     pub fn parent_of(&self, id: ResourceId) -> Option<ResourceId> {
         self.windows.get(&id.0).map(|w| w.parent)
     }

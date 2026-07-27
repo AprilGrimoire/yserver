@@ -456,17 +456,22 @@ const DMA_BUF_IOCTL_EXPORT_SYNC_FILE: libc::c_ulong = 0xc008_6202;
 const DMA_BUF_SYNC_READ: u32 = 1 << 0;
 const DMA_BUF_SYNC_WRITE: u32 = 1 << 1;
 
-/// Shared implementation of `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` + `poll`.
-///
-/// `flags` selects the reservation scope:
-/// - [`DMA_BUF_SYNC_READ`]  — snapshot the write fence a reader must wait on.
-/// - [`DMA_BUF_SYNC_WRITE`] — snapshot ALL fences (readers + writers) a writer
-///   must wait on before overwriting the buffer.
-fn sync_file_export_and_poll(
-    dma_buf_fd: std::os::fd::BorrowedFd<'_>,
-    flags: u32,
-    timeout_ms: i32,
-) -> DmabufWait {
+/// Outcome of exporting a dma-buf reservation-object fence as a
+/// `sync_file` fd (no poll). Distinguishes "nothing to wait on" from
+/// "the ioctl is unavailable" so callers can pick a fallback.
+pub enum ExportedSyncFile {
+    /// No fence attached in the requested scope → nothing to wait on.
+    Idle,
+    /// `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` unsupported / errored.
+    Unsupported,
+    /// The exported sync_file fd; caller owns it.
+    Fd(std::os::fd::OwnedFd),
+}
+
+/// Shared `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` ioctl. `flags` selects the
+/// reservation scope (see [`sync_file_export_and_poll`] doc). Returns the
+/// owned sync_file fd, or `Idle`/`Unsupported`.
+fn export_sync_file_fd(dma_buf_fd: std::os::fd::BorrowedFd<'_>, flags: u32) -> ExportedSyncFile {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
     let mut export = DmaBufExportSyncFile { flags, fd: -1 };
@@ -480,15 +485,35 @@ fn sync_file_export_and_poll(
         )
     };
     if rc != 0 {
-        return DmabufWait::Unsupported;
+        return ExportedSyncFile::Unsupported;
     }
     if export.fd < 0 {
         // No fences in the reservation object → buffer is idle.
-        return DmabufWait::Idle;
+        return ExportedSyncFile::Idle;
     }
     // Own the returned sync_file fd so it is always closed.
     // SAFETY: the kernel just handed us an owned fd via the ioctl.
-    let sync_fd = unsafe { OwnedFd::from_raw_fd(export.fd) };
+    ExportedSyncFile::Fd(unsafe { OwnedFd::from_raw_fd(export.fd) })
+}
+
+/// Shared implementation of `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` + `poll`.
+///
+/// `flags` selects the reservation scope:
+/// - [`DMA_BUF_SYNC_READ`]  — snapshot the write fence a reader must wait on.
+/// - [`DMA_BUF_SYNC_WRITE`] — snapshot ALL fences (readers + writers) a writer
+///   must wait on before overwriting the buffer.
+fn sync_file_export_and_poll(
+    dma_buf_fd: std::os::fd::BorrowedFd<'_>,
+    flags: u32,
+    timeout_ms: i32,
+) -> DmabufWait {
+    use std::os::fd::AsRawFd;
+
+    let sync_fd = match export_sync_file_fd(dma_buf_fd, flags) {
+        ExportedSyncFile::Unsupported => return DmabufWait::Unsupported,
+        ExportedSyncFile::Idle => return DmabufWait::Idle,
+        ExportedSyncFile::Fd(fd) => fd,
+    };
     let mut pfd = libc::pollfd {
         fd: sync_fd.as_raw_fd(),
         events: libc::POLLIN,
@@ -517,14 +542,25 @@ fn sync_file_export_and_poll(
 ///
 /// **Bounded / deadlock-safe:** on `timeout_ms` elapse it returns
 /// [`DmabufWait::TimedOut`] and the caller proceeds — worst case a
-/// stale frame, never a stall. This is the CONFIRMATION path; the
-/// production fix replaces the CPU poll with a GPU wait-semaphore on the
-/// copy submit.
+/// stale frame, never a stall. This remains available for diagnostic and
+/// compatibility paths; `PresentPixmap` uses
+/// [`export_dmabuf_read_access_sync_file`] and resumes asynchronously from
+/// the main loop instead of blocking here.
 pub fn wait_dmabuf_read_ready(
     dma_buf_fd: std::os::fd::BorrowedFd<'_>,
     timeout_ms: i32,
 ) -> DmabufWait {
     sync_file_export_and_poll(dma_buf_fd, DMA_BUF_SYNC_READ, timeout_ms)
+}
+
+/// Export the READ-access sync-file for an imported dma-buf without waiting.
+/// The returned fence represents the producer write a yserver copy must not
+/// overtake. Callers may register the fd in an event loop and submit the copy
+/// only after it becomes readable.
+pub fn export_dmabuf_read_access_sync_file(
+    dma_buf_fd: std::os::fd::BorrowedFd<'_>,
+) -> ExportedSyncFile {
+    export_sync_file_fd(dma_buf_fd, DMA_BUF_SYNC_READ)
 }
 
 /// CPU-wait until ALL current users (readers AND writers) of an exported

@@ -39,6 +39,111 @@ pub fn swap_request_body(major: u8, minor: u8, byte_order: ClientByteOrder, body
     if let Some(entries) = entries {
         swap_in_place(entries, byte_order, body);
     }
+    if major == 137 && minor == 23 {
+        swap_xi_change_feedback_control(byte_order, body);
+    } else if major == 137 && minor == 35 {
+        swap_xi_change_device_control(byte_order, body);
+    }
+}
+
+/// ChangeFeedbackControl's trailing control is a tagged union selected by
+/// request byte 5 (`feedbackid`, which is actually the feedback class).
+fn swap_xi_change_feedback_control(byte_order: ClientByteOrder, body: &mut [u8]) {
+    use FieldEntry::Fixed;
+    use FieldKind::{I16, U16, U32};
+
+    let entries: &[FieldEntry] = match body.get(5) {
+        // xKbdFeedbackCtl at body[8..]
+        Some(0) => &[
+            Fixed {
+                offset: 10,
+                kind: U16,
+            },
+            Fixed {
+                offset: 16,
+                kind: I16,
+            },
+            Fixed {
+                offset: 18,
+                kind: I16,
+            },
+            Fixed {
+                offset: 20,
+                kind: U32,
+            },
+            Fixed {
+                offset: 24,
+                kind: U32,
+            },
+        ],
+        // xPtrFeedbackCtl at body[8..]
+        Some(1) => &[
+            Fixed {
+                offset: 10,
+                kind: U16,
+            },
+            Fixed {
+                offset: 14,
+                kind: I16,
+            },
+            Fixed {
+                offset: 16,
+                kind: I16,
+            },
+            Fixed {
+                offset: 18,
+                kind: I16,
+            },
+        ],
+        _ => &[],
+    };
+    swap_in_place(entries, byte_order, body);
+}
+
+/// `RRChangeOutputProperty` / `RRChangeProviderProperty`'s trailing value
+/// payload (from body offset 20) is a tagged union selected by the format
+/// byte at offset 12: 8 = bytes (untouched), 16 = `INT16[]`, 32 =
+/// `INT32[]`. Mirrors Xorg's `SProcRRChangeOutputProperty` `SwapRestS` /
+/// `SwapRestL` dispatch.
+fn swap_change_output_property_tail(byte_order: ClientByteOrder, body: &mut [u8]) {
+    use FieldEntry::ElementArrayTail;
+
+    let entries: &[FieldEntry] = match body.get(12) {
+        Some(16) => &[ElementArrayTail {
+            from: 20,
+            kind: FieldKind::U16,
+        }],
+        Some(32) => &[ElementArrayTail {
+            from: 20,
+            kind: FieldKind::U32,
+        }],
+        _ => &[],
+    };
+    swap_in_place(entries, byte_order, body);
+}
+
+fn swap_xi_change_device_control(byte_order: ClientByteOrder, body: &mut [u8]) {
+    use FieldEntry::{ElementArrayTail, Fixed};
+    use FieldKind::{U16, U32};
+
+    swap_in_place(
+        &[
+            Fixed {
+                offset: 4,
+                kind: U16,
+            },
+            Fixed {
+                offset: 6,
+                kind: U16,
+            },
+            ElementArrayTail {
+                from: 12,
+                kind: U32,
+            },
+        ],
+        byte_order,
+        body,
+    );
 }
 
 /// Dispatch to a per-extension swap table by major opcode. yserver
@@ -61,7 +166,7 @@ const fn extension_request_swap_table(major: u8, minor: u8) -> Option<&'static [
 }
 
 const fn randr_request_swap_table(minor: u8) -> Option<&'static [FieldEntry]> {
-    use FieldEntry::{ElementArrayTail, Fixed};
+    use FieldEntry::{Custom, ElementArrayTail, Fixed};
     use FieldKind::{I16, U16, U32};
 
     macro_rules! u32f {
@@ -89,8 +194,17 @@ const fn randr_request_swap_table(minor: u8) -> Option<&'static [FieldEntry]> {
         };
     }
 
+    // Offsets are body-relative (the 4-byte request header is already
+    // stripped) and taken field-by-field from randrproto.h, NOT from the
+    // request's prose description. Every minor whose handler reads a field
+    // needs an entry: a big-endian client's xid read back little-endian is a
+    // silent mis-parse that surfaces as a bogus BadWindow/BadOutput/BadCrtc.
+    // Big-endian clients are not hypothetical here — X11 is network
+    // transparent, so `ssh -X` from a big-endian host (AIX/POWER, s390x,
+    // Solaris/SPARC) drives a big-endian client against this server over the
+    // LOCAL socket.
     Some(match minor {
-        super::randr::RR_GET_CRTC_TRANSFORM | super::randr::RR_GET_PANNING => &[u32f!(0)],
+        // SetCrtcTransform: crtc, 3x3 transform matrix, filter-name length.
         super::randr::RR_SET_CRTC_TRANSFORM => &[
             u32f!(0),
             u32f!(4),
@@ -104,6 +218,7 @@ const fn randr_request_swap_table(minor: u8) -> Option<&'static [FieldEntry]> {
             u32f!(36),
             u16f!(40),
         ],
+        // SetPanning: crtc, timestamp, panning/track dimensions, borders.
         super::randr::RR_SET_PANNING => &[
             u32f!(0),
             u32f!(4),
@@ -120,10 +235,81 @@ const fn randr_request_swap_table(minor: u8) -> Option<&'static [FieldEntry]> {
             i16f!(28),
             i16f!(30),
         ],
-        super::randr::RR_SET_OUTPUT_PRIMARY => &[u32f!(0), u32f!(4)],
+        // GetScreenInfo / GetScreenSizeRange / GetScreenResources /
+        // GetScreenResourcesCurrent / GetOutputPrimary / GetProviders:
+        // a lone Window. GetCrtcGammaSize / GetCrtcGamma / GetCrtcTransform /
+        // GetPanning / ListOutputProperties: a lone RRCrtc/RROutput.
+        5 | 6 | 8 | 10 | 22 | 23 | 25 | 27 | 28 | 31 | 32 | 36 => &[u32f!(0)],
+        // SetScreenConfig: drawable, timestamp, configTimestamp, sizeID,
+        // rotation, rate.
+        2 => &[
+            u32f!(0),
+            u32f!(4),
+            u32f!(8),
+            u16f!(12),
+            u16f!(14),
+            u16f!(16),
+        ],
+        // SelectInput: window, enable.
+        4 => &[u32f!(0), u16f!(4)],
+        // SetScreenSize: window, width, height, mmWidth, mmHeight.
+        7 => &[u32f!(0), u16f!(4), u16f!(6), u32f!(8), u32f!(12)],
+        // GetOutputInfo / GetCrtcInfo: resource + configTimestamp.
+        // QueryOutputProperty / DeleteOutputProperty / SetOutputPrimary /
+        // AddOutputMode / DeleteOutputMode / DeleteMonitor / provider pairs:
+        // two 32-bit ids.
+        9 | 11 | 14 | 18 | 19 | 20 | 30 | 37 | 40 | 44 => &[u32f!(0), u32f!(4)],
+        // GetOutputProperty / GetProviderProperty: output/provider, property,
+        // type, longOffset, longLength (the trailing BOOLs are bytes).
+        15 | 41 => &[u32f!(0), u32f!(4), u32f!(8), u32f!(12), u32f!(16)],
+        // ConfigureOutputProperty / ConfigureProviderProperty: ids, then BOOLs
+        // (untouched), then a trailing INT32[] of valid values (Xorg
+        // `SProcRRConfigureOutputProperty` swaps it with `SwapRestL`).
+        12 | 38 => &[
+            u32f!(0),
+            u32f!(4),
+            ElementArrayTail {
+                from: 12,
+                kind: U32,
+            },
+        ],
+        // ChangeOutputProperty / ChangeProviderProperty: output, property,
+        // type, then format/mode/pad bytes, then nUnits, then a value payload
+        // whose unit width depends on the format byte at offset 12 — Xorg's
+        // `SProcRRChangeOutputProperty` picks `SwapRestS`/`SwapRestL`
+        // accordingly (format 8 is untouched).
+        13 | 39 => &[
+            u32f!(0),
+            u32f!(4),
+            u32f!(8),
+            u32f!(16),
+            Custom(swap_change_output_property_tail),
+        ],
+        // DestroyMode: a lone RRMode. FreeLease: RRLease + terminate byte.
+        17 | 46 => &[u32f!(0)],
+        // SetCrtcConfig: crtc, timestamp, configTimestamp, x, y, mode,
+        // rotation, then a trailing RROutput array.
+        21 => &[
+            u32f!(0),
+            u32f!(4),
+            u32f!(8),
+            i16f!(12),
+            i16f!(14),
+            u32f!(16),
+            u16f!(20),
+            ElementArrayTail {
+                from: 24,
+                kind: U32,
+            },
+        ],
         super::randr::RR_SET_CRTC_GAMMA => {
             &[u32f!(0), u16f!(4), ElementArrayTail { from: 8, kind: U16 }]
         }
+        // SetProviderOutputSource / SetProviderOffloadSink: provider, peer,
+        // configTimestamp. GetProviderInfo: provider + configTimestamp.
+        33..=35 => &[u32f!(0), u32f!(4), u32f!(8)],
+        // GetMonitors: window + get_active byte.
+        42 => &[u32f!(0)],
         _ => return None,
     })
 }
@@ -568,9 +754,8 @@ const fn xi_request_swap_table(minor: u8) -> Option<&'static [FieldEntry]> {
         // 22 GetFeedbackControl: device(u8) [u8 pad u16 pad]
         22 => &[],
         // 23 ChangeFeedbackControl: mask(u32) device(u8) feedbackid(u8)
-        //   [u16 pad] feedback(opaque — variant-dependent layout, leave as
-        //   opaque; tests don't exercise BE feedback control payloads).
-        23 => &[u32f!(0), OpaqueTail { from: 8 }],
+        //   [u16 pad] feedback(tagged union, swapped dynamically above).
+        23 => &[u32f!(0)],
         // 24 GetDeviceKeyMapping: device(u8) first_keycode(u8) count(u8) [u8 pad]
         24 => &[],
         // 25 ChangeDeviceKeyMapping: device(u8) first_keycode(u8)
@@ -599,8 +784,9 @@ const fn xi_request_swap_table(minor: u8) -> Option<&'static [FieldEntry]> {
         33 => &[ElementArrayTail { from: 4, kind: U32 }],
         // 34 GetDeviceControl: control(u16) device(u8) [u8 pad]
         34 => &[u16f!(0)],
-        // 35 ChangeDeviceControl: control(u16) device(u8) [u8 pad] ctl(opaque)
-        35 => &[u16f!(0), OpaqueTail { from: 4 }],
+        // 35 ChangeDeviceControl: outer control here; the embedded control
+        // header and resolution array are swapped dynamically above.
+        35 => &[u16f!(0)],
         // 36 ListDeviceProperties: device(u8) [u8 pad u16 pad]
         36 => &[],
         // 37 ChangeDeviceProperty: property(u32) type(u32) device(u8)
@@ -785,6 +971,49 @@ mod tests {
     }
 
     #[test]
+    fn xi_change_feedback_control_swaps_tagged_keyboard_payload() {
+        let mut body = vec![0; 28];
+        body[0..4].copy_from_slice(&0x1fu32.to_be_bytes());
+        body[4] = 3;
+        body[5] = 0; // KbdFeedbackClass
+        body[8] = 0;
+        body[9] = 0;
+        body[10..12].copy_from_slice(&20u16.to_be_bytes());
+        body[16..18].copy_from_slice(&400i16.to_be_bytes());
+        body[18..20].copy_from_slice(&100i16.to_be_bytes());
+        body[20..24].copy_from_slice(&3u32.to_be_bytes());
+        body[24..28].copy_from_slice(&2u32.to_be_bytes());
+
+        swap_request_body(137, 23, ClientByteOrder::BigEndian, &mut body);
+        assert_eq!(u32::from_le_bytes(body[0..4].try_into().unwrap()), 0x1f);
+        assert_eq!(u16::from_le_bytes(body[10..12].try_into().unwrap()), 20);
+        assert_eq!(i16::from_le_bytes(body[16..18].try_into().unwrap()), 400);
+        assert_eq!(i16::from_le_bytes(body[18..20].try_into().unwrap()), 100);
+        assert_eq!(u32::from_le_bytes(body[20..24].try_into().unwrap()), 3);
+        assert_eq!(u32::from_le_bytes(body[24..28].try_into().unwrap()), 2);
+    }
+
+    #[test]
+    fn xi_change_device_control_swaps_resolution_payload() {
+        let mut body = vec![0; 20];
+        body[0..2].copy_from_slice(&1u16.to_be_bytes());
+        body[2] = 2;
+        body[4..6].copy_from_slice(&1u16.to_be_bytes());
+        body[6..8].copy_from_slice(&16u16.to_be_bytes());
+        body[8] = 0;
+        body[9] = 2;
+        body[12..16].copy_from_slice(&1000u32.to_be_bytes());
+        body[16..20].copy_from_slice(&2000u32.to_be_bytes());
+
+        swap_request_body(137, 35, ClientByteOrder::BigEndian, &mut body);
+        assert_eq!(u16::from_le_bytes(body[0..2].try_into().unwrap()), 1);
+        assert_eq!(u16::from_le_bytes(body[4..6].try_into().unwrap()), 1);
+        assert_eq!(u16::from_le_bytes(body[6..8].try_into().unwrap()), 16);
+        assert_eq!(u32::from_le_bytes(body[12..16].try_into().unwrap()), 1000);
+        assert_eq!(u32::from_le_bytes(body[16..20].try_into().unwrap()), 2000);
+    }
+
+    #[test]
     fn xi_extension_unknown_minor_passes_through() {
         // major=137 is XI, but minor=255 has no swap entry → no-op.
         let mut body = vec![0xaa, 0xbb, 0xcc, 0xdd];
@@ -833,6 +1062,105 @@ mod tests {
             let mut body = vec![0x00, 0x00, 0x00, 0x02];
             swap_request_body(128, minor, ClientByteOrder::BigEndian, &mut body);
             assert_eq!(u32::from_le_bytes([body[0], body[1], body[2], body[3]]), 2);
+        }
+    }
+
+    #[test]
+    fn randr_configure_output_property_swaps_header_and_tail_int32_array() {
+        let mut body = vec![
+            0x00, 0x00, 0x00, 0x02, // output = 2 in BE
+            0x00, 0x00, 0x00, 0x03, // property = 3 in BE
+            1, 0, 0, 0, // pending=true, range=false, pad
+            0x00, 0x00, 0x00, 0x0a, // valid_values[0] = 10 in BE
+            0x00, 0x00, 0x00, 0x14, // valid_values[1] = 20 in BE
+        ];
+        swap_request_body(128, 12, ClientByteOrder::BigEndian, &mut body);
+        assert_eq!(u32::from_le_bytes(body[0..4].try_into().unwrap()), 2);
+        assert_eq!(u32::from_le_bytes(body[4..8].try_into().unwrap()), 3);
+        assert_eq!(u32::from_le_bytes(body[12..16].try_into().unwrap()), 10);
+        assert_eq!(u32::from_le_bytes(body[16..20].try_into().unwrap()), 20);
+    }
+
+    #[test]
+    fn randr_change_output_property_swaps_tail_by_format32() {
+        let mut body = vec![
+            0x00, 0x00, 0x00, 0x02, // output
+            0x00, 0x00, 0x00, 0x03, // property
+            0x00, 0x00, 0x00, 0x04, // type
+            32, 0, 0, 0, // format=32, mode, pad
+            0x00, 0x00, 0x00, 0x02, // nUnits = 2
+            0x00, 0x00, 0x00, 0x0a, // value[0] = 10 in BE
+            0x00, 0x00, 0x00, 0x14, // value[1] = 20 in BE
+        ];
+        swap_request_body(128, 13, ClientByteOrder::BigEndian, &mut body);
+        assert_eq!(u32::from_le_bytes(body[0..4].try_into().unwrap()), 2);
+        assert_eq!(u32::from_le_bytes(body[4..8].try_into().unwrap()), 3);
+        assert_eq!(u32::from_le_bytes(body[8..12].try_into().unwrap()), 4);
+        assert_eq!(u32::from_le_bytes(body[16..20].try_into().unwrap()), 2);
+        assert_eq!(u32::from_le_bytes(body[20..24].try_into().unwrap()), 10);
+        assert_eq!(u32::from_le_bytes(body[24..28].try_into().unwrap()), 20);
+    }
+
+    #[test]
+    fn randr_change_output_property_swaps_tail_by_format16() {
+        let mut body = vec![
+            0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x04, 16, 0, 0,
+            0, // format=16
+            0x00, 0x00, 0x00, 0x02, // nUnits = 2
+            0x00, 0x0a, // value[0] = 10 in BE
+            0x00, 0x14, // value[1] = 20 in BE
+        ];
+        swap_request_body(128, 13, ClientByteOrder::BigEndian, &mut body);
+        assert_eq!(u16::from_le_bytes(body[20..22].try_into().unwrap()), 10);
+        assert_eq!(u16::from_le_bytes(body[22..24].try_into().unwrap()), 20);
+    }
+
+    #[test]
+    fn randr_change_output_property_format8_tail_untouched() {
+        let mut body = vec![
+            0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x04, 8, 0, 0,
+            0, // format=8
+            0x00, 0x00, 0x00, 0x02, // nUnits = 2
+            0xAB, 0xCD, // opaque byte-format data
+        ];
+        let original_tail = body[20..22].to_vec();
+        swap_request_body(128, 13, ClientByteOrder::BigEndian, &mut body);
+        assert_eq!(body[20..22], original_tail[..]);
+    }
+
+    /// Every RANDR minor whose handler reads a resource id must swap it. Only
+    /// SetCrtcGamma had an entry, so a big-endian client's xid was read back
+    /// byte-reversed — which the resource validation then rejected as a bogus
+    /// BadWindow/BadOutput/BadCrtc. Not hypothetical: X11 is network
+    /// transparent, so `ssh -X` from a big-endian host (AIX/POWER, s390x,
+    /// Solaris/SPARC) drives a big-endian client against this server.
+    #[test]
+    fn randr_leading_resource_id_is_swapped_for_every_validating_minor() {
+        const XID: u32 = 0x00de_ad01;
+        for minor in [
+            2u8, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 20, 21, 22, 23, 25, 27, 28, 30, 31, 32,
+            26, 29, 33, 34, 35, 42, 46,
+        ] {
+            let mut body = vec![0u8; 32];
+            body[0..4].copy_from_slice(&XID.to_be_bytes());
+            swap_request_body(128, minor, ClientByteOrder::BigEndian, &mut body);
+            assert_eq!(
+                u32::from_le_bytes(body[0..4].try_into().unwrap()),
+                XID,
+                "minor {minor} must swap its leading resource id",
+            );
+        }
+    }
+
+    /// A little-endian client's body must be left byte-for-byte alone, so the
+    /// new entries cannot corrupt the common path.
+    #[test]
+    fn randr_little_endian_bodies_are_untouched() {
+        for minor in [2u8, 4, 7, 12, 13, 15, 21, 30, 42, 46] {
+            let mut body: Vec<u8> = (0..32u8).collect();
+            let original = body.clone();
+            swap_request_body(128, minor, ClientByteOrder::LittleEndian, &mut body);
+            assert_eq!(body, original, "minor {minor} must not touch LE bodies");
         }
     }
 }

@@ -157,12 +157,24 @@ The greeter appears, you log in, and the login keyring is unlocked by lightdm's 
 
 ## Use directly on TTY
 
+The easiest way is the `starty` launcher (install it with `just install`, which
+puts both `yserver` and `starty` in `/usr/local/bin`):
+
 ```sh
 ## switch to a free TTY, then run:
-just startx
+starty                 # runs ~/.xinitrc (or /etc/X11/xinit/xinitrc)
+starty bspwm           # ...or a WM resolved via PATH, no xinitrc needed
 ```
 
-which will start yserver and then execute your `~/.xinitrc` (or fall back to `/etc/X11/xinit/xinitrc`)
+`starty` mirrors real `startx`: it picks the lowest free display, mints a
+per-session MIT-MAGIC-COOKIE-1 (server copy + entry in `~/.Xauthority`), waits
+for the socket, runs the session, and tears the server down on exit. Server
+and session logs land in `$XDG_STATE_HOME/yserver/` (`~/.local/state/yserver/`).
+`video`/`input` group access (above) is still required — yserver opens
+`/dev/dri` and `/dev/input` directly, with no seat manager.
+
+From a source checkout you can also use `just startx`, which does the same thing
+against the in-tree debug build.
 
 Some convenience keybinds are available:
 

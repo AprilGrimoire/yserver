@@ -636,7 +636,12 @@ impl SceneCompositor {
             }),
             root_overlay: super::root_overlay::RootOverlay::default(),
             scene_structure_dirty: true,
-            hw_cursor_strategy_enabled: hw_cursor_strategy_enabled(),
+            // HW cursor plane is the default on hardware that exposes it,
+            // EXCEPT nvidia-drm: there the legacy cursor-move ioctl blocks
+            // ~1 vblank per move (stalls the single-threaded loop on drags,
+            // HW-measured) and the atomic cursor path regressed rendering, so
+            // NVIDIA defaults to the smooth SW (composited) cursor.
+            hw_cursor_strategy_enabled: hw_cursor_strategy_enabled() && !platform.is_nvidia_drm(),
         })
     }
 

@@ -13,7 +13,13 @@
 //! The pre-lift `EventTarget`-based helpers in `server.rs` remain in
 //! place; D3 migrates callers off them.
 
-use std::{collections::HashSet, sync::atomic::Ordering};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{
+        LazyLock, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use yserver_protocol::x11::{self, ClientByteOrder, ClientId, ResourceId, SequenceNumber};
 
@@ -24,6 +30,97 @@ use crate::{
     server::ServerState,
     xinput::XI2_DEVICE_CHANGED_MASK,
 };
+
+/// Wire-frame classes emitted to clients while loop telemetry is enabled.
+/// Keeping replies and errors alongside events makes retry/synchronization
+/// feedback visible, not just asynchronous event fanout.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum OutboundTelemetryKind {
+    Reply,
+    Error(u8),
+    Event(u8),
+    GenericEvent { extension: u8, event_type: u16 },
+}
+
+static OUTBOUND_TELEMETRY_ENABLED: AtomicBool = AtomicBool::new(false);
+static OUTBOUND_TELEMETRY: LazyLock<Mutex<HashMap<(ClientId, OutboundTelemetryKind), u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub(crate) fn enable_outbound_telemetry() {
+    OUTBOUND_TELEMETRY_ENABLED.store(true, Ordering::Relaxed);
+    OUTBOUND_TELEMETRY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+}
+
+pub(crate) fn take_outbound_telemetry() -> HashMap<(ClientId, OutboundTelemetryKind), u64> {
+    let mut counters = OUTBOUND_TELEMETRY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    std::mem::take(&mut *counters)
+}
+
+/// Attribute one server-to-client protocol frame. Callers invoke this before
+/// the non-blocking write, so a full socket still counts the feedback the
+/// server attempted to deliver. Buffers produced here contain one reply,
+/// error, or event (occasionally a chain of 32-byte events).
+pub(crate) fn record_outbound_telemetry(client: ClientId, order: ClientByteOrder, bytes: &[u8]) {
+    if !OUTBOUND_TELEMETRY_ENABLED.load(Ordering::Relaxed) || bytes.is_empty() {
+        return;
+    }
+    let mut offset = 0;
+    let mut counters = OUTBOUND_TELEMETRY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    while offset < bytes.len() {
+        let frame = &bytes[offset..];
+        let response_type = frame[0] & 0x7f;
+        let (kind, frame_len) = match response_type {
+            0 => (
+                OutboundTelemetryKind::Error(*frame.get(1).unwrap_or(&0)),
+                32,
+            ),
+            1 => (OutboundTelemetryKind::Reply, bytes.len() - offset),
+            35 if frame.len() >= 10 => {
+                let event_type = match order {
+                    ClientByteOrder::LittleEndian => u16::from_le_bytes([frame[8], frame[9]]),
+                    ClientByteOrder::BigEndian => u16::from_be_bytes([frame[8], frame[9]]),
+                };
+                let extra_units = if frame.len() >= 8 {
+                    match order {
+                        ClientByteOrder::LittleEndian => {
+                            u32::from_le_bytes([frame[4], frame[5], frame[6], frame[7]])
+                        }
+                        ClientByteOrder::BigEndian => {
+                            u32::from_be_bytes([frame[4], frame[5], frame[6], frame[7]])
+                        }
+                    }
+                } else {
+                    0
+                };
+                let frame_len = 32_usize.saturating_add(
+                    usize::try_from(extra_units)
+                        .unwrap_or(usize::MAX)
+                        .saturating_mul(4),
+                );
+                (
+                    OutboundTelemetryKind::GenericEvent {
+                        extension: frame[1],
+                        event_type,
+                    },
+                    frame_len,
+                )
+            }
+            event => (OutboundTelemetryKind::Event(event), 32),
+        };
+        *counters.entry((client, kind)).or_default() += 1;
+        if frame_len == 0 || frame_len > frame.len() {
+            break;
+        }
+        offset += frame_len;
+    }
+}
 
 /// Build a deduped client-id list of every client that selected at
 /// least one of the bits in `mask_bits` on `window`.
@@ -144,6 +241,7 @@ where
         let order = client.byte_order;
         let mut buf = Vec::with_capacity(32);
         encode(&mut buf, seq, order);
+        record_outbound_telemetry(*cid, order, &buf);
         match client_io::write_or_buffer(client, &buf) {
             Ok(WriteOutcome::Done | WriteOutcome::WouldBlock) => {}
             Ok(WriteOutcome::Disconnect) => disconnected.push(*cid),
@@ -644,6 +742,7 @@ pub fn fanout_raw_event_to_clients(
         };
         buf[2] = seq_bytes[0];
         buf[3] = seq_bytes[1];
+        record_outbound_telemetry(*cid, recipient_order, &buf);
         match client_io::write_or_buffer(client, &buf) {
             Ok(WriteOutcome::Done | WriteOutcome::WouldBlock) => {}
             Ok(WriteOutcome::Disconnect) => disconnected.push(*cid),

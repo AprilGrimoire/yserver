@@ -59,6 +59,11 @@ pub(crate) struct CursorRecord {
     /// premultiplied) so the HW dumb-buffer and the SW pixmap
     /// agree on sample values byte-for-byte.
     pub(crate) bgra_bytes: Vec<u8>,
+    /// Pixel roles retained for core monochrome cursors so
+    /// `RecolorCursor` can regenerate the sprite even when the original
+    /// foreground and background colors were identical. `None` identifies
+    /// an ARGB/RENDER cursor, for which recoloring is intentionally ignored.
+    pub(crate) color_roles: Option<Vec<CursorColorRole>>,
     /// Monotonically-increasing version (compared by value, never
     /// by Arc identity). Consumed by Phase B/C's upload-dedup path.
     pub(crate) version: u64,
@@ -84,9 +89,90 @@ impl CursorRecord {
             hot_x,
             hot_y,
             bgra_bytes,
+            color_roles: None,
             version,
         })
     }
+
+    pub(crate) fn new_monochrome(
+        width: u16,
+        height: u16,
+        hot_x: u16,
+        hot_y: u16,
+        color_roles: Vec<CursorColorRole>,
+        fore: (u16, u16, u16),
+        back: (u16, u16, u16),
+        version: u64,
+    ) -> Arc<Self> {
+        let bgra_bytes = color_roles_to_bgra(&color_roles, fore, back);
+        Self::new_monochrome_with_bgra(
+            width,
+            height,
+            hot_x,
+            hot_y,
+            bgra_bytes,
+            color_roles,
+            version,
+        )
+    }
+
+    pub(crate) fn new_monochrome_with_bgra(
+        width: u16,
+        height: u16,
+        hot_x: u16,
+        hot_y: u16,
+        bgra_bytes: Vec<u8>,
+        color_roles: Vec<CursorColorRole>,
+        version: u64,
+    ) -> Arc<Self> {
+        debug_assert_eq!(color_roles.len(), usize::from(width) * usize::from(height));
+        debug_assert_eq!(bgra_bytes.len(), color_roles.len() * 4);
+        Arc::new(Self {
+            width,
+            height,
+            hot_x,
+            hot_y,
+            bgra_bytes,
+            color_roles: Some(color_roles),
+            version,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CursorColorRole {
+    Transparent,
+    Foreground,
+    Background,
+}
+
+pub(crate) fn color_roles_to_bgra(
+    roles: &[CursorColorRole],
+    fore: (u16, u16, u16),
+    back: (u16, u16, u16),
+) -> Vec<u8> {
+    let foreground = [
+        (fore.2 >> 8) as u8,
+        (fore.1 >> 8) as u8,
+        (fore.0 >> 8) as u8,
+    ];
+    let background = [
+        (back.2 >> 8) as u8,
+        (back.1 >> 8) as u8,
+        (back.0 >> 8) as u8,
+    ];
+    let mut bgra = vec![0; roles.len() * 4];
+    for (i, role) in roles.iter().enumerate() {
+        let offset = i * 4;
+        let color = match role {
+            CursorColorRole::Transparent => continue,
+            CursorColorRole::Foreground => foreground,
+            CursorColorRole::Background => background,
+        };
+        bgra[offset..offset + 3].copy_from_slice(&color);
+        bgra[offset + 3] = 0xff;
+    }
+    bgra
 }
 
 /// One frame of a RENDER animated cursor (spec
@@ -207,6 +293,7 @@ pub(crate) fn unpack_wire_bitmap_to_r8(packed: &[u8], width: u16, height: u16) -
 ///   * mask supplied → pixel visible iff mask bit set; visible pixels
 ///     carry `fore` if source bit set else `back`.
 ///   * mask = None   → all pixels visible; same fore/back gating.
+#[cfg(test)]
 pub(crate) fn rasterise_create_cursor(
     src_bytes: &[u8],
     src_w: u16,
@@ -215,17 +302,27 @@ pub(crate) fn rasterise_create_cursor(
     fore: (u16, u16, u16),
     back: (u16, u16, u16),
 ) -> Vec<u8> {
+    rasterise_create_cursor_with_roles(src_bytes, src_w, src_h, mask_bytes, fore, back).bgra_bytes
+}
+
+pub(crate) struct MonochromeCursorImage {
+    pub(crate) bgra_bytes: Vec<u8>,
+    pub(crate) color_roles: Vec<CursorColorRole>,
+}
+
+pub(crate) fn rasterise_create_cursor_with_roles(
+    src_bytes: &[u8],
+    src_w: u16,
+    src_h: u16,
+    mask_bytes: Option<&[u8]>,
+    fore: (u16, u16, u16),
+    back: (u16, u16, u16),
+) -> MonochromeCursorImage {
     let w = usize::from(src_w);
     let h = usize::from(src_h);
     let pixel_count = w * h;
-    let fr = (fore.0 >> 8) as u8;
-    let fg = (fore.1 >> 8) as u8;
-    let fb = (fore.2 >> 8) as u8;
-    let br = (back.0 >> 8) as u8;
-    let bg = (back.1 >> 8) as u8;
-    let bb = (back.2 >> 8) as u8;
-    let mut argb = vec![0u8; pixel_count * 4];
-    for i in 0..pixel_count {
+    let mut roles = vec![CursorColorRole::Transparent; pixel_count];
+    for (i, role) in roles.iter_mut().enumerate() {
         let src_set = src_bytes.get(i).copied().unwrap_or(0) != 0;
         let visible = match mask_bytes {
             Some(mb) => mb.get(i).copied().unwrap_or(0) != 0,
@@ -234,19 +331,17 @@ pub(crate) fn rasterise_create_cursor(
         if !visible {
             continue;
         }
-        let off = i * 4;
-        if src_set {
-            argb[off] = fb;
-            argb[off + 1] = fg;
-            argb[off + 2] = fr;
+        *role = if src_set {
+            CursorColorRole::Foreground
         } else {
-            argb[off] = bb;
-            argb[off + 1] = bg;
-            argb[off + 2] = br;
-        }
-        argb[off + 3] = 0xFF;
+            CursorColorRole::Background
+        };
     }
-    argb
+    let bgra_bytes = color_roles_to_bgra(&roles, fore, back);
+    MonochromeCursorImage {
+        bgra_bytes,
+        color_roles: roles,
+    }
 }
 
 /// Glyph cursor rasterisation result. Returned by
@@ -258,6 +353,7 @@ pub(crate) struct GlyphCursorImage {
     pub(crate) hot_x: u16,
     pub(crate) hot_y: u16,
     pub(crate) bgra_bytes: Vec<u8>,
+    pub(crate) color_roles: Vec<CursorColorRole>,
 }
 
 /// A single FreeType-rendered glyph used as input to glyph-cursor
@@ -304,13 +400,6 @@ pub(crate) fn rasterise_glyph_cursor(
     let hot_x = (-left).clamp(0, i32::from(u16::MAX)) as u16;
     let hot_y = top.clamp(0, i32::from(u16::MAX)) as u16;
 
-    let fr = (fore.0 >> 8) as u8;
-    let fg = (fore.1 >> 8) as u8;
-    let fb = (fore.2 >> 8) as u8;
-    let br = (back.0 >> 8) as u8;
-    let bg = (back.1 >> 8) as u8;
-    let bb = (back.2 >> 8) as u8;
-
     let read_bit = |pixels: &[u8], w: i32, h: i32, x: i32, y: i32| -> bool {
         if x < 0 || y < 0 || x >= w || y >= h {
             return false;
@@ -323,7 +412,7 @@ pub(crate) fn rasterise_glyph_cursor(
     let mask_off = mask.as_ref().map(|m| (m.lsb - left, top - m.top));
 
     let pixel_count = (pixmap_w as usize) * (pixmap_h as usize);
-    let mut argb = vec![0u8; pixel_count * 4];
+    let mut color_roles = vec![CursorColorRole::Transparent; pixel_count];
     for y in 0..pixmap_h as i32 {
         for x in 0..pixmap_w as i32 {
             let src_set = read_bit(
@@ -342,25 +431,22 @@ pub(crate) fn rasterise_glyph_cursor(
             if !visible {
                 continue;
             }
-            let off = ((y as u32 * pixmap_w + x as u32) * 4) as usize;
-            if src_set {
-                argb[off] = fb;
-                argb[off + 1] = fg;
-                argb[off + 2] = fr;
+            let off = (y as u32 * pixmap_w + x as u32) as usize;
+            color_roles[off] = if src_set {
+                CursorColorRole::Foreground
             } else {
-                argb[off] = bb;
-                argb[off + 1] = bg;
-                argb[off + 2] = br;
-            }
-            argb[off + 3] = 0xFF;
+                CursorColorRole::Background
+            };
         }
     }
+    let bgra_bytes = color_roles_to_bgra(&color_roles, fore, back);
     GlyphCursorImage {
         width: pixmap_w.min(u32::from(u16::MAX)) as u16,
         height: pixmap_h.min(u32::from(u16::MAX)) as u16,
         hot_x,
         hot_y,
-        bgra_bytes: argb,
+        bgra_bytes,
+        color_roles,
     }
 }
 
@@ -377,6 +463,23 @@ mod tests {
         assert_eq!(rec.hot_y, 2);
         assert_eq!(rec.version, 42);
         assert_eq!(rec.bgra_bytes.len(), 4 * 4 * 4);
+    }
+
+    #[test]
+    fn monochrome_roles_recolor_even_when_original_colors_match() {
+        let roles = vec![
+            CursorColorRole::Transparent,
+            CursorColorRole::Foreground,
+            CursorColorRole::Background,
+        ];
+        let same = (0xaaaa, 0xbbbb, 0xcccc);
+        let record = CursorRecord::new_monochrome(3, 1, 0, 0, roles.clone(), same, same, 1);
+        assert_eq!(&record.bgra_bytes[4..8], &record.bgra_bytes[8..12]);
+
+        let recolored = color_roles_to_bgra(&roles, (0xff00, 0, 0), (0, 0, 0xff00));
+        assert_eq!(&recolored[0..4], &[0, 0, 0, 0]);
+        assert_eq!(&recolored[4..8], &[0, 0, 0xff, 0xff]);
+        assert_eq!(&recolored[8..12], &[0xff, 0, 0, 0xff]);
     }
 
     /// Replacing a record never mutates the old Arc's bytes — load-

@@ -35,11 +35,35 @@ use ash::vk;
 
 use crate::kms::{render::batch_resource::BatchResource, vk::device::VkContext};
 
-/// Per-bucket cap. 32 BGRA8 256×256 images is 8 MB per bucket
-/// (post-MAX_POOLED_DIM=256 bump 2026-05-26); across ~4–8 active
-/// buckets the worst-case pool memory is ~32–64 MB — comparable to
-/// Mesa's default userspace BO cache budget.
-pub const PIXMAP_POOL_BUCKET_CAP: usize = 32;
+/// Per-bucket **memory** budget, from which the per-bucket entry cap
+/// is derived by [`PixmapPool::bucket_cap`]. 8 MiB is exactly what the
+/// previous flat 32-entry cap already permitted for the largest
+/// poolable BGRA8 entry (32 × 256 × 256 × 4), so worst-case
+/// per-bucket memory is unchanged; what changes is that *smaller*
+/// entries now get proportionally deeper buckets instead of being
+/// capped at a count that only ever made sense for 256×256.
+///
+/// Why this matters (measured, 2026-07-27, silence dual-output MATE
+/// drag under adapta-nokto): the theme churns 230×51 / 230×57 /
+/// 230×26 BGRA8 menu-row intermediates — 430,882 of 439,177
+/// `CreatePixmap` in the matched Xorg xtrace. At 46,920 B/entry the
+/// flat 32-cap held only 1.5 MB of a possible 8 MB, so ~1,800
+/// returns/sec were rejected `bucket_full`, and that number showed up
+/// 1:1 as ~1,800 `takes_miss`/sec — kernel `vkCreateImage` +
+/// `vkAllocateMemory` round trips the pool exists to avoid, on the
+/// hot path of a drag.
+pub const PIXMAP_POOL_BUCKET_BUDGET_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Floor for the derived per-bucket cap, so an entry larger than the
+/// whole budget still keeps a usable bucket instead of degenerating
+/// to zero (which would disable pooling for that key entirely).
+pub const PIXMAP_POOL_BUCKET_CAP_MIN: usize = 32;
+
+/// Ceiling for the derived per-bucket cap. Tiny entries would other-
+/// wise permit thousands per bucket; the real cost there is not
+/// memory but live `VkImage`/`VkImageView` handle count and
+/// `VecDeque` growth, which this bounds.
+pub const PIXMAP_POOL_BUCKET_CAP_MAX: usize = 256;
 
 /// Pixmaps with `width > MAX_POOLED_DIM || height > MAX_POOLED_DIM`
 /// skip the pool. Above this size reuse rates drop and per-entry
@@ -100,6 +124,22 @@ pub struct PixmapPoolStats {
 /// with `PixmapPoolStats::total_returns_rejected_oversize_by_bucket`.
 /// The last entry (`u32::MAX`) is the "everything else" catch-all.
 pub const OVERSIZE_BIN_THRESHOLDS: [u32; 4] = [256, 512, 1024, u32::MAX];
+
+/// Bytes per pixel for the formats server-owned pixmaps are allocated
+/// in (depth 1 → `R8_UNORM`, depth 24/32 → `B8G8R8A8_UNORM`). Only
+/// used to size pool buckets, so an unrecognised format falls back to
+/// 4 — the common case, and an over-estimate merely yields a shallower
+/// bucket rather than an over-budget one.
+#[must_use]
+pub fn format_bytes_per_pixel(format: vk::Format) -> u32 {
+    match format {
+        vk::Format::R8_UNORM | vk::Format::R8_UINT | vk::Format::S8_UINT => 1,
+        vk::Format::R8G8_UNORM | vk::Format::R16_UNORM | vk::Format::R5G6B5_UNORM_PACK16 => 2,
+        vk::Format::R16G16B16A16_UNORM | vk::Format::R16G16B16A16_SFLOAT => 8,
+        vk::Format::R32G32B32A32_SFLOAT | vk::Format::R32G32B32A32_UINT => 16,
+        _ => 4,
+    }
+}
 
 /// Map `max(width, height)` to its `OVERSIZE_BIN_THRESHOLDS` index.
 #[must_use]
@@ -174,6 +214,26 @@ impl PixmapPool {
         key.width <= MAX_POOLED_DIM && key.height <= MAX_POOLED_DIM
     }
 
+    /// Per-bucket entry cap for `key`, derived from
+    /// [`PIXMAP_POOL_BUCKET_BUDGET_BYTES`] so every bucket costs about
+    /// the same *memory* rather than holding the same *count*. Clamped
+    /// to [`PIXMAP_POOL_BUCKET_CAP_MIN`]..=[`PIXMAP_POOL_BUCKET_CAP_MAX`].
+    ///
+    /// Pure function of the key — the pool's sizing policy is unit
+    /// tested without a Vulkan device.
+    #[must_use]
+    pub fn bucket_cap(key: PixmapPoolKey) -> usize {
+        let entry_bytes = u64::from(key.width)
+            .saturating_mul(u64::from(key.height))
+            .saturating_mul(u64::from(format_bytes_per_pixel(key.format)))
+            // A zero-extent key costs no memory; `max(1)` keeps the
+            // division defined and lands it on the ceiling below.
+            .max(1);
+        let by_budget = PIXMAP_POOL_BUCKET_BUDGET_BYTES / entry_bytes;
+        let by_budget = usize::try_from(by_budget).unwrap_or(PIXMAP_POOL_BUCKET_CAP_MAX);
+        by_budget.clamp(PIXMAP_POOL_BUCKET_CAP_MIN, PIXMAP_POOL_BUCKET_CAP_MAX)
+    }
+
     /// Take a recycled entry for `key`, or `None` if the bucket is
     /// empty.
     pub fn try_take(&self, key: PixmapPoolKey) -> Option<PooledPixmapImage> {
@@ -214,8 +274,9 @@ impl PixmapPool {
             .buckets
             .lock()
             .expect("pixmap pool buckets mutex poisoned");
+        let cap = Self::bucket_cap(key);
         let bucket = buckets.entry(key).or_default();
-        if bucket.len() >= PIXMAP_POOL_BUCKET_CAP {
+        if bucket.len() >= cap {
             self.stats
                 .lock()
                 .expect("pixmap pool stats mutex poisoned")
@@ -352,6 +413,93 @@ mod tests {
             height: MAX_POOLED_DIM + 1,
             format: vk::Format::B8G8R8A8_UNORM,
         }));
+    }
+
+    /// The 2026-07-27 MATE/adapta-nokto drag capture is the sizing
+    /// oracle here: the theme churns 230×51 / 230×57 / 230×26 BGRA8
+    /// menu-row intermediates (430,882 of 439,177 CreatePixmap in the
+    /// matched Xorg xtrace), and the flat 32-entry cap rejected
+    /// ~1,800 returns/sec as bucket-full — which showed up 1:1 as
+    /// ~1,800 takes_miss/sec, i.e. kernel image allocations the pool
+    /// existed to avoid.
+    #[test]
+    fn bucket_cap_is_deep_for_the_measured_menu_row_size() {
+        let key = PixmapPoolKey {
+            width: 230,
+            height: 51,
+            format: vk::Format::B8G8R8A8_UNORM,
+        };
+        // 230*51*4 = 46_920 B/entry; 8 MiB / 46_920 = 178.
+        assert_eq!(PixmapPool::bucket_cap(key), 178);
+    }
+
+    /// The budget is calibrated so the largest poolable BGRA8 entry
+    /// keeps exactly the historical cap — the change must not grow
+    /// worst-case per-bucket memory beyond what 32×256×256×4 already
+    /// allowed.
+    #[test]
+    fn bucket_cap_at_max_pooled_dim_matches_legacy_flat_cap() {
+        let key = PixmapPoolKey {
+            width: MAX_POOLED_DIM,
+            height: MAX_POOLED_DIM,
+            format: vk::Format::B8G8R8A8_UNORM,
+        };
+        assert_eq!(PixmapPool::bucket_cap(key), 32);
+        // And the budget it derives from is the same 8 MiB the flat
+        // cap implied for this size.
+        assert_eq!(
+            PIXMAP_POOL_BUCKET_BUDGET_BYTES,
+            32 * u64::from(MAX_POOLED_DIM) * u64::from(MAX_POOLED_DIM) * 4,
+        );
+    }
+
+    #[test]
+    fn bucket_cap_scales_inversely_with_bytes_per_entry() {
+        let bgra = PixmapPoolKey {
+            width: MAX_POOLED_DIM,
+            height: MAX_POOLED_DIM,
+            format: vk::Format::B8G8R8A8_UNORM,
+        };
+        let r8 = PixmapPoolKey {
+            format: vk::Format::R8_UNORM,
+            ..bgra
+        };
+        // Same extent, 1/4 the bytes per pixel → 4× the entries.
+        assert_eq!(PixmapPool::bucket_cap(r8), 4 * PixmapPool::bucket_cap(bgra));
+    }
+
+    #[test]
+    fn bucket_cap_clamps_tiny_entries_to_the_count_ceiling() {
+        let key = PixmapPoolKey {
+            width: 16,
+            height: 16,
+            format: vk::Format::B8G8R8A8_UNORM,
+        };
+        // 8 MiB / 1_024 B = 8_192 entries by budget; the count
+        // ceiling bounds handle/VecDeque growth instead.
+        assert_eq!(PixmapPool::bucket_cap(key), PIXMAP_POOL_BUCKET_CAP_MAX);
+    }
+
+    #[test]
+    fn bucket_cap_never_drops_below_the_floor() {
+        // A hypothetical entry far larger than the budget still keeps
+        // a usable bucket rather than degenerating to zero.
+        let key = PixmapPoolKey {
+            width: MAX_POOLED_DIM,
+            height: MAX_POOLED_DIM,
+            format: vk::Format::R32G32B32A32_SFLOAT, // 16 B/px
+        };
+        assert_eq!(PixmapPool::bucket_cap(key), PIXMAP_POOL_BUCKET_CAP_MIN);
+    }
+
+    #[test]
+    fn bucket_cap_handles_zero_extent_without_dividing_by_zero() {
+        let key = PixmapPoolKey {
+            width: 0,
+            height: 0,
+            format: vk::Format::B8G8R8A8_UNORM,
+        };
+        assert_eq!(PixmapPool::bucket_cap(key), PIXMAP_POOL_BUCKET_CAP_MAX);
     }
 
     #[test]

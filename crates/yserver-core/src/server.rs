@@ -15,7 +15,7 @@ use yserver_protocol::x11::{
 };
 
 use crate::{
-    randr::{RandrOutput, RandrState},
+    randr::{RandrOutput, RandrOutputProperty, RandrState},
     resources::{COMPOSITE_OVERLAY_WINDOW, ROOT_WINDOW, ResourceTable},
 };
 
@@ -33,6 +33,15 @@ pub const PER_CLIENT_MASK: u32 = 0x000F_FFFF;
 /// `DevicePropertyNotify` (XI1 event code 16) therefore lives at
 /// `XI_FIRST_EVENT + XI_DEVICE_PROPERTY_NOTIFY_OFFSET = 82`.
 pub(crate) const XI_FIRST_EVENT: u8 = crate::nested::XI2_FIRST_EVENT;
+
+/// One root-coordinate sample in the bounded pointer motion history shared by
+/// core GetMotionEvents and XI1 GetDeviceMotionEvents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PointerMotionRecord {
+    pub time: u32,
+    pub root_x: i16,
+    pub root_y: i16,
+}
 
 #[derive(Debug)]
 pub struct IdAllocator {
@@ -808,11 +817,21 @@ pub struct ServerState {
     pub atoms: AtomTable,
     pub resources: ResourceTable,
     pub clients: HashMap<u32, ClientState>,
+    /// Client currently holding the core `GrabServer` lock. The core loop
+    /// parks requests from every other client until this owner issues
+    /// `UngrabServer` or disconnects, matching Xorg's `grabClient` /
+    /// `grabWaiters` scheduling model.
+    pub server_grab_owner: Option<ClientId>,
     pub id_allocator: IdAllocator,
     pub start_instant: Instant,
     pub randr: RandrState,
     /// RANDR event masks selected via RRSelectInput: (client, window) -> mask.
     pub randr_select_masks: HashMap<(u32, ResourceId), u16>,
+    /// Client-set RANDR output properties (`RRChangeOutputProperty` /
+    /// `RRConfigureOutputProperty`), keyed by output id then property atom.
+    /// See [`RandrOutputProperty`] for why this lives beside `randr` rather
+    /// than inside `RandrState`.
+    pub randr_output_properties: HashMap<u32, Vec<(AtomId, RandrOutputProperty)>>,
     /// XKB SelectEvents masks: (client, device spec) -> selected event mask.
     pub xkb_select_event_masks: HashMap<(u32, u16), u16>,
     /// Selection ownership: maps selection atom → (owning window,
@@ -903,6 +922,9 @@ pub struct ServerState {
     /// Re-entrancy / bypass guard for synthetic pointer motion used
     /// by warps and barrier corrective warps.
     pub barrier_bypass: bool,
+    /// Last 256 translated pointer-motion samples. Recording happens once at
+    /// the authoritative pointer fanout boundary after confinement/barriers.
+    pub pointer_motion_history: std::collections::VecDeque<PointerMotionRecord>,
     /// Most recent input event timestamp seen by either fanout —
     /// stands in for "current server time" in XI1 grab time checks.
     pub xi1_last_input_time: u32,
@@ -964,6 +986,9 @@ pub struct ServerState {
     /// at request time; drained at vblank by the KMS backend
     /// (live integration lands with §5.5 hardware coverage).
     pub present_scheduler: crate::present_scheduler::PresentScheduler,
+    /// PresentPixmap copies parked until an imported dma-buf's producer
+    /// sync-file becomes readable. Keyed by the backend-owned wait id.
+    pub pending_present_pixmaps: HashMap<u64, PendingPresentPixmap>,
     pub sync_counters: HashMap<u32, SyncCounter>,
     pub sync_alarms: HashMap<u32, SyncAlarm>,
     /// Per-XI2-master-device idle clock. Key = device id (VCP=2, VCK=3
@@ -1194,10 +1219,12 @@ impl ServerState {
             atoms,
             resources,
             clients: HashMap::new(),
+            server_grab_owner: None,
             id_allocator: IdAllocator::new(),
             start_instant: Instant::now(),
             randr: RandrState::nested(0, width, height),
             randr_select_masks: HashMap::new(),
+            randr_output_properties: HashMap::new(),
             xkb_select_event_masks: HashMap::new(),
             selections: HashMap::new(),
             pointer_root: (0, 0),
@@ -1222,6 +1249,7 @@ impl ServerState {
             buttons_down: 0,
             confine_warp_active: false,
             barrier_bypass: false,
+            pointer_motion_history: std::collections::VecDeque::new(),
             xi1_last_input_time: 0,
             xi1_frozen: HashMap::new(),
             xi1_device_focus: HashMap::new(),
@@ -1238,6 +1266,7 @@ impl ServerState {
             shape_windows: HashMap::new(),
             shape_select_masks: HashMap::new(),
             present_scheduler: crate::present_scheduler::PresentScheduler::default(),
+            pending_present_pixmaps: HashMap::new(),
             sync_counters: HashMap::new(),
             sync_alarms: HashMap::new(),
             per_device_last_activity: HashMap::new(),
@@ -1574,6 +1603,22 @@ impl Default for ServerState {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct PendingPresentPixmap {
+    pub origin: Option<crate::backend::OriginContext>,
+    pub client_id: ClientId,
+    pub request: x11::present::PixmapRequest,
+    pub masked_options: u32,
+    pub src_host_xid: u32,
+    pub paint_dst_host_xid: u32,
+    pub completion_dst_host_xid: u32,
+    pub src_width: u16,
+    pub src_height: u16,
+    /// `None` means a full-pixmap copy. `Some(empty)` is an existing empty
+    /// update region and intentionally copies no pixels.
+    pub update_rects: Option<Vec<xfixes::RegionRect>>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct XFixesRegion {
     pub owner: ClientId,
@@ -1874,13 +1919,13 @@ pub struct ClientState {
     /// `SelectExtensionEvent` (XInput minor 6). Each class encodes
     /// `(deviceid << 8) | event_code` where `event_code` is one of the
     /// 17 XInput event types at `XI_FIRST_EVENT..=XI_FIRST_EVENT + 16`.
-    /// Classes are stored verbatim — the XI1 events delivered from this
-    /// set (`DevicePropertyNotify`) are device-scoped, not
-    /// window-scoped, so the request's `window` argument is ignored.
+    /// This is a delivery-oriented aggregate of the server-wide
+    /// notifications selected in `xi1_window_event_classes`. The canonical
+    /// per-window state lives there so GetSelectedExtensionEvents can report
+    /// the selection accurately.
     pub xi1_event_classes: HashSet<u32>,
-    /// XI1 *input*-event classes per window — DeviceKeyPress through
-    /// DeviceMotionNotify select like core input events: per window,
-    /// delivered by walking the event window's ancestor chain
+    /// Canonical XI1 event classes per window. DeviceKeyPress through
+    /// DeviceMotionNotify are delivered by walking the event window's ancestor chain
     /// (Xorg dix `DeliverDeviceEvents`). Key: window; value: the
     /// selected `XEventClass` values for it.
     pub xi1_window_event_classes: HashMap<ResourceId, HashSet<u32>>,
@@ -1898,6 +1943,27 @@ pub struct ClientState {
     pub reader_control: Option<crossbeam_channel::Sender<ReaderControl>>,
 }
 
+/// XI1 notifications which yserver fans out server-wide after a client
+/// selects them on any window. The canonical selection remains per window.
+pub(crate) fn xi1_class_is_global_notification(class: u32) -> bool {
+    #[allow(clippy::cast_possible_truncation)]
+    let event_code = class as u8;
+    event_code == XI_FIRST_EVENT + crate::xinput::XI_DEVICE_PROPERTY_NOTIFY_OFFSET
+        || event_code == XI_FIRST_EVENT + crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET
+        || event_code == XI_FIRST_EVENT + crate::xinput::XI_CHANGE_DEVICE_NOTIFY_OFFSET
+}
+
+impl ClientState {
+    pub(crate) fn rebuild_xi1_global_event_classes(&mut self) {
+        self.xi1_event_classes = self
+            .xi1_window_event_classes
+            .values()
+            .flat_map(|set| set.iter().copied())
+            .filter(|class| xi1_class_is_global_notification(*class))
+            .collect();
+    }
+}
+
 /// Messages the core sends to a per-client reader thread.
 ///
 /// `Apply`/`Ignore` are the BigRequests barrier: the reader pauses
@@ -1911,6 +1977,9 @@ pub enum ReaderControl {
     /// Enable was malformed or the reply path errored; reader
     /// resumes with the previous `big` value.
     IgnoreBigRequests,
+    /// One previously accepted request has left the core's pending queues.
+    /// Return its wire-size budget so the reader may accept more socket data.
+    GrantRequestBytes(usize),
     Shutdown,
 }
 
@@ -2303,7 +2372,12 @@ impl ServerState {
         for client in self.clients.values_mut() {
             for w in windows {
                 client.event_masks.remove(w);
+                client.xi1_window_event_classes.remove(w);
             }
+            client
+                .xi2_masks
+                .retain(|(window, _), _| !windows.contains(window));
+            client.rebuild_xi1_global_event_classes();
         }
     }
 
@@ -3613,6 +3687,10 @@ mod tests {
     #[test]
     fn drop_window_subscriptions_removes_entries_for_destroyed_windows() {
         let mut state = ServerState::new();
+        let xi1_class_dev4 =
+            (4 << 8) | u32::from(XI_FIRST_EVENT + crate::xinput::XI_DEVICE_PROPERTY_NOTIFY_OFFSET);
+        let xi1_class_dev5 =
+            (5 << 8) | u32::from(XI_FIRST_EVENT + crate::xinput::XI_DEVICE_PROPERTY_NOTIFY_OFFSET);
         state.clients.insert(
             1,
             ClientState {
@@ -3627,9 +3705,15 @@ mod tests {
                 ]),
                 save_set: HashSet::new(),
                 big_requests_enabled: false,
-                xi2_masks: HashMap::new(),
-                xi1_event_classes: HashSet::new(),
-                xi1_window_event_classes: HashMap::new(),
+                xi2_masks: HashMap::from([
+                    ((ResourceId(0x100), 4), 1),
+                    ((ResourceId(0x200), 5), 1),
+                ]),
+                xi1_event_classes: HashSet::from([xi1_class_dev4, xi1_class_dev5]),
+                xi1_window_event_classes: HashMap::from([
+                    (ResourceId(0x100), HashSet::from([xi1_class_dev4])),
+                    (ResourceId(0x200), HashSet::from([xi1_class_dev5])),
+                ]),
                 outbound: std::collections::VecDeque::new(),
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
@@ -3641,6 +3725,20 @@ mod tests {
         assert!(state.subscribers(ResourceId(0x100), 0x0040_0000).is_empty());
         // Surviving window's subscription stays.
         assert_eq!(state.subscribers(ResourceId(0x200), 0x0040_0000).len(), 1);
+        let client = state.clients.get(&1).unwrap();
+        assert!(!client.xi2_masks.contains_key(&(ResourceId(0x100), 4)));
+        assert!(client.xi2_masks.contains_key(&(ResourceId(0x200), 5)));
+        assert!(
+            !client
+                .xi1_window_event_classes
+                .contains_key(&ResourceId(0x100))
+        );
+        assert!(
+            client
+                .xi1_window_event_classes
+                .contains_key(&ResourceId(0x200))
+        );
+        assert_eq!(client.xi1_event_classes, HashSet::from([xi1_class_dev5]));
     }
 
     #[test]

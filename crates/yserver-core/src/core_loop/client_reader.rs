@@ -16,6 +16,13 @@
 //! `IgnoreBigRequests` (leave `big` unchanged). `Shutdown` causes the
 //! reader to exit immediately and also unparks barrier waits.
 //!
+//! Ingress backpressure: each reader may have only
+//! [`MAX_IN_FLIGHT_BYTES_PER_CLIENT`] accepted request bytes outstanding. Once
+//! those credits are consumed it stops reading the socket until the core
+//! dispatches a request and returns `GrantRequestBytes`. This keeps a hot
+//! client in the kernel socket instead of draining it into an unbounded
+//! userspace queue, matching the natural backpressure of Xorg's dispatch loop.
+//!
 //! Disconnect path: any `read_request` error (EOF, EPIPE, malformed
 //! framing) is reported back as `Message::ClientDisconnected`. The
 //! core then sends `ReaderControl::Shutdown` to the reader before
@@ -43,6 +50,36 @@ use crate::{
 
 /// X11 BigRequests `Enable` minor opcode (always 0 — see X.Org spec).
 pub const BIG_REQUESTS_ENABLE_MINOR: u8 = 0;
+
+/// Maximum ordinary request bytes one client may have accepted but not yet
+/// dispatched. This matches Xorg's 16 KiB initial per-client input buffer
+/// (`os/io.c::BUFSIZE`). A single request larger than the remaining budget is
+/// still framed, like Xorg growing its buffer for one complete large request;
+/// the reader then stops until that request's bytes are returned.
+pub const MAX_IN_FLIGHT_BYTES_PER_CLIENT: usize = 16 * 1024;
+
+#[derive(Debug, Default)]
+struct ReaderIngressWindow {
+    outstanding_bytes: usize,
+}
+
+impl ReaderIngressWindow {
+    fn can_read(&self) -> bool {
+        self.outstanding_bytes < MAX_IN_FLIGHT_BYTES_PER_CLIENT
+    }
+
+    fn accept(&mut self, bytes: usize) {
+        // One complete request may cross the window boundary, just as Xorg
+        // grows its input buffer to hold one request. Preserve that overshoot
+        // as outstanding debt; discarding it recreates unbounded read-ahead
+        // when variable-sized requests repeat in a shifted cycle.
+        self.outstanding_bytes = self.outstanding_bytes.saturating_add(bytes);
+    }
+
+    fn complete(&mut self, bytes: usize) {
+        self.outstanding_bytes = self.outstanding_bytes.saturating_sub(bytes);
+    }
+}
 
 /// Spawn the reader thread. Returns immediately; the thread runs
 /// until it observes EOF, an unrecoverable framing error, or
@@ -83,22 +120,39 @@ fn run(
     let mut reader = BlockingFdReader::new(FdReader::new(stream));
     let mut big = false;
     let mut sequence: u16 = 0;
+    let mut ingress = ReaderIngressWindow::default();
+    let telemetry_enabled = std::env::var_os("YSERVER_LOOP_TELEMETRY").is_some();
 
     loop {
-        // Drain any pending Shutdown without blocking before issuing
-        // the next blocking read.
-        match control_rx.try_recv() {
-            Ok(ReaderControl::Shutdown) => return Ok(()),
-            Ok(_) => {
-                // Stray Apply/Ignore outside the barrier window — bug;
-                // log and discard.
-                warn!(
-                    "client {}: stray ReaderControl outside BigRequests barrier",
-                    id.0
-                );
+        // Consume returned credits and observe Shutdown before reading again.
+        // If the credit window is exhausted, blocking here deliberately leaves
+        // subsequent bytes in the client socket so the producer is throttled.
+        loop {
+            let control = if !ingress.can_read() {
+                match control_rx.recv() {
+                    Ok(control) => control,
+                    Err(_) => return Ok(()),
+                }
+            } else {
+                match control_rx.try_recv() {
+                    Ok(control) => control,
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => return Ok(()),
+                }
+            };
+            match control {
+                ReaderControl::Shutdown => return Ok(()),
+                ReaderControl::GrantRequestBytes(bytes) => {
+                    ingress.complete(bytes);
+                }
+                ReaderControl::ApplyBigRequests | ReaderControl::IgnoreBigRequests => {
+                    // Apply/Ignore is valid only inside the barrier below.
+                    warn!(
+                        "client {}: stray ReaderControl outside BigRequests barrier",
+                        id.0
+                    );
+                }
             }
-            Err(TryRecvError::Empty) => {}
-            Err(TryRecvError::Disconnected) => return Ok(()),
         }
 
         let frame = match x11::read_request(&mut reader, byte_order, big) {
@@ -117,6 +171,10 @@ fn run(
             Err(e) => return Err(e),
         };
         let (header, mut body) = frame;
+        let request_bytes = usize::try_from(header.length_units)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(4)
+            .max(4);
         // Phase E: swap inbound BE-client request bodies in-place so the
         // rest of the dispatch path can decode bytes as little-endian.
         x11::request_swap::swap_request_body(header.opcode, header.data, byte_order, &mut body);
@@ -147,9 +205,11 @@ fn run(
         let is_enable =
             header.opcode == big_requests_major && header.data == BIG_REQUESTS_ENABLE_MINOR;
 
+        ingress.accept(request_bytes);
         sender.send(Message::Request {
             id,
             sequence: SequenceNumber(sequence),
+            accepted_at: telemetry_enabled.then(std::time::Instant::now),
             header,
             body,
             attached_fd: attached_fd.map(|raw| {
@@ -161,11 +221,18 @@ fn run(
 
         if is_enable {
             // Park until the core processes the Enable.
-            match control_rx.recv() {
-                Ok(ReaderControl::ApplyBigRequests) => big = true,
-                Ok(ReaderControl::IgnoreBigRequests) => { /* leave big as-is */ }
-                Ok(ReaderControl::Shutdown) => return Ok(()),
-                Err(_) => return Ok(()),
+            loop {
+                match control_rx.recv() {
+                    Ok(ReaderControl::ApplyBigRequests) => {
+                        big = true;
+                        break;
+                    }
+                    Ok(ReaderControl::IgnoreBigRequests) => break,
+                    Ok(ReaderControl::GrantRequestBytes(bytes)) => {
+                        ingress.complete(bytes);
+                    }
+                    Ok(ReaderControl::Shutdown) | Err(_) => return Ok(()),
+                }
             }
         }
     }
@@ -308,6 +375,122 @@ mod tests {
     }
 
     const BIG_MAJOR: u8 = 135;
+
+    #[test]
+    fn ingress_window_preserves_variable_request_overshoot_debt() {
+        let mut window = ReaderIngressWindow::default();
+        window.accept(MAX_IN_FLIGHT_BYTES_PER_CLIENT - 4);
+        assert!(window.can_read(), "four bytes of the window remain");
+
+        window.accept(20);
+        assert_eq!(
+            window.outstanding_bytes,
+            MAX_IN_FLIGHT_BYTES_PER_CLIENT + 16
+        );
+        assert!(!window.can_read());
+
+        // Completing a four-byte request must not erase the 16-byte
+        // overshoot. The old saturating available-credit implementation did,
+        // admitting another request on every shifted variable-size cycle.
+        window.complete(4);
+        assert_eq!(
+            window.outstanding_bytes,
+            MAX_IN_FLIGHT_BYTES_PER_CLIENT + 12
+        );
+        assert!(!window.can_read());
+
+        window.complete(13);
+        assert!(window.can_read());
+    }
+
+    #[test]
+    fn reader_credit_window_restores_socket_backpressure() {
+        let (poll, sender, rx) = channel().unwrap();
+        let _ = poll;
+        let (server_side, mut client_side) = UnixStream::pair().unwrap();
+        let (ctrl_tx, ctrl_rx) = unbounded::<ReaderControl>();
+
+        spawn(
+            ClientId(99),
+            server_side,
+            ClientByteOrder::LittleEndian,
+            BIG_MAJOR,
+            ctrl_rx,
+            sender,
+        )
+        .unwrap();
+
+        const REQUEST_BYTES: usize = 4;
+        let initial_requests = MAX_IN_FLIGHT_BYTES_PER_CLIENT / REQUEST_BYTES;
+        for _ in 0..(initial_requests + 16) {
+            write_request_no_body(&mut client_side, 42, 0, 1);
+        }
+
+        for _ in 0..initial_requests {
+            let message = recv_with_timeout(&rx, Duration::from_secs(2))
+                .expect("initial credit window request");
+            assert!(matches!(message, Message::Request { .. }));
+        }
+        assert!(
+            recv_with_timeout(&rx, Duration::from_millis(50)).is_none(),
+            "reader must stop draining after its per-client credits are exhausted"
+        );
+
+        ctrl_tx
+            .send(ReaderControl::GrantRequestBytes(REQUEST_BYTES))
+            .unwrap();
+        let message = recv_with_timeout(&rx, Duration::from_secs(2))
+            .expect("one returned credit admits one request");
+        assert!(matches!(message, Message::Request { .. }));
+        assert!(
+            recv_with_timeout(&rx, Duration::from_millis(50)).is_none(),
+            "one returned credit must not admit multiple requests"
+        );
+        ctrl_tx.send(ReaderControl::Shutdown).unwrap();
+    }
+
+    #[test]
+    fn reader_admits_one_request_larger_than_the_byte_window() {
+        let (poll, sender, rx) = channel().unwrap();
+        let _ = poll;
+        let (server_side, mut client_side) = UnixStream::pair().unwrap();
+        let (ctrl_tx, ctrl_rx) = unbounded::<ReaderControl>();
+        spawn(
+            ClientId(100),
+            server_side,
+            ClientByteOrder::LittleEndian,
+            BIG_MAJOR,
+            ctrl_rx,
+            sender,
+        )
+        .unwrap();
+
+        const LARGE_UNITS: u16 = 5 * 1024; // 20 KiB > Xorg's 16 KiB BUFSIZE.
+        write_request_no_body(&mut client_side, 42, 0, LARGE_UNITS);
+        client_side
+            .write_all(&vec![0; usize::from(LARGE_UNITS) * 4 - 4])
+            .unwrap();
+        write_request_no_body(&mut client_side, 42, 0, 1);
+
+        let large = recv_with_timeout(&rx, Duration::from_secs(2)).expect("large request");
+        assert!(matches!(
+            large,
+            Message::Request { header, .. } if header.length_units == u32::from(LARGE_UNITS)
+        ));
+        assert!(recv_with_timeout(&rx, Duration::from_millis(50)).is_none());
+
+        ctrl_tx
+            .send(ReaderControl::GrantRequestBytes(
+                usize::from(LARGE_UNITS) * 4,
+            ))
+            .unwrap();
+        let next = recv_with_timeout(&rx, Duration::from_secs(2)).expect("request after return");
+        assert!(matches!(
+            next,
+            Message::Request { header, .. } if header.length_units == 1
+        ));
+        ctrl_tx.send(ReaderControl::Shutdown).unwrap();
+    }
 
     #[test]
     fn enable_then_large_request_round_trip() {

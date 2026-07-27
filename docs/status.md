@@ -28,10 +28,87 @@ Earlier program docs are archived:
 Cross-cutting bugs and followups that don't fit a stage live in
 [`known-issues.md`](known-issues.md).
 
+The repository-wide code-quality and technical-debt review from 2026-07-26
+lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
+
 ---
 
 ## Where we are
 
+- **2026-07-26 protocol silent-success audit:** the first two phases and the
+  core-request classification portion of Phase 3 are complete on
+  `quality/protocol-stub-audit`. Reserved/unknown major opcodes and unknown
+  minor opcodes across every locally dispatched extension now return the same
+  `BadRequest` class as Xorg instead of logging and reporting success. GLX
+  retains its intentional extension-specific error. Wire regressions cover
+  error code, sequence, major opcode, and minor opcode. Defined request
+  numbers with partial/no-op implementations are deliberately separated from
+  unknown-request correctness. `GrabServer` now blocks other clients until
+  ungrab/disconnect, and `GetMotionEvents` validates its window before the
+  intentional empty-history reply. `RecolorCursor` rejects invalid cursor ids,
+  retains monochrome pixel roles for correct KMS recoloring, refreshes active
+  sprites, forwards through ynest, and leaves ARGB cursors unchanged as Xorg
+  does. Phase 3 is complete. Phase 4 has started: RANDR provider requests now
+  return `BadProvider` consistently with the empty advertised provider list,
+  eliminating four reply hangs, and `FreeLease` returns `BadLease` while no
+  leases can be created. RANDR reply paths now validate window/output/CRTC
+  resources with Xorg's error classes, and `SetOutputPrimary` updates tracked
+  state instead of silently succeeding. X-Resource now reports real
+  per-client pixmap storage and ClientXID identities rather than zero/empty
+  stubs; PID and recursive resource-size accounting remain open. XI1
+  `GetSelectedExtensionEvents` now returns real per-window this-client and
+  all-client class lists. Window teardown clears core, XI1, and XI2 masks
+  together, and the old blanket XI1 zero-stub marker has been replaced by
+  explicit follow-ups. `DeviceBell` now rejects yserver's bell-less feedbacks
+  with Xorg's `BadValue` instead of silently succeeding.
+  `ChangeFeedbackControl` now updates shared keyboard/pointer state for both
+  byte orders. Xorg confirms the synthetic relative axes' `0/0/0` resolution
+  range is correct; zero-resolution round trips and big-endian control changes
+  are covered. A bounded 256-sample history is recorded once after pointer
+  translation/confinement and serves both window-filtered core queries and
+  four-axis XI1 pointer queries. The XI1 audit subgroup is complete. XTEST
+  `CompareCursor` also uses real inherited/current cursor state instead of its
+  former hardcoded true reply. Plan:
+  [`2026-07-26-protocol-silent-success-audit.md`](superpowers/plans/2026-07-26-protocol-silent-success-audit.md).
+- **2026-07-25 asynchronous Present source waits (Warframe HW result):**
+  Warframe fullscreen testing showed that the old bounded CPU wait was not a
+  viable implicit-sync bridge: 50 ms stalled the single-threaded server, 1 ms
+  happened to work on one machine, and both 0 ms and 2 ms could copy a stale
+  frame. With compositing disabled the game image froze while input dispatch,
+  KMS flips, and Present copies continued, and every source wait timed out.
+  `PresentPixmap` now exports the imported dma-buf's READ sync-file, retains
+  the exact source drawable, and parks the copy until the fd is readable via
+  the existing Present-completion poller. The core then records the copy,
+  damage, and completion without ever blocking request/input dispatch. A 1 ms
+  timer remains only as a degraded fallback if poller registration fails.
+  Unit coverage pins both sync-file readiness and copy-after-readiness order.
+  Silence/RX580 fullscreen with Marco compositing both disabled and enabled
+  keeps unrelated game animations moving, but Warframe's drawn cursor and
+  pointer-driven parallax remain completely stationary. The 2026-07-25 trace
+  disproved an input-thread stall: fullscreen motion reached 100--125 events/s
+  with non-zero relative deltas, and RawMotion fanout included Warframe's
+  `steam_app_230410` client. Comparison with the saved Xorg Steam trace found
+  one concrete wire mismatch: Xorg's mieq master copy sends RawMotion with the
+  master pointer as `deviceid` and the physical slave as `sourceid`, while
+  yserver sent slave/slave. Yserver now sends master/slave. Live hardware
+  validation confirmed that this fixes Warframe's cursor completely: motion
+  and pointer-driven parallax track normally in fullscreen. A subsequent
+  workspace investigation initially looked like issue #98: after Marco hid the
+  game, Warframe sent `UnmapWindow` plus a synthetic root `UnmapNotify`, then
+  remapped; Marco therefore withdrew and re-managed it on the currently active
+  desktop. Alt-Tab on that desktop always recovered the game. An identical
+  right/left workspace test under Xorg produced the same behavior, so this is
+  Warframe/Marco parity and not evidence for a yserver visibility bug. Issue
+  #98 remains separate and needs a reproduction that differs from Xorg. The
+  captured lifecycle/EWMH/UnmapNotify/SendEvent sequence establishes the Xorg
+  comparison baseline without retaining the temporary server tracing. The
+  final capture also exposed 1,676 failed idle-syncobj signals across several
+  destroyed Vulkan child surfaces. The unused informational Present scheduler
+  retains historical, already-completed frames and teardown later treats them
+  as pending after their syncobjs have been freed; this is a separate
+  bookkeeping/lifetime bug. The dark rectangular line around Plank is also
+  tracked separately. Wezterm/Firefox still need live KMS revalidation of the
+  new source-wait path.
 - **2026-07-24 Raspberry Pi 4/400 bring-up:** raw Vulkan scanout remains
   unsupported because v3d rendering and vc4 display expose no mutually usable
   buffer path. The investigation produced three general improvements:
@@ -5112,3 +5189,157 @@ regressions. The final cleanup removed redundant KMS-side crossing-coordinate
 plumbing; core fanout is the single coordinate authority. The deferred-Present
 experiment remains absent. `cargo test -p yserver-core` passes 928 tests and
 `cargo clippy --all-targets -- -D warnings` is clean.
+
+## MATE adapta-nokto drag-lag telemetry (2026-07-27)
+
+**Status: DRAG FIX AND SERVER-GRAB ORDERING FIX HARDWARE-VERIFIED; INGRESS
+BOUND TELEMETRY-VERIFIED.** On bee, dragging
+the MATE Control Center under adapta-nokto repeatedly drove the global deferred
+request FIFO to approximately 65,536 entries while yserver processed roughly
+33–41K requests/s. That queue depth implies about 1.6–2.0 seconds of FIFO age
+for a later low-rate Marco `ConfigureWindow`, matching the observed stationary
+window followed by a delayed jump. Xorg also consumes high CPU in the same
+theme/application scenario, so the pathological client paint volume is real;
+the yserver-specific defect under investigation is starvation between clients.
+
+`YSERVER_LOOP_TELEMETRY=1` now reports current/peak deferred depth per client,
+maximum reader-accept-to-dispatch request age per client, the largest request
+batch drained from the shared channel and its dominant client, and accepted
+sequence-boundary counts for `0xffff` and `0x0000`. These counters distinguish
+a client/library burst aligned to the 16-bit X11 sequence epoch from any
+internal queue limit: yserver's crossbeam channel is unbounded. The next
+telemetry run showed that this is **not** one 65,536-request channel drain: the
+largest shared-channel drain was only 3,343 requests. One client (`c57`, the
+client whose arrival immediately starts the Control Center paint flood) did,
+however, own essentially the entire backlog, peaking at 64,863 deferred
+requests while repeatedly crossing both sequence `0xffff` and `0x0000`.
+Therefore the approximately 65K shape belongs to that client's outstanding
+workload/backpressure cycle rather than a yserver channel capacity.
+
+The request-age counter directly confirms cross-client starvation. During the
+same flood, `c57` requests reached 2.57 seconds old, while low-volume clients
+also reached 1.0–1.8 seconds despite core-loop iterations remaining mostly
+below 15 ms. This established the requirement for per-client round-robin
+request scheduling which preserves order within each client while preventing
+`c57`'s queued paint stream from sitting ahead of Marco and other clients.
+
+The leading explanation for why Control Center submits more work per second on
+yserver than on Xorg is ingress backpressure. Yserver gives every client a
+dedicated reader thread which continuously drains its Unix socket into an
+unbounded crossbeam channel; the core can therefore be seconds behind while the
+client still sees writable socket space and keeps generating paint work. Xorg's
+`Dispatch` loop instead selects a client and calls `ReadRequestFromClient`
+immediately before dispatching that request, with smart-scheduler yields between
+clients. An overloaded Xorg consequently stops draining the producer's socket
+and naturally throttles it. The measured approximately 65K accepted/deferred
+requests are direct evidence that yserver had removed this throttle. Both fair
+core dispatch and bounded per-client ingress are required so fairness does not
+merely move an ever-growing flood into memory.
+
+Server feedback may still explain part of the rate difference. The observed
+major-opcode ratio is approximately three RENDER requests (`op133`) for every
+`CreatePixmap`/`FreePixmap` pair, consistent with a GTK/Cairo temporary-surface
+clear cycle, but the first run did not retain RENDER minor opcodes or
+server-to-client traffic. Telemetry now reports per-client accepted versus
+dispatched counts, top major/minor request pairs, and attempted outbound replies,
+errors, core events, and GenericEvents. A matched yserver/Xorg run can therefore
+test for excess Expose, ConfigureNotify, motion/crossing, Damage/Present events,
+replies/errors, or a missing pacing interaction. This attribution is
+diagnostic-only and remains disabled unless `YSERVER_LOOP_TELEMETRY` is set.
+
+The follow-up hardware run confirms the ingress-backpressure explanation. Over
+31 one-second windows attributed to Control Center's `c57`, yserver accepted
+1,103,575 requests and dispatched 1,103,444, but intake arrived as a sawtooth:
+up to 97,034 requests were accepted in one second, followed by nine windows
+with zero `c57` ingress in which the core dispatched 320,972 requests already
+waiting in its queue. Individual burst windows accepted 68–97K requests while
+dispatching only 34–47K and again peaked near 65K deferred. This is the direct
+signature of the reader thread emptying the client socket far ahead of core
+dispatch, followed by the client/library's own burst boundary.
+
+The exact hot loop is `CreatePixmap`, RENDER `CreatePicture`, RENDER
+`FillRectangles`, RENDER `FreePicture`, `FreePixmap`; the five operations have
+near-identical counts, with minor imbalances caused by rollup-window boundaries.
+Outbound traffic does not show an excess Expose/Configure/Damage feedback loop.
+Only 7,693 outbound frames were attributed to `c57` during those windows versus
+1.10M incoming requests. Of those, 6,761 were event code 65, the normal MIT-SHM
+`ShmCompletion` used by GTK/GDK to release SHM buffers; both yserver and Xorg
+emit that completion after `ShmPutImage`. A completion can release a GTK frame
+buffer and therefore unlock a larger request batch, but there is no sign of
+duplicate completions or a separate Expose/Configure/Damage storm: its rate is
+the expected pacing feedback from processing more frames.
+
+The implementation replaces the global deferred FIFO with one FIFO per client
+and a round-robin ready ring. Each turn dispatches one request from a ready
+client, preserving that client's wire order while bounding how long Marco can
+wait behind Control Center. Requests blocked by another client's `GrabServer`
+remain subject to the same per-client ordering invariant. The existing
+32-request/8-ms outer-loop budget still bounds request work relative to input,
+page flips, and other maintenance.
+
+Each reader now starts with a 16 KiB byte-credit window, matching Xorg's initial
+per-client input `BUFSIZE`. Framing a request consumes its wire length; the core
+returns those bytes only after that request leaves dispatch. A single request
+larger than the remaining window is still admitted before the balance reaches
+zero, matching Xorg's grow-buffer behavior for one complete request. An
+exhausted reader blocks on its control channel before reading again, leaving
+subsequent bytes in the Unix socket so kernel backpressure throttles the
+producer. Requests parked behind `GrabServer` continue consuming credits,
+bounding that case too. The BigRequests Apply/Ignore barrier shares the control
+channel and accumulates returned bytes without bypassing the barrier. Focused
+tests pin the 16 KiB bound, one-returned-request/one-new-request behavior,
+per-client order, and round-robin order.
+
+`cargo test -p yserver-core` passes 996 tests and
+`cargo clippy --all-targets -- -D warnings` is clean. Hardware re-verification
+on bee confirmed that dragging MATE Control Center with adapta-nokto is smooth
+with fair dispatch and the Xorg-sized ingress window enabled (2026-07-27).
+
+Post-fix telemetry showed why the visible result and ingress bound must be
+verified separately. Fair scheduling kept other clients responsive, but `c57`
+still reached 31,077 deferred requests: the initial available-credit
+implementation used saturating subtraction, so a request larger than the few
+remaining bytes erased its overshoot debt. A shifted variable-size request
+cycle could repeat that loss indefinitely. Reader accounting now stores exact
+outstanding bytes instead: accepting a complete request may cross 16 KiB, that
+overshoot remains charged, and returned dispatch bytes reduce it exactly. A
+regression test pins the case where 4 bytes remain, a 20-byte request is
+accepted, and a 4-byte completion must leave the reader blocked with 12 bytes
+of overshoot still outstanding.
+
+A bee telemetry rerun with the exact-outstanding accounting processed 20 active
+one-second windows at an average 40,005 requests/s (peak 48,881). The hot `c57`
+client peaked at 990 deferred requests and the global fair queue at 1,192,
+versus `c57`'s previous 31,077-request peak. Its five-request
+pixmap/RENDER/free cycle averages approximately 16 request bytes, so roughly
+1,024 requests is the expected scale for a 16 KiB ingress window. Across the
+active windows `c57` accepted 595,582 and dispatched 594,634 requests; the
+948-request difference exactly matches its final deferred depth rather than
+showing the old unbounded drift. The worst reported `c57` request age was
+174.3 ms during the slower initial interval, while normal high-throughput
+intervals were mostly around 42--51 ms. This confirms that overshoot debt is
+preserved and the ingress bound is effective under the reproducer.
+
+A subsequent Cinnamon hardware run exposed a fair-scheduler regression in the
+initial `GrabServer` handling. Plank aborted with XCB's
+`xcb_xlib_threads_sequence_lost` assertion, and WasIstLos disconnected after
+the server log showed its client `c66` dispatch request sequence fall from
+`#59264` back to `#59216`. While another client owned the server grab, the
+scheduler removed an older prefix into `server_grab_waiters`, left a newer
+suffix in the fair queue, and appended the prefix behind that suffix on
+release. Newly accepted requests could also enter the side queue directly,
+making the split order ambiguous. Intake now always appends to the canonical
+per-client fair FIFO. The drain may temporarily park only an older prefix, and
+release groups those waiters per client and prepends each prefix ahead of the
+remaining suffix without changing that client's ready-ring position. A
+regression test pins `16,17` parked plus `18,19` queued and requires dispatch
+order `16,17,18,19`. This restores X11's strict per-client request ordering
+while retaining round-robin fairness across clients.
+
+A live Cinnamon hardware re-verification produced zero per-client sequence
+inversions across a 42 MiB debug log while processing 541 matched
+`GrabServer`/`UngrabServer` cycles. Plank remained connected after six of its
+own server grabs. WasIstLos remained connected after 89 of its own grabs and
+crossed the 16-bit request-sequence wrap cleanly; both processes were still
+running after several minutes of active dragging. The session contained none
+of the prior XCB unknown-sequence/assertion or Xlib I/O-failure signatures.

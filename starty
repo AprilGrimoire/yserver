@@ -1,0 +1,124 @@
+#!/bin/sh
+# starty — bring up yserver on a free display, run a session, tear down.
+#
+# The installed counterpart of the `just startx` recipe. Mirrors real
+# `startx`: scan for the lowest free X display, mint a per-session
+# MIT-MAGIC-COOKIE-1, hand it to yserver via -auth (an unguessable mktemp
+# /tmp file, the SERVER's copy — used only to validate incoming clients),
+# add the same cookie to the user's ~/.Xauthority keyed to :$display, run
+# the session with XAUTHORITY pointed at ~/.Xauthority, and on exit remove
+# the :$display entry + delete the temp server file. Needs xauth + mcookie
+# on PATH.
+#
+# Usage:
+#   starty                 # run ~/.xinitrc (/etc/X11/xinit/xinitrc fallback)
+#   starty bspwm           # run a WM/client resolved via PATH (no xinitrc)
+#   starty bspwm --foo bar # ...with client args
+#
+# Runs STANDALONE from a bare TTY (yserver drives KMS directly, no seat
+# manager): refuses pty / SSH / graphical-terminal callers via a /dev/ttyN
+# check on stdin. Your user needs /dev/dri + /dev/input access (see
+# README): `sudo usermod -aG video,input $USER` then re-login.
+
+set -eu
+
+usage() {
+    cat <<'EOF'
+usage: starty [client [client_args...]]
+
+  With no client, runs ~/.xinitrc (or /etc/X11/xinit/xinitrc fallback).
+  With a client, resolves it via PATH and runs it with the given args.
+
+Environment:
+  RUST_LOG   yserver log level (default: warn)
+  XAUTHORITY alternate user authority file (default: ~/.Xauthority)
+
+Logs:
+  server   $XDG_STATE_HOME/yserver/yserver.log  (~/.local/state/yserver/...)
+  session  $XDG_STATE_HOME/yserver/session.log
+EOF
+}
+
+case "${1:-}" in
+    -h|--help) usage; exit 0;;
+esac
+
+# --- TTY guard: yserver needs a real controlling console. ---------------
+case "$(tty 2>/dev/null || true)" in
+    /dev/tty[0-9]*) ;;
+    *) got=$(tty 2>/dev/null || true)
+       [ -n "$got" ] || got='no controlling tty'
+       echo "starty: must be run from a TTY (got: $got)" >&2
+       echo "       switch to a free VT (Ctrl-Alt-F2) and run starty there." >&2
+       exit 1;;
+esac
+
+# --- Resolve the client command (or fall back to xinitrc). --------------
+have_client=0
+client_bin=""
+if [ $# -gt 0 ]; then
+    have_client=1
+    client_bin=$(command -v "$1" 2>/dev/null) || {
+        echo "starty: client not found: $1" >&2; exit 127; }
+    shift
+else
+    xinitrc="${XINITRC:-$HOME/.xinitrc}"
+    [ -f "$xinitrc" ] || xinitrc=/etc/X11/xinit/xinitrc
+    [ -f "$xinitrc" ] || { echo "starty: no ~/.xinitrc and no /etc/X11/xinit/xinitrc" >&2; exit 1; }
+fi
+
+# --- Depends: xauth + mcookie are part of the auth handshake. ------------
+command -v xauth  >/dev/null 2>&1 || { echo "starty: xauth not found on PATH (try: pacman -S xorg-xauth)" >&2; exit 1; }
+command -v mcookie >/dev/null 2>&1 || { echo "starty: mcookie not found on PATH (try: pacman -S util-linux)" >&2; exit 1; }
+command -v yserver >/dev/null 2>&1 || { echo "starty: yserver not found on PATH (run: just install)" >&2; exit 1; }
+
+# --- State + logs. -------------------------------------------------------
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/yserver"
+mkdir -p "$state_dir"
+server_log="$state_dir/yserver.log"
+session_log="$state_dir/session.log"
+
+# --- Pick the lowest free display. --------------------------------------
+display=0
+while [ -e /tmp/.X11-unix/X$display ]; do display=$((display+1)); done
+
+authfile=$(mktemp /tmp/yserver-startx-auth.XXXXXX)
+userauth="${XAUTHORITY:-$HOME/.Xauthority}"
+cookie=$(mcookie)
+xauth -f "$authfile"  add ":$display" . "$cookie"
+xauth -f "$userauth"  add ":$display" . "$cookie"
+echo "starty: DISPLAY=:$display (server auth $authfile; cookie added to $userauth)"
+
+# --- Bring up the server. -----------------------------------------------
+# Inherit the TTY login's XDG_RUNTIME_DIR — a real VT has the real
+# /run/user/UID + systemd --user instance, which is what makes agent/UI/keyring reached from ~/.xinitrc work.
+RUST_LOG="${RUST_LOG:-warn}" RUST_BACKTRACE=1 \
+    yserver "$display" -auth "$authfile" >"$server_log" 2>&1 &
+yserver_pid=$!
+
+cleanup() {
+    kill -TERM "$yserver_pid" 2>/dev/null
+    wait "$yserver_pid" 2>/dev/null
+    xauth -f "$userauth" remove ":$display" 2>/dev/null
+    rm -f "$authfile"
+}
+trap cleanup EXIT INT TERM
+
+# Wait for the socket (cap at ~30 s like the recipe).
+for i in $(seq 30); do
+    [ -S /tmp/.X11-unix/X$display ] && break
+    sleep 1
+    if ! kill -0 "$yserver_pid" 2>/dev/null; then
+        echo "starty: yserver exited before the socket came up — see $server_log" >&2
+        exit 1
+    fi
+done
+[ -S /tmp/.X11-unix/X$display ] || { echo "starty: socket not ready — see $server_log" >&2; exit 1; }
+
+# --- Run the session. ---------------------------------------------------
+session_env="env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET XDG_SESSION_TYPE=x11 XAUTHORITY=$userauth DISPLAY=:$display"
+if [ "$have_client" -eq 1 ]; then
+    $session_env "$client_bin" "$@" >"$session_log" 2>&1
+else
+    $session_env sh "$xinitrc" >"$session_log" 2>&1
+fi

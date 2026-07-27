@@ -2182,8 +2182,8 @@ pub fn encode_xi2_motion_with_scroll(
 /// Encode an XInput2 raw device event (XI_RawKeyPress / XI_RawKeyRelease /
 /// XI_RawButtonPress / XI_RawButtonRelease / XI_RawMotion / XI_RawTouch*).
 /// Motion and touch events include X and Y valuators with the supplied
-/// root-coordinate values stored as FP3232 (signed 32-bit integer + unsigned
-/// 32-bit fraction). Xorg emits key and button events with a padded, all-zero
+/// relative values stored as FP3232 (signed 32-bit integer + unsigned 32-bit
+/// fraction). Xorg emits key and button events with a padded, all-zero
 /// valuator mask and no values.
 /// xeyes selects XI_RawMotion as a "cursor moved" notification and then
 /// calls XIQueryPointer for the actual position; we only need to supply
@@ -3771,14 +3771,11 @@ pub fn write_get_device_key_mapping_reply(
     writer.write_all(&reply)
 }
 
-/// XInput 1.x `GetDeviceMotionEvents` reply (minor 10) for a device
-/// with no buffered motion history. Layout from
+/// XInput 1.x `GetDeviceMotionEvents` empty-history reply utility. Layout from
 /// `xGetDeviceMotionEventsReply` (XIproto.h): `nEvents`@8 (4),
-/// `axes`@12, `mode`@13, then pads. yserver keeps no per-device motion
-/// buffer (same posture as core `GetMotionEvents`), so `nEvents` and
-/// `length` are 0 — but `axes`/`mode` report the device's true class,
-/// exactly as Xorg `Xi/gtmotion.c` does on the empty-history path
-/// (`mode = Absolute`).
+/// `axes`@12, `mode`@13, then pads. This is used for the no-matching-samples
+/// case; `axes`/`mode` still report the device's true class exactly as Xorg
+/// `Xi/gtmotion.c` does (`mode = Absolute`).
 pub fn write_get_device_motion_events_reply(
     writer: &mut impl Write,
     byte_order: ClientByteOrder,

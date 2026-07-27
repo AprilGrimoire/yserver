@@ -528,6 +528,20 @@ fn pointer_event_fanout_to_state_inner(
     // Step 1 — translate host-screen coords to ynest-root coords.
     let event = translate_host_event(state, xid_map, event);
 
+    if matches!(event.kind, PointerEventKind::MotionNotify) {
+        const MOTION_HISTORY_CAPACITY: usize = 256;
+        if state.pointer_motion_history.len() == MOTION_HISTORY_CAPACITY {
+            state.pointer_motion_history.pop_front();
+        }
+        state
+            .pointer_motion_history
+            .push_back(crate::server::PointerMotionRecord {
+                time: event.time,
+                root_x: event.root_x,
+                root_y: event.root_y,
+            });
+    }
+
     // Cache the pointer position so server-generated events that must
     // carry it (XI2 focus events) don't ship (0,0). Mirrors Xorg keeping
     // the sprite position in device state.
@@ -1431,7 +1445,10 @@ fn pointer_event_fanout_to_state_inner(
                 seq,
                 XI2_MAJOR_OPCODE,
                 raw_evtype,
-                XI2_SLAVE_POINTER_DEVICE_ID,
+                // Xorg's mieq master-device copy rewrites `deviceid` to
+                // the attached master pointer while retaining the
+                // originating slave in `sourceid` (mi/mieq.c).
+                XI2_MASTER_POINTER_DEVICE_ID,
                 event.time,
                 u32::from(event.detail),
                 XI2_SLAVE_POINTER_DEVICE_ID,
@@ -3336,6 +3353,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn translated_motion_is_recorded_once_in_bounded_history() {
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        let event = motion_event();
+        let _ = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &HostXidMap::new(),
+            event,
+            true,
+            false,
+        );
+        assert_eq!(state.pointer_motion_history.len(), 1);
+        assert_eq!(state.pointer_motion_history[0].time, event.time);
+        assert_eq!(state.pointer_motion_history[0].root_x, event.root_x);
+        assert_eq!(state.pointer_motion_history[0].root_y, event.root_y);
+    }
+
     /// Regression (HW-confirmed 2026-07-10, Telegram/Qt on silence):
     /// a client selecting `XIAllDevices(0)` receives every pointer event
     /// in BOTH slave- and master-stamped forms, and the SLAVE form MUST be
@@ -3710,7 +3746,7 @@ mod tests {
     }
 
     #[test]
-    fn xi2_raw_motion_uses_source_device_id() {
+    fn xi2_raw_motion_uses_master_device_and_slave_source_ids() {
         let mut state = ServerState::new();
         let mut backend = crate::backend::recording::RecordingBackend::new();
         let mut peer = install_client(&mut state, 1);
@@ -3735,8 +3771,8 @@ mod tests {
             .expect("XI_RawMotion event present");
         assert_eq!(
             u16::from_le_bytes([bytes[off + 10], bytes[off + 11]]),
-            XI2_SLAVE_POINTER_DEVICE_ID,
-            "Xorg raw events are source-device events; deviceid must be the slave pointer"
+            XI2_MASTER_POINTER_DEVICE_ID,
+            "Xorg delivers the mieq master-device copy of raw pointer events"
         );
         assert_eq!(
             u16::from_le_bytes([bytes[off + 20], bytes[off + 21]]),

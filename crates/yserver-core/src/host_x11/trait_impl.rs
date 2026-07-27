@@ -396,6 +396,18 @@ impl Backend for HostX11Backend {
         self.with_active_origin(origin, |this| HostX11Backend::free_cursor(this, host_xid))
     }
 
+    fn recolor_cursor(
+        &mut self,
+        origin: Option<OriginContext>,
+        host_xid: u32,
+        fore: (u16, u16, u16),
+        back: (u16, u16, u16),
+    ) -> io::Result<()> {
+        self.with_active_origin(origin, |this| {
+            HostX11Backend::recolor_cursor(this, host_xid, fore, back)
+        })
+    }
+
     fn create_glyph_cursor(
         &mut self,
         origin: Option<OriginContext>,

@@ -49,14 +49,29 @@ use crate::{
 ///   - host_input + page_flip dispatches/sec
 ///   - max time between subsequent HostInput dispatches (cursor-lag proxy)
 ///   - max single-iteration wall time
+///   - total/per-client deferred depth and request age
+///   - largest shared-channel request drain, including its dominant client
+///   - accepted sequence 0xffff/0x0000 boundary counts
 ///
-/// Costs: one HashMap lookup + counter increment per request, one
-/// `Instant::now()` per iteration boundary, and one `info!` line per
-/// second. Should be <0.5% overhead even at high request rates.
+/// Costs are deliberately accepted only when explicitly enabled: request
+/// timestamps cross the reader boundary, and the core maintains small
+/// per-client maps in addition to the existing per-opcode counters.
 const TELEMETRY_EMIT_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Number of opcodes to show in the per-second telemetry emit.
 const TELEMETRY_TOP_N: usize = 3;
+
+#[derive(Debug, Default)]
+struct ClientLoopTelemetry {
+    deferred_current: usize,
+    deferred_max: usize,
+    accepted: u64,
+    dispatched: u64,
+    request_age_max: Duration,
+    sequence_ffff: u64,
+    sequence_zero: u64,
+    requests_by_opcode: HashMap<(u8, Option<u8>), u64>,
+}
 
 #[derive(Debug, Default)]
 struct LoopTelemetry {
@@ -73,6 +88,24 @@ struct LoopTelemetry {
     last_host_input: Option<Instant>,
     page_flip_count: u64,
     max_iter_wall: Duration,
+    /// Peak depth of `deferred_requests` observed this window.
+    ///
+    /// Distinguishes two failure modes that look identical from the
+    /// outside during a request flood. A shallow backlog (tens) means
+    /// the drain keeps up and any residual stutter is
+    /// request-vs-input scheduling — what `REQUEST_TIME_BUDGET`
+    /// addresses. A deep, growing backlog (thousands) means requests
+    /// arrive faster than they drain, so a low-rate client's request
+    /// (marco's `ConfigureWindow`, which is what actually moves a
+    /// dragged window) waits behind a high-rate client's flood — a
+    /// per-client fairness problem the time budget does NOT fix.
+    /// Added because that distinction had been argued repeatedly
+    /// without ever being measured.
+    deferred_current: usize,
+    max_deferred_depth: usize,
+    clients: HashMap<yserver_protocol::x11::ClientId, ClientLoopTelemetry>,
+    channel_request_batch_max: usize,
+    channel_client_batch_max: (u32, usize),
 }
 
 impl LoopTelemetry {
@@ -85,7 +118,14 @@ impl LoopTelemetry {
         }
     }
 
-    fn record_request(&mut self, opcode: u8, dur: Duration) {
+    fn record_request(
+        &mut self,
+        client: yserver_protocol::x11::ClientId,
+        opcode: u8,
+        data: u8,
+        dur: Duration,
+        age: Duration,
+    ) {
         if !self.enabled {
             return;
         }
@@ -96,6 +136,67 @@ impl LoopTelemetry {
         entry.1 += dur;
         if dur > self.longest_request.1 {
             self.longest_request = (opcode, dur);
+        }
+        let client_stats = self.clients.entry(client).or_default();
+        client_stats.dispatched += 1;
+        client_stats.request_age_max = client_stats.request_age_max.max(age);
+        let request_key = (opcode, (opcode >= 128).then_some(data));
+        *client_stats
+            .requests_by_opcode
+            .entry(request_key)
+            .or_default() += 1;
+    }
+
+    fn record_request_accepted(
+        &mut self,
+        client: yserver_protocol::x11::ClientId,
+        sequence: yserver_protocol::x11::SequenceNumber,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        let client_stats = self.clients.entry(client).or_default();
+        client_stats.accepted += 1;
+        match sequence.0 {
+            0xffff => client_stats.sequence_ffff += 1,
+            0 => client_stats.sequence_zero += 1,
+            _ => {}
+        }
+    }
+
+    fn record_deferred_push(&mut self, client: yserver_protocol::x11::ClientId) {
+        if !self.enabled {
+            return;
+        }
+        self.deferred_current += 1;
+        self.max_deferred_depth = self.max_deferred_depth.max(self.deferred_current);
+        let client_stats = self.clients.entry(client).or_default();
+        client_stats.deferred_current += 1;
+        client_stats.deferred_max = client_stats.deferred_max.max(client_stats.deferred_current);
+    }
+
+    fn record_deferred_pop(&mut self, client: yserver_protocol::x11::ClientId) {
+        if !self.enabled {
+            return;
+        }
+        self.deferred_current = self.deferred_current.saturating_sub(1);
+        let client_stats = self.clients.entry(client).or_default();
+        client_stats.deferred_current = client_stats.deferred_current.saturating_sub(1);
+    }
+
+    fn record_channel_drain(
+        &mut self,
+        requests: usize,
+        requests_by_client: &HashMap<yserver_protocol::x11::ClientId, usize>,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        self.channel_request_batch_max = self.channel_request_batch_max.max(requests);
+        if let Some((&client, &count)) = requests_by_client.iter().max_by_key(|(_, count)| *count)
+            && count > self.channel_client_batch_max.1
+        {
+            self.channel_client_batch_max = (client.0, count);
         }
     }
 
@@ -166,11 +267,111 @@ impl LoopTelemetry {
             .map(|(op, cnt, t)| format!("op{op}:n={cnt}/t={:.1}ms", t.as_secs_f64() * 1000.0))
             .collect();
 
+        let mut deferred_clients: Vec<_> = self.clients.iter().collect();
+        deferred_clients.sort_by_key(|(_, stats)| std::cmp::Reverse(stats.deferred_max));
+        let top_deferred: Vec<String> = deferred_clients
+            .iter()
+            .take(TELEMETRY_TOP_N)
+            .map(|(id, stats)| {
+                format!(
+                    "c{}:cur={}/max={}",
+                    id.0, stats.deferred_current, stats.deferred_max
+                )
+            })
+            .collect();
+
+        let mut age_clients: Vec<_> = self.clients.iter().collect();
+        age_clients.sort_by_key(|(_, stats)| std::cmp::Reverse(stats.request_age_max));
+        let top_age: Vec<String> = age_clients
+            .iter()
+            .take(TELEMETRY_TOP_N)
+            .map(|(id, stats)| {
+                format!(
+                    "c{}:n={}/max={:.1}ms",
+                    id.0,
+                    stats.dispatched,
+                    stats.request_age_max.as_secs_f64() * 1000.0
+                )
+            })
+            .collect();
+        let sequence_ffff: u64 = self.clients.values().map(|stats| stats.sequence_ffff).sum();
+        let sequence_zero: u64 = self.clients.values().map(|stats| stats.sequence_zero).sum();
+
+        let mut request_clients: Vec<_> = self.clients.iter().collect();
+        request_clients
+            .sort_by_key(|(_, stats)| std::cmp::Reverse(stats.accepted.max(stats.dispatched)));
+        let request_client_mix: Vec<String> = request_clients
+            .iter()
+            .filter(|(_, stats)| stats.accepted != 0 || stats.dispatched != 0)
+            .take(TELEMETRY_TOP_N)
+            .map(|(id, stats)| {
+                let mut operations: Vec<_> = stats.requests_by_opcode.iter().collect();
+                operations.sort_by_key(|(_, count)| std::cmp::Reverse(**count));
+                let top: Vec<String> = operations
+                    .iter()
+                    .take(5)
+                    .map(|((major, minor), count)| match minor {
+                        Some(minor) => format!("{major}.{minor}={count}"),
+                        None => format!("{major}={count}"),
+                    })
+                    .collect();
+                format!(
+                    "c{}:accepted={}/dispatched={}/top={}",
+                    id.0,
+                    stats.accepted,
+                    stats.dispatched,
+                    top.join("|")
+                )
+            })
+            .collect();
+
+        let outbound = crate::core_loop::fanout::take_outbound_telemetry();
+        let mut outbound_by_client: HashMap<_, Vec<_>> = HashMap::new();
+        for ((client, kind), count) in outbound {
+            outbound_by_client
+                .entry(client)
+                .or_default()
+                .push((kind, count));
+        }
+        let mut outbound_clients: Vec<_> = outbound_by_client.into_iter().collect();
+        outbound_clients.sort_by_key(|(_, kinds)| {
+            std::cmp::Reverse(kinds.iter().map(|(_, count)| count).sum::<u64>())
+        });
+        let outbound_client_mix: Vec<String> = outbound_clients
+            .iter_mut()
+            .take(TELEMETRY_TOP_N)
+            .map(|(id, kinds)| {
+                kinds.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+                let total: u64 = kinds.iter().map(|(_, count)| count).sum();
+                let top: Vec<String> = kinds
+                    .iter()
+                    .take(5)
+                    .map(|(kind, count)| {
+                        use crate::core_loop::fanout::OutboundTelemetryKind;
+                        let label = match kind {
+                            OutboundTelemetryKind::Reply => "reply".to_string(),
+                            OutboundTelemetryKind::Error(code) => format!("err{code}"),
+                            OutboundTelemetryKind::Event(event) => format!("e{event}"),
+                            OutboundTelemetryKind::GenericEvent {
+                                extension,
+                                event_type,
+                            } => format!("ge{extension}.{event_type}"),
+                        };
+                        format!("{label}={count}")
+                    })
+                    .collect();
+                format!("c{}:n={total}/top={}", id.0, top.join("|"))
+            })
+            .collect();
+
         log::info!(
             "loop telemetry [{:.2}s]: iter/s={:.0} req/s={:.0} drain_max={} \
              req_time={:.1}ms ({:.1}%) longest=op{}:{:.2}ms \
              host_input/s={:.1} gap_max={:.1}ms \
-             page_flip/s={:.1} iter_wall_max={:.1}ms \
+             page_flip/s={:.1} iter_wall_max={:.1}ms deferred={}/{} \
+             channel_batch_max={} channel_client_max=c{}:{} seq_boundary[ffff={} zero={}] \
+             deferred_clients=[{}] age_clients=[{}] \
+             request_clients=[{}] outbound_clients=[{}] \
              top_by_time=[{}] top_by_count=[{}]",
             secs,
             self.iter_count as f64 / secs,
@@ -184,6 +385,17 @@ impl LoopTelemetry {
             self.host_input_max_gap.as_secs_f64() * 1000.0,
             self.page_flip_count as f64 / secs,
             self.max_iter_wall.as_secs_f64() * 1000.0,
+            self.deferred_current,
+            self.max_deferred_depth,
+            self.channel_request_batch_max,
+            self.channel_client_batch_max.0,
+            self.channel_client_batch_max.1,
+            sequence_ffff,
+            sequence_zero,
+            top_deferred.join(","),
+            top_age.join(","),
+            request_client_mix.join(","),
+            outbound_client_mix.join(","),
             top_time.join(","),
             top_count.join(","),
         );
@@ -202,10 +414,23 @@ impl LoopTelemetry {
         self.host_input_max_gap = Duration::ZERO;
         self.page_flip_count = 0;
         self.max_iter_wall = Duration::ZERO;
+        self.max_deferred_depth = self.deferred_current;
+        self.channel_request_batch_max = 0;
+        self.channel_client_batch_max = (0, 0);
+        self.clients.retain(|_, stats| {
+            stats.deferred_max = stats.deferred_current;
+            stats.accepted = 0;
+            stats.dispatched = 0;
+            stats.request_age_max = Duration::ZERO;
+            stats.sequence_ffff = 0;
+            stats.sequence_zero = 0;
+            stats.requests_by_opcode.clear();
+            stats.deferred_current != 0
+        });
     }
 }
 
-/// Core-loop fairness cap. Each main-loop iteration processes at
+/// Core-loop work cap. Each main-loop iteration processes at
 /// most this many X protocol requests before yielding back to the
 /// outer poll / maintenance pass. Excess requests are buffered in
 /// `deferred_requests` and picked up at the start of the next
@@ -224,10 +449,14 @@ impl LoopTelemetry {
 /// 32 chosen as the initial cap because: typical request cost is
 /// ~0.25 ms, so 32 × 0.25 ≈ 8 ms per iteration worst case — about
 /// one frame at 120 Hz, well below the perceptual cursor-lag
-/// threshold. The cap is intentionally NOT time-based at this
-/// stage; count-based is simpler and the telemetry shows
-/// per-request costs are tightly clustered. If we ever encounter
-/// per-request outliers above ~5 ms, revisit with a time budget.
+/// threshold.
+///
+/// The count cap alone is NOT sufficient: it presumes the ~0.25 ms
+/// figure above, and that presumption was measured false. See
+/// [`REQUEST_TIME_BUDGET`], which now bounds the same iteration by
+/// wall clock. The count cap is retained because for well-behaved
+/// requests it binds first (32 × 0.25 ms == the 8 ms budget by
+/// construction), so the fast path is unchanged.
 const MAX_REQUESTS_PER_ITER: usize = 32;
 
 /// One backend-owned source registered with the core poller. The
@@ -239,18 +468,168 @@ struct BackendPollSource {
     kind: BackendFdKind,
 }
 
-/// One pending X protocol request held over from a prior iteration
-/// because the per-iteration `MAX_REQUESTS_PER_ITER` cap was hit
-/// before it could be processed. Buffered locally rather than
-/// pushed back into the channel: re-sending would re-trigger the
-/// channel's waker (one atomic CAS per push-back) and the local
-/// VecDeque avoids that overhead.
+/// Wall-clock ceiling on request processing per main-loop iteration,
+/// enforced alongside [`MAX_REQUESTS_PER_ITER`] — whichever trips
+/// first ends the drain.
+///
+/// **Why the count cap was not enough** (measured on silence, dual
+/// 1440p, MATE + adapta-nokto, dragging the mate-control-center
+/// window — `YSERVER_LOOP_TELEMETRY=1`): GTK emits ~200,000 requests
+/// per second during that drag (each themed fill costs CreatePixmap +
+/// CreatePicture + FillRectangles + FreePicture + FreePixmap), and
+/// individual requests reach **44-50 ms** (`longest=op70:44.23ms`,
+/// `op70:49.61ms`) because a request that closes the open frame
+/// absorbs the whole batch flush. 32 × 44 ms is ~1.4 s inside one
+/// iteration, and `HostInput` / `PageFlipReady` share that channel —
+/// so the cursor and the window position stall together
+/// (`gap_max` 225-360 ms between consecutive input events, against
+/// `host_input/s` ≈ 128 arriving fine). The visible symptom is a drag
+/// that tracks, lags, then skips.
+///
+/// A deadline cannot preempt a request already running, so this does
+/// not make a 44 ms request cheaper — it stops that request from
+/// authorising 31 more. Worst-case iteration becomes one overrunning
+/// request instead of 32.
+///
+/// 8 ms is the figure `MAX_REQUESTS_PER_ITER` was already aiming at
+/// (one frame at 120 Hz), so this restores the intended design point
+/// rather than picking a new one.
+const REQUEST_TIME_BUDGET: Duration = Duration::from_millis(8);
+
+/// Whether this iteration's request drain must stop, given how many
+/// requests remain in the count budget and how long the drain has been
+/// running. Split out as a pure function so the count-vs-deadline
+/// interaction is unit-testable without driving the whole core loop.
+///
+/// `elapsed` is measured from the top of the iteration, so the first
+/// request always passes (`elapsed` ≈ 0) — that guarantees forward
+/// progress even when every request overruns the budget.
+fn budget_exhausted(remaining: usize, elapsed: Duration) -> bool {
+    remaining == 0 || elapsed >= REQUEST_TIME_BUDGET
+}
+
+/// One pending X protocol request accepted by a reader but not yet dispatched.
 struct DeferredRequest {
     id: yserver_protocol::x11::ClientId,
     sequence: yserver_protocol::x11::SequenceNumber,
+    accepted_at: Option<Instant>,
     header: yserver_protocol::x11::RequestHeader,
     body: Vec<u8>,
     attached_fd: Option<OwnedFd>,
+}
+
+/// Per-client FIFO queues behind a round-robin ready ring.
+///
+/// Request order is preserved within each client, as required by X11, while a
+/// continuously busy client gets at most one request before every other ready
+/// client gets a turn. Cross-client request order has no protocol meaning.
+#[derive(Default)]
+struct FairRequestQueue {
+    by_client: HashMap<yserver_protocol::x11::ClientId, VecDeque<DeferredRequest>>,
+    ready: VecDeque<yserver_protocol::x11::ClientId>,
+    len: usize,
+}
+
+impl FairRequestQueue {
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn push_back(&mut self, req: DeferredRequest) {
+        let client = req.id;
+        let queue = self.by_client.entry(client).or_default();
+        if queue.is_empty() {
+            self.ready.push_back(client);
+        }
+        queue.push_back(req);
+        self.len += 1;
+    }
+
+    /// Restore an older, temporarily parked prefix ahead of this client's
+    /// remaining requests without changing the client's place in the ready
+    /// ring. `requests` must contain exactly one client's requests in arrival
+    /// order.
+    fn prepend_client(&mut self, mut requests: VecDeque<DeferredRequest>) {
+        let Some(first) = requests.front() else {
+            return;
+        };
+        let client = first.id;
+        debug_assert!(requests.iter().all(|req| req.id == client));
+        let added = requests.len();
+
+        if let Some(existing) = self.by_client.get_mut(&client) {
+            requests.append(existing);
+            *existing = requests;
+        } else {
+            self.ready.push_back(client);
+            self.by_client.insert(client, requests);
+        }
+        self.len = self.len.saturating_add(added);
+    }
+
+    fn pop_front(&mut self) -> Option<DeferredRequest> {
+        while let Some(client) = self.ready.pop_front() {
+            let (request, remains_ready) = {
+                let Some(queue) = self.by_client.get_mut(&client) else {
+                    continue;
+                };
+                (queue.pop_front(), !queue.is_empty())
+            };
+            let Some(request) = request else {
+                self.by_client.remove(&client);
+                continue;
+            };
+            self.len = self.len.saturating_sub(1);
+            if remains_ready {
+                self.ready.push_back(client);
+            } else {
+                self.by_client.remove(&client);
+            }
+            return Some(request);
+        }
+        debug_assert_eq!(self.len, 0);
+        None
+    }
+}
+
+fn blocked_by_server_grab(state: &ServerState, req: &DeferredRequest) -> bool {
+    state.server_grab_owner.is_some_and(|owner| owner != req.id)
+}
+
+/// Restore parked server-grab requests to the fair queue without changing
+/// their per-client arrival order.
+fn release_server_grab_waiters(
+    deferred_requests: &mut FairRequestQueue,
+    server_grab_waiters: &mut VecDeque<DeferredRequest>,
+    telemetry: &mut LoopTelemetry,
+) {
+    // A waiter is an older prefix temporarily removed from one client's fair
+    // queue while another client owned GrabServer. Restore each prefix ahead
+    // of that client's requests which remained queued. Appending here breaks
+    // X11's strict per-client order (observed as #59264 dispatched before
+    // #59216), causing Xlib/XCB to abort with threads_sequence_lost.
+    let mut client_order = Vec::new();
+    let mut by_client: HashMap<_, VecDeque<_>> = HashMap::new();
+    while let Some(req) = server_grab_waiters.pop_front() {
+        telemetry.record_deferred_push(req.id);
+        let client = req.id;
+        match by_client.entry(client) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.get_mut().push_back(req);
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                client_order.push(client);
+                entry.insert(VecDeque::from([req]));
+            }
+        }
+    }
+    for client in client_order {
+        deferred_requests.prepend_client(
+            by_client
+                .remove(&client)
+                .expect("server-grab waiter client recorded"),
+        );
+    }
 }
 
 fn process_one_request(
@@ -262,6 +641,13 @@ fn process_one_request(
     req: DeferredRequest,
 ) {
     let req_opcode = req.header.opcode;
+    let req_data = req.header.data;
+    let req_wire_bytes = usize::try_from(req.header.length_units)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(4)
+        .max(4);
+    let req_client = req.id;
+    let req_age = req.accepted_at.map(|accepted_at| accepted_at.elapsed());
     let req_start = if telemetry.enabled {
         Some(Instant::now())
     } else {
@@ -277,12 +663,59 @@ fn process_one_request(
         req.attached_fd,
     );
     if let Some(start) = req_start {
-        telemetry.record_request(req_opcode, start.elapsed());
+        telemetry.record_request(
+            req_client,
+            req_opcode,
+            req_data,
+            start.elapsed(),
+            req_age.unwrap_or_default(),
+        );
     }
     *requests_this_iter += 1;
     *request_budget -= 1;
     if let Some(disc_id) = disc {
         crate::core_loop::process_disconnect::process_disconnect(state, backend, disc_id);
+    } else if let Some(control) = state
+        .clients
+        .get(&req_client.0)
+        .and_then(|client| client.reader_control.as_ref())
+    {
+        let _ = control.send(crate::server::ReaderControl::GrantRequestBytes(
+            req_wire_bytes,
+        ));
+    }
+}
+
+fn drain_pending_requests(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    telemetry: &mut LoopTelemetry,
+    deferred_requests: &mut FairRequestQueue,
+    server_grab_waiters: &mut VecDeque<DeferredRequest>,
+    requests_this_iter: &mut u32,
+    request_budget: &mut usize,
+    drain_start: Instant,
+) {
+    while !budget_exhausted(*request_budget, drain_start.elapsed()) {
+        let Some(req) = deferred_requests.pop_front() else {
+            break;
+        };
+        telemetry.record_deferred_pop(req.id);
+        if blocked_by_server_grab(state, &req) {
+            server_grab_waiters.push_back(req);
+            continue;
+        }
+        process_one_request(
+            state,
+            backend,
+            telemetry,
+            requests_this_iter,
+            request_budget,
+            req,
+        );
+        if state.server_grab_owner.is_none() {
+            release_server_grab_waiters(deferred_requests, server_grab_waiters, telemetry);
+        }
     }
 }
 
@@ -303,7 +736,8 @@ fn process_request_inline(
     attached_fd: Option<OwnedFd>,
 ) -> Option<yserver_protocol::x11::ClientId> {
     // Half-closed-socket / post-disconnect guard. The `Message::Request`
-    // channel preserves arrival order — when a client crashes (e.g.
+    // The reader/channel/fair-queue path preserves per-client arrival order.
+    // When a client crashes (e.g.
     // mate-appearance-properties cratering with the keyring locked) and
     // the client_reader thread enqueues a burst of bogus requests
     // before/around the EOF, the main thread can still be draining those
@@ -447,13 +881,30 @@ pub fn run_core(
     let mut events = Events::with_capacity(64);
     let mut telemetry = LoopTelemetry::new();
     if telemetry.enabled {
+        crate::core_loop::fanout::enable_outbound_telemetry();
         log::info!(
             "loop telemetry: enabled (YSERVER_LOOP_TELEMETRY set); \
              1s rollups via info!"
         );
     }
-    let mut deferred_requests: VecDeque<DeferredRequest> = VecDeque::new();
+    let mut deferred_requests = FairRequestQueue::default();
+    let mut server_grab_waiters: VecDeque<DeferredRequest> = VecDeque::new();
     loop {
+        // The grab can be dropped by paths that have no release check of
+        // their own — notably the two disconnect sites outside the message
+        // loop (a failed outbound write, and the writable-interest
+        // reconcile). Re-check once per iteration so a released grab always
+        // frees its waiters no matter who released it. Without this, an
+        // owner that dies via a failed write leaves waiters parked while
+        // `deferred_requests` stays empty, so the timeout below blocks on
+        // deadlines and those clients hang until unrelated traffic arrives.
+        if state.server_grab_owner.is_none() {
+            release_server_grab_waiters(
+                &mut deferred_requests,
+                &mut server_grab_waiters,
+                &mut telemetry,
+            );
+        }
         // Fairness: if we already have unprocessed work queued from a
         // prior iteration, don't block on the poller — we have things
         // to do right now. Without this, an idle moment where the
@@ -515,26 +966,25 @@ pub fn run_core(
         };
         let mut requests_this_iter: u32 = 0;
         let mut request_budget: usize = MAX_REQUESTS_PER_ITER;
-
-        // Fairness: drain the backlog from prior iterations FIRST,
-        // counted against this iteration's request budget. If the
-        // backlog itself exceeds the budget, we'll bail out before
-        // touching the channel — guarantees that `HostInput` /
-        // backend readiness (DRM, libinput, etc.) still gets serviced
-        // in the outer for-ev loop below.
-        while request_budget > 0 {
-            let Some(req) = deferred_requests.pop_front() else {
-                break;
-            };
-            process_one_request(
-                state,
-                backend,
-                &mut telemetry,
-                &mut requests_this_iter,
-                &mut request_budget,
-                req,
-            );
-        }
+        // Deadline for this iteration's request processing, paired with
+        // `request_budget` — see `REQUEST_TIME_BUDGET`. Taken
+        // unconditionally (not gated on telemetry) because the drain
+        // loops below depend on it for latency bounding, and measured
+        // from here so the first request of the iteration always runs.
+        let drain_start = Instant::now();
+        // Drain backlog from prior iterations first. The ready ring gives each
+        // active client one turn while the count/time cap still guarantees
+        // input and page-flip maintenance between request slices.
+        drain_pending_requests(
+            state,
+            backend,
+            &mut telemetry,
+            &mut deferred_requests,
+            &mut server_grab_waiters,
+            &mut requests_this_iter,
+            &mut request_budget,
+            drain_start,
+        );
         for ev in events.iter() {
             if let Some(index) = token_to_backend_index(ev.token()) {
                 let Some(source) = backend_poll_sources.get(index).copied() else {
@@ -627,6 +1077,8 @@ pub fn run_core(
                     }
                 }
                 NOTIFY_TOKEN => {
+                    let mut channel_requests = 0_usize;
+                    let mut channel_requests_by_client = HashMap::new();
                     for msg in rx.try_recv_all() {
                         match msg {
                             Message::Shutdown => {
@@ -636,34 +1088,34 @@ pub fn run_core(
                             Message::Request {
                                 id,
                                 sequence,
+                                accepted_at,
                                 header,
                                 body,
                                 attached_fd,
                             } => {
-                                if request_budget == 0 {
-                                    deferred_requests.push_back(DeferredRequest {
-                                        id,
-                                        sequence,
-                                        header,
-                                        body,
-                                        attached_fd,
-                                    });
-                                } else {
-                                    process_one_request(
-                                        state,
-                                        backend,
-                                        &mut telemetry,
-                                        &mut requests_this_iter,
-                                        &mut request_budget,
-                                        DeferredRequest {
-                                            id,
-                                            sequence,
-                                            header,
-                                            body,
-                                            attached_fd,
-                                        },
-                                    );
+                                if telemetry.enabled {
+                                    channel_requests += 1;
+                                    *channel_requests_by_client.entry(id).or_insert(0) += 1;
+                                    telemetry.record_request_accepted(id, sequence);
                                 }
+                                let req = DeferredRequest {
+                                    id,
+                                    sequence,
+                                    accepted_at,
+                                    header,
+                                    body,
+                                    attached_fd,
+                                };
+                                // Keep one canonical per-client FIFO even
+                                // while another client owns GrabServer. The
+                                // drain path may temporarily park an older
+                                // prefix, but newly accepted requests must
+                                // remain behind the requests already queued
+                                // for this client. Sending them directly to
+                                // `server_grab_waiters` lets new arrivals jump
+                                // ahead of that remaining suffix on release.
+                                telemetry.record_deferred_push(req.id);
+                                deferred_requests.push_back(req);
                             }
                             Message::SetupAllocate { id, response_tx } => {
                                 handle_setup_allocate(state, id, response_tx);
@@ -727,7 +1179,25 @@ pub fn run_core(
                             Message::DumpScanout => backend.dump_scanout(),
                             Message::DumpDrawables => backend.dump_drawables(),
                         }
+                        if state.server_grab_owner.is_none() {
+                            release_server_grab_waiters(
+                                &mut deferred_requests,
+                                &mut server_grab_waiters,
+                                &mut telemetry,
+                            );
+                        }
                     }
+                    telemetry.record_channel_drain(channel_requests, &channel_requests_by_client);
+                    drain_pending_requests(
+                        state,
+                        backend,
+                        &mut telemetry,
+                        &mut deferred_requests,
+                        &mut server_grab_waiters,
+                        &mut requests_this_iter,
+                        &mut request_budget,
+                        drain_start,
+                    );
                 }
                 tok => {
                     let Some(client_id) = token_to_client(tok) else {
@@ -860,6 +1330,10 @@ pub fn run_core(
 }
 
 fn drain_present_completions(state: &mut ServerState, backend: &mut dyn Backend) {
+    // Producer readiness precedes copy submission, which in turn precedes the
+    // existing GPU-completion queue below. Keeping both on the same stable
+    // backend wake fd avoids blocking request dispatch on client GPU work.
+    crate::core_loop::process_request::drain_ready_present_pixmaps(state, backend);
     let completed = backend.drain_completed_present_events();
     for entry in completed {
         if let crate::backend::PresentWake::Pixmap { idle_fence_xid } = entry.wake
@@ -987,6 +1461,165 @@ pub(crate) fn handle_host_container_resize(
         .into_iter()
         .collect();
     apply_screen_size_side_effects(state, backend, ev.width, ev.height, &changed);
+}
+
+/// Tell RANDR subscribers the layout changed without the screen resizing.
+///
+/// Xorg treats a primary-output change as a layout change, not a geometry one:
+/// `RRSetPrimaryOutput` marks the affected outputs via `RROutputChanged`, sets
+/// `layoutChanged`, and calls `RRTellChanged` (randr/rroutput.c), which fans out
+/// ScreenChangeNotify plus one OutputChangeNotify per changed output. No
+/// CrtcChangeNotify: no CRTC moved. Without this, panels and desktop shells
+/// never learn the primary moved, because polling `GetOutputPrimary` is not how
+/// they are written — they wait for the notify.
+///
+/// Screen dimensions come straight from `state.randr`, so this stays correct if
+/// it is ever called after a resize.
+pub(crate) fn notify_randr_layout_changed(state: &mut ServerState, changed_outputs: &[u32]) {
+    use std::sync::atomic::Ordering;
+    use yserver_protocol::x11::{SequenceNumber, randr as x11randr};
+
+    const RANDR_FIRST_EVENT: u8 = 89;
+
+    let timestamp = state.randr.timestamp;
+    let width = state.randr.screen_width;
+    let height = state.randr.screen_height;
+    let width_mm = u16::try_from(state.randr.width_mm).unwrap_or(u16::MAX);
+    let height_mm = u16::try_from(state.randr.height_mm).unwrap_or(u16::MAX);
+    // Resolve each changed output's current crtc/mode for the notify payload.
+    let changed: Vec<(u32, u32, u32, u8)> = changed_outputs
+        .iter()
+        .filter_map(|id| {
+            state
+                .randr
+                .outputs
+                .iter()
+                .find(|o| o.output_id == *id)
+                .map(|o| {
+                    (
+                        o.output_id,
+                        o.crtc_id,
+                        o.mode_id,
+                        if o.connected {
+                            x11randr::CONNECTION_CONNECTED
+                        } else {
+                            x11randr::CONNECTION_DISCONNECTED
+                        },
+                    )
+                })
+        })
+        .collect();
+
+    let subscribers: Vec<(u32, yserver_protocol::x11::ResourceId, u16)> = state
+        .randr_select_masks
+        .iter()
+        .map(|((owner, window), mask)| (*owner, *window, *mask))
+        .collect();
+    for (owner, request_window, mask) in subscribers {
+        let Some(client) = state.clients.get_mut(&owner) else {
+            continue;
+        };
+        let sequence = SequenceNumber(client.last_sequence.load(Ordering::Relaxed));
+        if mask & x11randr::NOTIFY_MASK_SCREEN_CHANGE != 0 {
+            let event = x11randr::encode_screen_change_notify_event(
+                client.byte_order,
+                RANDR_FIRST_EVENT,
+                sequence,
+                x11randr::ScreenChangeNotify {
+                    timestamp,
+                    config_timestamp: timestamp,
+                    root: crate::resources::ROOT_WINDOW.0,
+                    request_window: request_window.0,
+                    width,
+                    height,
+                    width_mm,
+                    height_mm,
+                },
+            );
+            crate::core_loop::fanout::record_outbound_telemetry(
+                yserver_protocol::x11::ClientId(owner),
+                client.byte_order,
+                &event,
+            );
+            let _ = client_io::write_or_buffer(client, &event);
+        }
+        if mask & x11randr::NOTIFY_MASK_OUTPUT_CHANGE != 0 {
+            for &(output, crtc, mode, connection) in &changed {
+                let event = x11randr::encode_output_change_notify_event(
+                    client.byte_order,
+                    RANDR_FIRST_EVENT,
+                    sequence,
+                    x11randr::OutputChangeNotify {
+                        timestamp,
+                        config_timestamp: timestamp,
+                        request_window: request_window.0,
+                        output,
+                        crtc,
+                        mode,
+                        connection,
+                    },
+                );
+                crate::core_loop::fanout::record_outbound_telemetry(
+                    yserver_protocol::x11::ClientId(owner),
+                    client.byte_order,
+                    &event,
+                );
+                let _ = client_io::write_or_buffer(client, &event);
+            }
+        }
+    }
+}
+
+/// Fans out `RRNotify_OutputProperty` (randr/rrproperty.c
+/// `RRDeliverPropertyEvent`) to every client that selected
+/// `NOTIFY_MASK_OUTPUT_PROPERTY` via `RRSelectInput`. Unlike
+/// `notify_randr_layout_changed`, this is not gated on
+/// `NOTIFY_MASK_SCREEN_CHANGE`/`NOTIFY_MASK_OUTPUT_CHANGE` — property
+/// changes are a distinct notify sub-type in the real protocol.
+pub(crate) fn notify_randr_output_property_changed(
+    state: &mut ServerState,
+    output: u32,
+    atom: yserver_protocol::x11::AtomId,
+    property_state: u8,
+) {
+    use std::sync::atomic::Ordering;
+    use yserver_protocol::x11::{SequenceNumber, randr as x11randr};
+
+    const RANDR_FIRST_EVENT: u8 = 89;
+
+    let timestamp = state.randr.timestamp;
+    let subscribers: Vec<(u32, yserver_protocol::x11::ResourceId, u16)> = state
+        .randr_select_masks
+        .iter()
+        .map(|((owner, window), mask)| (*owner, *window, *mask))
+        .collect();
+    for (owner, request_window, mask) in subscribers {
+        if mask & x11randr::NOTIFY_MASK_OUTPUT_PROPERTY == 0 {
+            continue;
+        }
+        let Some(client) = state.clients.get_mut(&owner) else {
+            continue;
+        };
+        let sequence = SequenceNumber(client.last_sequence.load(Ordering::Relaxed));
+        let event = x11randr::encode_output_property_notify_event(
+            client.byte_order,
+            RANDR_FIRST_EVENT,
+            sequence,
+            x11randr::OutputPropertyNotify {
+                request_window: request_window.0,
+                output,
+                atom: atom.0,
+                timestamp,
+                state: property_state,
+            },
+        );
+        crate::core_loop::fanout::record_outbound_telemetry(
+            yserver_protocol::x11::ClientId(owner),
+            client.byte_order,
+            &event,
+        );
+        let _ = client_io::write_or_buffer(client, &event);
+    }
 }
 
 /// Common side-effects of a logical-screen-size change: update root +
@@ -1249,6 +1882,11 @@ pub fn emit_randr_change_notifications(state: &mut ServerState, changed: &[(u32,
                     height_mm,
                 },
             );
+            crate::core_loop::fanout::record_outbound_telemetry(
+                yserver_protocol::x11::ClientId(owner),
+                client.byte_order,
+                &event,
+            );
             let _ = client_io::write_or_buffer(client, &event);
         }
         for &(output, crtc, mode) in changed {
@@ -1269,6 +1907,11 @@ pub fn emit_randr_change_notifications(state: &mut ServerState, changed: &[(u32,
                         height: crtc_h,
                     },
                 );
+                crate::core_loop::fanout::record_outbound_telemetry(
+                    yserver_protocol::x11::ClientId(owner),
+                    client.byte_order,
+                    &event,
+                );
                 let _ = client_io::write_or_buffer(client, &event);
             }
             if mask & x11randr::NOTIFY_MASK_OUTPUT_CHANGE != 0 {
@@ -1288,6 +1931,11 @@ pub fn emit_randr_change_notifications(state: &mut ServerState, changed: &[(u32,
                             .copied()
                             .unwrap_or(x11randr::CONNECTION_CONNECTED),
                     },
+                );
+                crate::core_loop::fanout::record_outbound_telemetry(
+                    yserver_protocol::x11::ClientId(owner),
+                    client.byte_order,
+                    &event,
                 );
                 let _ = client_io::write_or_buffer(client, &event);
             }
@@ -1745,6 +2393,223 @@ fn _hint(_: UnixStream) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The count cap alone was sized on an assumption of ~0.25 ms per
+    /// request (`MAX_REQUESTS_PER_ITER`'s own doc comment). Measured on
+    /// silence under MATE + adapta-nokto during a window drag, single
+    /// requests reach 44-50 ms (`longest=op70:44.23ms`), so 32 of them
+    /// is ~1.4 s in one iteration — during which `HostInput` and
+    /// `PageFlipReady` sit undelivered in the same channel and the
+    /// cursor visibly stalls (`gap_max` 225-360 ms). These pin the
+    /// deadline half of the budget.
+    #[test]
+    fn budget_not_exhausted_when_both_count_and_time_remain() {
+        assert!(!budget_exhausted(31, Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn budget_exhausted_when_count_runs_out() {
+        assert!(budget_exhausted(0, Duration::from_millis(0)));
+    }
+
+    /// THE FIX: slow requests must stop the drain even with count left.
+    #[test]
+    fn budget_exhausted_when_deadline_passed_despite_count_remaining() {
+        assert!(budget_exhausted(31, REQUEST_TIME_BUDGET));
+        assert!(budget_exhausted(
+            31,
+            REQUEST_TIME_BUDGET + Duration::from_millis(40)
+        ));
+    }
+
+    /// One 44 ms request must not authorise 31 more. This is the
+    /// 1.4 s-iteration case the count-only cap allowed.
+    #[test]
+    fn budget_stops_after_a_single_overrunning_request() {
+        let elapsed_after_one_slow_request = Duration::from_millis(44);
+        assert!(budget_exhausted(
+            MAX_REQUESTS_PER_ITER - 1,
+            elapsed_after_one_slow_request
+        ));
+    }
+
+    /// Forward progress: the budget is checked before each request with
+    /// elapsed measured from the top of the iteration, so the first
+    /// request of an iteration always runs. Without this the loop could
+    /// livelock without draining anything.
+    #[test]
+    fn budget_permits_the_first_request_of_an_iteration() {
+        assert!(!budget_exhausted(MAX_REQUESTS_PER_ITER, Duration::ZERO));
+    }
+
+    /// The fast path must be unchanged: 32 × 0.25 ms = 8 ms, so a
+    /// well-behaved burst still exhausts on count, not on time.
+    #[test]
+    fn typical_fast_requests_still_exhaust_on_count_first() {
+        let typical = Duration::from_micros(250);
+        let elapsed_at_cap = typical * u32::try_from(MAX_REQUESTS_PER_ITER).unwrap();
+        assert!(
+            elapsed_at_cap <= REQUEST_TIME_BUDGET,
+            "time budget must not bind before the count cap for ~0.25ms requests \
+             (elapsed_at_cap={elapsed_at_cap:?}, budget={REQUEST_TIME_BUDGET:?})"
+        );
+    }
+
+    #[test]
+    fn loop_telemetry_attributes_burst_depth_age_and_sequence_boundary() {
+        let client = yserver_protocol::x11::ClientId(17);
+        let other = yserver_protocol::x11::ClientId(23);
+        let mut telemetry = LoopTelemetry {
+            enabled: true,
+            ..LoopTelemetry::default()
+        };
+
+        telemetry.record_channel_drain(65_541, &HashMap::from([(client, 65_536), (other, 5)]));
+        telemetry.record_request_accepted(client, yserver_protocol::x11::SequenceNumber(0xffff));
+        telemetry.record_request_accepted(client, yserver_protocol::x11::SequenceNumber(0x0000));
+        telemetry.record_deferred_push(client);
+        telemetry.record_deferred_push(client);
+        telemetry.record_deferred_push(other);
+        telemetry.record_deferred_pop(client);
+        telemetry.record_request(
+            client,
+            133,
+            26,
+            Duration::from_micros(20),
+            Duration::from_millis(1_750),
+        );
+
+        assert_eq!(telemetry.channel_request_batch_max, 65_541);
+        assert_eq!(telemetry.channel_client_batch_max, (17, 65_536));
+        assert_eq!(telemetry.deferred_current, 2);
+        assert_eq!(telemetry.max_deferred_depth, 3);
+        let client_stats = &telemetry.clients[&client];
+        assert_eq!(client_stats.deferred_current, 1);
+        assert_eq!(client_stats.deferred_max, 2);
+        assert_eq!(client_stats.accepted, 2);
+        assert_eq!(client_stats.request_age_max, Duration::from_millis(1_750));
+        assert_eq!(client_stats.requests_by_opcode[&(133, Some(26))], 1);
+        assert_eq!(client_stats.sequence_ffff, 1);
+        assert_eq!(client_stats.sequence_zero, 1);
+    }
+
+    fn deferred_request(id: u32, opcode: u8) -> DeferredRequest {
+        DeferredRequest {
+            id: yserver_protocol::x11::ClientId(id),
+            sequence: yserver_protocol::x11::SequenceNumber(1),
+            accepted_at: None,
+            header: yserver_protocol::x11::RequestHeader {
+                opcode,
+                data: 0,
+                length_units: 1,
+            },
+            body: Vec::new(),
+            attached_fd: None,
+        }
+    }
+
+    #[test]
+    fn server_grab_blocks_only_non_owner_requests() {
+        let mut state = ServerState::new();
+        state.server_grab_owner = Some(yserver_protocol::x11::ClientId(7));
+
+        assert!(!blocked_by_server_grab(&state, &deferred_request(7, 127)));
+        assert!(blocked_by_server_grab(&state, &deferred_request(8, 127)));
+        state.server_grab_owner = None;
+        assert!(!blocked_by_server_grab(&state, &deferred_request(8, 127)));
+    }
+
+    #[test]
+    fn released_server_grab_waiters_join_round_robin_in_waiter_order() {
+        let mut deferred = FairRequestQueue::default();
+        deferred.push_back(deferred_request(9, 90));
+        let mut waiters = VecDeque::from([deferred_request(2, 20), deferred_request(3, 30)]);
+
+        release_server_grab_waiters(&mut deferred, &mut waiters, &mut LoopTelemetry::default());
+
+        let mut order = Vec::new();
+        while let Some(req) = deferred.pop_front() {
+            order.push((req.id.0, req.header.opcode));
+        }
+        assert_eq!(order, [(9, 90), (2, 20), (3, 30)]);
+        assert!(waiters.is_empty());
+    }
+
+    #[test]
+    fn released_server_grab_prefix_stays_ahead_of_same_client_suffix() {
+        let mut deferred = FairRequestQueue::default();
+        // Requests 16 and 17 were popped and parked while another client held
+        // GrabServer. Requests 18 and 19 were already the remaining suffix in
+        // the fair queue. The old release path appended the parked prefix and
+        // dispatched 18,19,16,17, corrupting Xlib/XCB sequence tracking.
+        deferred.push_back(deferred_request(66, 18));
+        deferred.push_back(deferred_request(66, 19));
+        deferred.push_back(deferred_request(12, 90));
+        let mut waiters = VecDeque::from([deferred_request(66, 16), deferred_request(66, 17)]);
+
+        release_server_grab_waiters(&mut deferred, &mut waiters, &mut LoopTelemetry::default());
+
+        let mut client_66_order = Vec::new();
+        while let Some(req) = deferred.pop_front() {
+            if req.id.0 == 66 {
+                client_66_order.push(req.header.opcode);
+            }
+        }
+        assert_eq!(client_66_order, [16, 17, 18, 19]);
+        assert!(waiters.is_empty());
+    }
+
+    #[test]
+    fn fair_queue_round_robins_clients_and_preserves_each_clients_order() {
+        let mut queue = FairRequestQueue::default();
+        queue.push_back(deferred_request(57, 1));
+        queue.push_back(deferred_request(57, 2));
+        queue.push_back(deferred_request(12, 10));
+        queue.push_back(deferred_request(57, 3));
+        queue.push_back(deferred_request(12, 11));
+
+        let mut order = Vec::new();
+        while let Some(req) = queue.pop_front() {
+            order.push((req.id.0, req.header.opcode));
+        }
+        assert_eq!(order, [(57, 1), (12, 10), (57, 2), (12, 11), (57, 3)]);
+        assert!(queue.is_empty());
+    }
+
+    /// The grab owner can be dropped by paths that carry no release check of
+    /// their own — `process_disconnect` runs at two sites outside the message
+    /// loop (a failed outbound write, and the writable-interest reconcile).
+    /// The loop therefore re-checks once per iteration. This pins the state
+    /// that made that necessary: waiters parked while `deferred_requests` is
+    /// EMPTY, because the poll timeout keys off `deferred_requests` alone, so
+    /// a waiter left in the side queue would strand its client until
+    /// unrelated traffic happened to wake the loop.
+    #[test]
+    fn owner_disconnect_outside_the_message_loop_still_frees_waiters() {
+        let mut state = ServerState::new();
+        state.server_grab_owner = Some(yserver_protocol::x11::ClientId(1));
+        let mut deferred = FairRequestQueue::default();
+        let mut waiters = VecDeque::from([deferred_request(2, 20)]);
+
+        // While the grab is held, a waiter must stay parked.
+        if state.server_grab_owner.is_none() {
+            release_server_grab_waiters(&mut deferred, &mut waiters, &mut LoopTelemetry::default());
+        }
+        assert_eq!(waiters.len(), 1, "grab still held: waiter stays parked");
+        assert!(deferred.is_empty(), "nothing runnable while grabbed");
+
+        // Owner reaped by a path with no release check of its own (this is
+        // what process_disconnect does at run.rs' two non-message sites).
+        state.server_grab_owner = None;
+
+        // The per-iteration re-check must pick it up on its own.
+        if state.server_grab_owner.is_none() {
+            release_server_grab_waiters(&mut deferred, &mut waiters, &mut LoopTelemetry::default());
+        }
+        assert!(waiters.is_empty(), "released grab must free its waiters");
+        assert_eq!(deferred.pop_front().map(|r| r.id.0), Some(2));
+        assert!(deferred.is_empty());
+    }
     use crate::{
         backend::recording::RecordingBackend,
         core_loop::sender::channel,

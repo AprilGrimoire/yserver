@@ -1544,6 +1544,28 @@ impl PlatformBackend {
         self.hw_cursor_disabled = true;
     }
 
+    /// True iff the KMS driver is nvidia-drm. On NVIDIA the HW cursor
+    /// plane is a trap: the legacy `drmModeMoveCursor` ioctl BLOCKS ~1
+    /// vblank (~11.5ms) per move — HW-measured on a GTX-1050, it stalls
+    /// the single-threaded loop on every cursor motion during a drag —
+    /// and the atomic cursor-plane path regressed rendering (the
+    /// abandoned bundle-cursor-atomic branch). The SW (composited) cursor
+    /// is smooth on NVIDIA (cheap GPU compose), so we default to it there.
+    /// Best-effort: `get_driver` failure → `false` (keep HW cursor).
+    #[must_use]
+    pub(crate) fn is_nvidia_drm(&self) -> bool {
+        use ::drm::Device as _;
+        self.primary_device()
+            .and_then(|device| device.device.get_driver().ok())
+            .map(|d| {
+                d.name()
+                    .to_string_lossy()
+                    .to_ascii_lowercase()
+                    .contains("nvidia")
+            })
+            .unwrap_or(false)
+    }
+
     /// True iff the HW cursor strategy has been latched off because a
     /// bind ioctl failed with a "driver doesn't support cursor ioctls"
     /// errno (see [`cursor_err_disables_hw`]). Diagnostic / test hook.

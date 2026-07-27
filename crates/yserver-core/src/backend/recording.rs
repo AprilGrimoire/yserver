@@ -24,7 +24,8 @@ use yserver_protocol::x11::{ClipRectangles, FontMetrics, ResourceId, xfixes};
 use crate::{
     backend::{
         AnyHandle, Backend, ClipState, CursorHandle, DrawState, FillState, FontHandle,
-        GlyphSetHandle, OriginContext, PictureHandle, PixmapHandle, WindowHandle,
+        GlyphSetHandle, OriginContext, PictureHandle, PixmapHandle, PresentSourceWait,
+        WindowHandle,
     },
     host_x11::{HostSubwindowConfig, HostSubwindowVisual, HostXidMap, PointerPosition},
 };
@@ -116,6 +117,11 @@ pub enum RecordedCall {
     DefineCursor {
         host_window_xid: u32,
         cursor_host_xid: u32,
+    },
+    RecolorCursor {
+        host_xid: u32,
+        fore: (u16, u16, u16),
+        back: (u16, u16, u16),
     },
     SetDpmsPower(u8),
     SetProviderOutputSource {
@@ -234,6 +240,10 @@ pub struct RecordingBackend {
     /// Configurable region returned by RENDER paint methods so core
     /// tests can assert exact damage plumbing without a real backend.
     pub render_return_region: Vec<xfixes::RegionRect>,
+    /// Test controls for the asynchronous Present source-wait bridge.
+    pub present_source_wait: PresentSourceWait,
+    pub ready_present_source_waits: Vec<u64>,
+    pub finished_present_source_waits: Vec<u64>,
 }
 
 impl Default for RecordingBackend {
@@ -270,6 +280,9 @@ impl RecordingBackend {
             xkb_rules_names: None,
             xkb_mods: (0, 0, 0, 0),
             render_return_region: Vec::new(),
+            present_source_wait: PresentSourceWait::Ready,
+            ready_present_source_waits: Vec::new(),
+            finished_present_source_waits: Vec::new(),
         }
     }
 
@@ -340,6 +353,21 @@ impl Backend for RecordingBackend {
 
     fn root_visual_xid(&self) -> u32 {
         self.fake_root_visual_xid
+    }
+
+    fn arm_present_source_wait(
+        &mut self,
+        _src_pixmap_host_xid: u32,
+    ) -> std::io::Result<PresentSourceWait> {
+        Ok(self.present_source_wait)
+    }
+
+    fn drain_ready_present_source_waits(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.ready_present_source_waits)
+    }
+
+    fn finish_present_source_wait(&mut self, wait_id: u64) {
+        self.finished_present_source_waits.push(wait_id);
     }
 
     fn argb_visual_xid(&self) -> Option<u32> {
@@ -787,6 +815,21 @@ impl Backend for RecordingBackend {
     ) -> io::Result<CursorHandle> {
         let xid = self.allocate_handle();
         Ok(CursorHandle::from_raw_panicking(xid))
+    }
+
+    fn recolor_cursor(
+        &mut self,
+        _origin: Option<OriginContext>,
+        host_xid: u32,
+        fore: (u16, u16, u16),
+        back: (u16, u16, u16),
+    ) -> io::Result<()> {
+        self.record(RecordedCall::RecolorCursor {
+            host_xid,
+            fore,
+            back,
+        });
+        Ok(())
     }
 
     fn define_cursor(

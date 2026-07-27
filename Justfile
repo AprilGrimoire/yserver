@@ -2,11 +2,12 @@ KERNEL := "/boot/vmlinuz-linux-cachyos"
 
 # ============================== SETUP & ENVIRONMENT CHECKS ==============================
 
-# Build a release yserver and install it to /usr/local/bin (needs sudo).
+# Build a release yserver and install it + the starty launcher to /usr/local/bin (needs sudo).
 install:
     cargo build --release --bin yserver
     sudo install -m755 target/release/yserver /usr/local/bin/yserver
-    @echo "installed /usr/local/bin/yserver — see README 'Use with a display manager' to enable it"
+    sudo install -m755 starty /usr/local/bin/starty
+    @echo "installed /usr/local/bin/yserver + /usr/local/bin/starty — see README 'Use directly on TTY' for starty"
 
 # ============================== CORE — RUN / HEADLESS / SSH / DEBUG / ENTRY ==============================
 
@@ -127,21 +128,19 @@ yserver-cinnamon-hw-perf log="warn" freq="999":
         tools/profile-mate.sh
 
 yserver-cinnamon-hw-telemetry log="info":
-    RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release --bin yserver
+    cargo build --release --bin yserver
     rm -f yserver-cinnamon.submit.tsv
     bash -c '\
-        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
         YSERVER_LOOP_TELEMETRY=1 YSERVER_SUBMIT_TRACE=yserver-cinnamon.submit.tsv \
             RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
             target/release/yserver > yserver-hw-cinnamon.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 \
-            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
+            XDG_SESSION_TYPE=x11 \
             dbus-run-session cinnamon-session > cinnamon.log 2>&1;\
         kill -TERM $yserver_pid 2>/dev/null;\
-        wait $yserver_pid 2>/dev/null;\
-        rm -rf "$xdg_rd" 2>/dev/null;'
+        wait $yserver_pid 2>/dev/null;'
 
 yserver-cinnamon-hw-trace log="trace":
     cargo build --bin yserver
@@ -183,30 +182,6 @@ yserver-mate-hw log="warn":
 yserver-mate-hw-perf log="warn" freq="999":
     RUST_LOG={{log}} PERF_FREQ={{freq}} tools/profile-mate.sh
 
-# Release-mode mate with logging turned down to `warn`. Use this to
-# test whether pointer lag under hover is dominated by env_logger /
-# stderr formatting cost (observed at ~5% of CPU under debug+debug
-# build) or by the underlying paint pipeline. If hover responds
-# noticeably faster than `yserver-mate-hw`, logging was the bottleneck.
-#
-# Build is forced with `-C force-frame-pointers=yes` so that
-# `perf record --call-graph fp` can walk the stack reliably for
-# flamegraphs. Without this, optimized Rust release builds produce
-# ~66% [unknown] frames in the flamegraph (DWARF unwinding fails
-# partway through inlined call chains). ~1-2% runtime cost; harmless
-# for general release use, essential for profiling.
-yserver-mate-hw-release log="warn":
-    RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release --bin yserver
-    bash -c '\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-mate.log 2>&1 &\
-        yserver_pid=$!;\
-        sleep 2;\
-        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 \
-            XDG_SESSION_TYPE=x11 \
-            dbus-run-session mate-session --display :7 > mate.log 2>&1;\
-        kill -TERM $yserver_pid 2>/dev/null;\
-        wait $yserver_pid 2>/dev/null;\
-
 # Release-build counterpart to `yserver-mate-hw-trace`: builds with
 # `--release` (so perf characteristics match real-world) but still
 # wires `x11trace` between mate-session and yserver, dumping the
@@ -218,7 +193,7 @@ yserver-mate-hw-release log="warn":
 # Defaults `RUST_LOG=warn` so yserver-hw-mate.log stays compact; pass
 # `log=...` to crank specific targets for a cross-reference run.
 yserver-mate-hw-release-trace log="warn":
-    RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release --bin yserver
+    cargo build --release --bin yserver
     rm -f mate.xtrace
     bash -c '\
         RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-mate.log 2>&1 &\
@@ -256,26 +231,24 @@ yserver-mate-hw-release-trace log="warn":
 # through; pass `log=warn` if you need quieter output, but you'll
 # lose the rollup lines (they're info!-level).
 yserver-mate-hw-telemetry log="info":
-    RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release --bin yserver
+    cargo build --release --bin yserver
     rm -f yserver-mate.submit.tsv
     bash -c '\
-        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
-        YSERVER_LOOP_TELEMETRY=1 YSERVER_SUBMIT_TRACE=yserver-mate.submit.tsv \
+        YSERVER_TICK_SKIP_LOG=1 YSERVER_LOOP_TELEMETRY=1 YSERVER_SUBMIT_TRACE=yserver-mate.submit.tsv \
             RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
             target/release/yserver > yserver-hw-mate.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 \
-            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
+            XDG_SESSION_TYPE=x11 \
             dbus-run-session mate-session --display :7 > mate.log 2>&1;\
         kill -TERM $yserver_pid 2>/dev/null;\
-        wait $yserver_pid 2>/dev/null;\
-        rm -rf "$xdg_rd" 2>/dev/null;'
+        wait $yserver_pid 2>/dev/null;'
 
 # MATE on yserver/KMS with x11trace recording the full X11 wire
 # protocol between clients and yserver. Follows the server default
 # cursor strategy, currently SW cursor.
-yserver-mate-hw-trace log="trace":
+yserver-mate-hw-trace log="warn":
     cargo build --bin yserver
     rm -f mate.xtrace
     bash -c '\
@@ -356,7 +329,7 @@ yserver-xfce-hw-perf log="warn" freq="999":
         tools/profile-mate.sh
 
 yserver-xfce-hw-telemetry log="info":
-    RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release --bin yserver
+    cargo build --release --bin yserver
     rm -f yserver-xfce.submit.tsv
     bash -c '\
         YSERVER_LOOP_TELEMETRY=1 YSERVER_SUBMIT_TRACE=yserver-xfce.submit.tsv \
@@ -506,7 +479,7 @@ yserver-e27-xterm-hw-trace log="debug":
 #   grep "render_telemetry"   yserver-hw-e27.log   # per-second render rollup
 #   grep "loop telemetry" yserver-hw-e27.log   # iter/s + host_input gap
 yserver-e27-hw-telemetry log="info":
-    RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release --bin yserver
+    cargo build --release --bin yserver
     rm -f yserver-e27.submit.tsv
     bash -c '\
         xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
@@ -564,7 +537,7 @@ yserver-openbox-picom-hw log="info":
 # faults). RUST_LOG defaults to `info` for the rollups.
 #   grep "render_telemetry" yserver-hw-openbox-picom.log   # copy_area_calls/s etc
 yserver-openbox-picom-xrender-hw-telemetry log="info":
-    RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release --bin yserver
+    cargo build --release --bin yserver
     rm -f yserver-openbox-picom.submit.tsv
     bash -c '\
         xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
@@ -622,7 +595,7 @@ yserver-awesome-hw log="info":
 # RUST_LOG defaults to `info` so the rollup lines come through; pass
 # `log=warn` for quieter output (but you lose the rollups — they're info!).
 yserver-awesome-hw-telemetry log="info":
-    RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release --bin yserver
+    cargo build --release --bin yserver
     rm -f yserver-awesome.submit.tsv
     bash -c '\
         xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
@@ -788,7 +761,7 @@ yserver-fvwm3-xterm-hw log="info":
 #   cursor_move_ebusy/s ~0 while moving         -> cursor is SW, tied to compose cadence (#2)
 #   full_redraw_fallback/s == frame_present_count/s (damage_fraction~1.0) confirms Repaint::Full/frame
 yserver-fvwm3-hw-telemetry log="info":
-    RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release --bin yserver
+    cargo build --release --bin yserver
     rm -f yserver-fvwm3.submit.tsv
     bash -c '\
         xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\

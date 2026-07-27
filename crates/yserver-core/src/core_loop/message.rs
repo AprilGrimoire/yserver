@@ -2,7 +2,10 @@
 //!
 //! See `docs/superpowers/plans/2026-05-06-single-threaded-core.md` Phase B.
 
-use std::os::{fd::OwnedFd, unix::net::UnixStream};
+use std::{
+    os::{fd::OwnedFd, unix::net::UnixStream},
+    time::Instant,
+};
 
 use yserver_protocol::x11::{ClientByteOrder, ClientId, RequestHeader, SequenceNumber};
 
@@ -143,6 +146,11 @@ pub enum Message {
     Request {
         id: ClientId,
         sequence: SequenceNumber,
+        /// Time at which the reader finished framing this request. Present
+        /// only under opt-in core-loop telemetry, avoiding a clock read per
+        /// request in normal operation while measuring channel + deferred
+        /// queue age from the correct producer boundary.
+        accepted_at: Option<Instant>,
         header: RequestHeader,
         body: Vec<u8>,
         attached_fd: Option<OwnedFd>,

@@ -84,12 +84,14 @@ pub const RR_FREE_LEASE: u8 = 46;
 pub const NOTIFY_MASK_SCREEN_CHANGE: u16 = 1 << 0;
 pub const NOTIFY_MASK_CRTC_CHANGE: u16 = 1 << 1;
 pub const NOTIFY_MASK_OUTPUT_CHANGE: u16 = 1 << 2;
+pub const NOTIFY_MASK_OUTPUT_PROPERTY: u16 = 1 << 3;
 pub const NOTIFY_MASK_PROVIDER_CHANGE: u16 = 1 << 4;
 
 pub const EVENT_SCREEN_CHANGE_NOTIFY: u8 = 0;
 pub const EVENT_NOTIFY: u8 = 1;
 pub const NOTIFY_CRTC_CHANGE: u8 = 0;
 pub const NOTIFY_OUTPUT_CHANGE: u8 = 1;
+pub const NOTIFY_OUTPUT_PROPERTY: u8 = 2;
 pub const NOTIFY_PROVIDER_CHANGE: u8 = 3;
 pub const ROTATION_ROTATE_0: u16 = 1;
 pub const SET_CONFIG_SUCCESS: u8 = 0;
@@ -103,6 +105,10 @@ pub const PROVIDER_CAPABILITY_SOURCE_OFFLOAD: u32 = 1 << 2;
 pub const PROVIDER_CAPABILITY_SINK_OFFLOAD: u32 = 1 << 3;
 /// RANDR extension-relative error number (`BadProvider`).
 pub const ERROR_BAD_PROVIDER: u8 = 3;
+/// `xRROutputPropertyNotifyEvent.state`: the property gained a new value.
+pub const PROPERTY_NEW_VALUE: u8 = 0;
+/// `xRROutputPropertyNotifyEvent.state`: the property was deleted.
+pub const PROPERTY_DELETE: u8 = 1;
 
 // ── Local wire helpers (mirrors of wire.rs helpers, private to this module) ──
 
@@ -179,6 +185,11 @@ pub struct GetOutputPropertyRequest {
     pub long_length: u32,
     pub delete: bool,
     pub pending: bool,
+    /// The raw `delete` byte, for the handler to enforce Xorg's strict
+    /// `BOOL` validation (`stuff->delete != xTrue && stuff->delete !=
+    /// xFalse` is a `BadValue`) — unlike `pending`, `delete` is not
+    /// tolerant of arbitrary nonzero values on the wire.
+    pub delete_raw: u8,
 }
 
 #[derive(Debug, PartialEq)]
@@ -324,6 +335,90 @@ pub fn parse_output_property_request(body: &[u8]) -> Option<OutputPropertyReques
     })
 }
 
+/// `RRConfigureOutputProperty` (randrproto.h `xRRConfigureOutputPropertyReq`,
+/// 12 bytes fixed: output, property, pending(BOOL), range(BOOL), pad(2))
+/// followed by a trailing `INT32[]` of valid values (range pairs or an
+/// enumeration, per `range`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigureOutputPropertyRequest {
+    pub output: u32,
+    pub property: u32,
+    pub pending: bool,
+    pub range: bool,
+    pub valid_values: Vec<i32>,
+}
+
+pub fn parse_configure_output_property_request(
+    body: &[u8],
+) -> Option<ConfigureOutputPropertyRequest> {
+    if body.len() < 12 {
+        return None;
+    }
+    let trailing = &body[12..];
+    if !trailing.len().is_multiple_of(4) {
+        return None;
+    }
+    let valid_values = trailing
+        .chunks_exact(4)
+        .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    Some(ConfigureOutputPropertyRequest {
+        output: read_u32_le(body),
+        property: read_u32_le(&body[4..]),
+        pending: body[8] != 0,
+        range: body[9] != 0,
+        valid_values,
+    })
+}
+
+/// `RRChangeOutputProperty` (randrproto.h `xRRChangeOutputPropertyReq`, 20
+/// bytes fixed: output, property, type, format(BYTE), mode(BYTE), pad(2),
+/// nUnits) followed by `nUnits * (format/8)` bytes of value data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeOutputPropertyRequest {
+    pub output: u32,
+    pub property: u32,
+    pub prop_type: u32,
+    pub format: u8,
+    pub mode: u8,
+    pub n_units: u32,
+    pub data: Vec<u8>,
+}
+
+/// Parses the fixed 20-byte header always; tolerates an invalid `format`
+/// (unit size unknown) by capturing the rest of the body verbatim so the
+/// handler can reject with `BadValue` before ever reading `data`, mirroring
+/// `x11::change_property_request`.
+pub fn parse_change_output_property_request(body: &[u8]) -> Option<ChangeOutputPropertyRequest> {
+    if body.len() < 20 {
+        return None;
+    }
+    let format = body[12];
+    let mode = body[13];
+    let n_units = read_u32_le(&body[16..]);
+    let unit = match format {
+        8 => Some(1usize),
+        16 => Some(2),
+        32 => Some(4),
+        _ => None,
+    };
+    let data = if let Some(unit) = unit {
+        let data_bytes = (n_units as usize).checked_mul(unit)?;
+        body.get(20..20 + data_bytes)?.to_vec()
+    } else {
+        body.get(20..)?.to_vec()
+    };
+    Some(ChangeOutputPropertyRequest {
+        output: read_u32_le(body),
+        property: read_u32_le(&body[4..]),
+        prop_type: read_u32_le(&body[8..]),
+        format,
+        mode,
+        n_units,
+        data,
+    })
+}
+
 /// Parse `RRGetOutputProperty`. Body: output, property, type,
 /// long-offset, long-length (5×CARD32) + delete, pending (2×BOOL) +
 /// 2 pad. `delete`/`pending` are tolerated as absent (default false)
@@ -340,6 +435,7 @@ pub fn parse_get_output_property_request(body: &[u8]) -> Option<GetOutputPropert
         long_length: read_u32_le(&body[16..]),
         delete: body.get(20).is_some_and(|&b| b != 0),
         pending: body.get(21).is_some_and(|&b| b != 0),
+        delete_raw: body.get(20).copied().unwrap_or(0),
     })
 }
 
@@ -913,6 +1009,30 @@ pub fn encode_get_output_property_reply(
     out
 }
 
+/// Encodes a `QueryOutputProperty` reply (randrproto.h
+/// `xRRQueryOutputPropertyReply`, 32-byte header + `valid_values.len()`
+/// trailing `INT32`s). `length` is the trailing count, matching Xorg
+/// (`rep.length = prop->num_valid`).
+pub fn encode_query_output_property_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    pending: bool,
+    range: bool,
+    immutable: bool,
+    valid_values: &[i32],
+) -> Vec<u8> {
+    let mut out = fixed_reply(byte_order, sequence, 0, valid_values.len() as u32);
+    out.push(u8::from(pending));
+    out.push(u8::from(range));
+    out.push(u8::from(immutable));
+    out.extend_from_slice(&[0u8; 21]); // pad1(1) + pad2..pad6(20) -> 32-byte header
+    debug_assert_eq!(out.len(), 32);
+    for &v in valid_values {
+        put(byte_order, &mut out, v as u32);
+    }
+    out
+}
+
 /// Encodes a `GetPanning` reply (36 bytes) with all-zero panning (no panning configured).
 ///
 /// Wire layout: `status(1) seq(2) length=1(4) timestamp(4) left top width height
@@ -1169,6 +1289,19 @@ pub struct CrtcChangeNotify {
     pub height: u16,
 }
 
+/// `xRROutputPropertyNotifyEvent` (randrproto.h): wire order is
+/// `window, output, atom, timestamp, state` — note `window` leads (unlike
+/// `CrtcChangeNotify`/`OutputChangeNotify`, where `timestamp` leads).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OutputPropertyNotify {
+    pub request_window: u32,
+    pub output: u32,
+    pub atom: u32,
+    pub timestamp: u32,
+    /// `PROPERTY_NEW_VALUE` or `PROPERTY_DELETE`.
+    pub state: u8,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OutputChangeNotify {
     pub timestamp: u32,
@@ -1274,6 +1407,29 @@ pub fn encode_provider_change_notify_event(
     put(byte_order, &mut buf, event.request_window);
     put(byte_order, &mut buf, event.provider);
     buf.extend_from_slice(&[0u8; 16]);
+    buf.try_into().expect("32-byte event")
+}
+
+#[must_use]
+pub fn encode_output_property_notify_event(
+    byte_order: ClientByteOrder,
+    first_event: u8,
+    sequence: SequenceNumber,
+    event: OutputPropertyNotify,
+) -> [u8; 32] {
+    let mut buf: Vec<u8> = Vec::with_capacity(32);
+    buf.push(first_event + EVENT_NOTIFY);
+    buf.push(NOTIFY_OUTPUT_PROPERTY);
+    put(byte_order, &mut buf, sequence.0);
+    put(byte_order, &mut buf, event.request_window);
+    put(byte_order, &mut buf, event.output);
+    put(byte_order, &mut buf, event.atom);
+    put(byte_order, &mut buf, event.timestamp);
+    buf.push(event.state);
+    buf.push(0u8); // pad1
+    put(byte_order, &mut buf, 0u16); // pad2
+    put(byte_order, &mut buf, 0u32); // pad3
+    put(byte_order, &mut buf, 0u32); // pad4
     buf.try_into().expect("32-byte event")
 }
 
@@ -1608,6 +1764,7 @@ mod tests {
                 long_length: 8,
                 delete: false,
                 pending: true,
+                delete_raw: 0,
             }
         );
         assert!(parse_get_output_property_request(&body[..19]).is_none());
@@ -1658,6 +1815,151 @@ mod tests {
         let req = parse_output_property_request(&body).unwrap();
         assert_eq!(req.output, 1);
         assert_eq!(req.property, 2);
+    }
+
+    #[test]
+    fn parse_configure_output_property_request_reads_header_and_values() {
+        let mut body = vec![
+            0x01, 0x00, 0x00, 0x00, // output
+            0x02, 0x00, 0x00, 0x00, // property
+            1,    // pending = true
+            0,    // range = false
+            0, 0, // pad
+        ];
+        body.extend_from_slice(&10i32.to_le_bytes());
+        body.extend_from_slice(&20i32.to_le_bytes());
+        let req = parse_configure_output_property_request(&body).unwrap();
+        assert_eq!(req.output, 1);
+        assert_eq!(req.property, 2);
+        assert!(req.pending);
+        assert!(!req.range);
+        assert_eq!(req.valid_values, vec![10, 20]);
+    }
+
+    #[test]
+    fn parse_configure_output_property_request_no_values() {
+        let body = [0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0, 0, 0, 0];
+        let req = parse_configure_output_property_request(&body).unwrap();
+        assert!(req.valid_values.is_empty());
+    }
+
+    #[test]
+    fn parse_configure_output_property_request_short_body_returns_none() {
+        assert!(parse_configure_output_property_request(&[0u8; 4]).is_none());
+    }
+
+    #[test]
+    fn parse_change_output_property_request_reads_header_and_data() {
+        let mut body = vec![
+            0x01, 0x00, 0x00, 0x00, // output
+            0x02, 0x00, 0x00, 0x00, // property
+            31, 0x00, 0x00, 0x00, // type (XA_STRING)
+            8,    // format
+            0,    // mode = Replace
+            0, 0, // pad
+            5, 0x00, 0x00, 0x00, // nUnits = 5
+        ];
+        body.extend_from_slice(b"hello");
+        let req = parse_change_output_property_request(&body).unwrap();
+        assert_eq!(req.output, 1);
+        assert_eq!(req.property, 2);
+        assert_eq!(req.prop_type, 31);
+        assert_eq!(req.format, 8);
+        assert_eq!(req.mode, 0);
+        assert_eq!(req.n_units, 5);
+        assert_eq!(req.data, b"hello".to_vec());
+    }
+
+    #[test]
+    fn parse_change_output_property_request_format32_units_are_4_bytes_each() {
+        let mut body = vec![
+            0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, // XA_ATOM
+            32,   // format
+            0, 0, 0, // pad
+            2, 0x00, 0x00, 0x00, // nUnits = 2
+        ];
+        body.extend_from_slice(&1u32.to_le_bytes());
+        body.extend_from_slice(&2u32.to_le_bytes());
+        let req = parse_change_output_property_request(&body).unwrap();
+        assert_eq!(req.data.len(), 8);
+    }
+
+    #[test]
+    fn parse_change_output_property_request_short_body_returns_none() {
+        assert!(parse_change_output_property_request(&[0u8; 8]).is_none());
+    }
+
+    #[test]
+    fn parse_change_output_property_request_invalid_format_captures_raw_tail() {
+        let mut body = vec![
+            0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
+            7, /* bad format */
+            0, 0, 0, 0, 0, 0, 0,
+        ];
+        body.extend_from_slice(b"xy");
+        let req = parse_change_output_property_request(&body).unwrap();
+        assert_eq!(req.format, 7);
+        assert_eq!(req.data, b"xy".to_vec());
+    }
+
+    #[test]
+    fn encode_query_output_property_reply_shape() {
+        let buf = encode_query_output_property_reply(
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(7),
+            true,
+            true,
+            false,
+            &[10, 20],
+        );
+        assert_eq!(buf.len(), 40); // 32-byte header + 2 x 4-byte INT32
+        assert_eq!(buf[0], 1); // reply type
+        assert_eq!(&buf[2..4], &7u16.to_le_bytes());
+        assert_eq!(&buf[4..8], &2u32.to_le_bytes()); // length = num_valid
+        assert_eq!(buf[8], 1); // pending
+        assert_eq!(buf[9], 1); // range
+        assert_eq!(buf[10], 0); // immutable
+        assert_eq!(&buf[32..36], &10i32.to_le_bytes());
+        assert_eq!(&buf[36..40], &20i32.to_le_bytes());
+    }
+
+    #[test]
+    fn encode_query_output_property_reply_no_values_is_32_bytes() {
+        let buf = encode_query_output_property_reply(
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(1),
+            false,
+            false,
+            true,
+            &[],
+        );
+        assert_eq!(buf.len(), 32);
+        assert_eq!(buf[10], 1); // immutable
+    }
+
+    #[test]
+    fn output_property_notify_event_shape() {
+        let buf = encode_output_property_notify_event(
+            ClientByteOrder::LittleEndian,
+            89,
+            SequenceNumber(3),
+            OutputPropertyNotify {
+                request_window: 0x100,
+                output: 1,
+                atom: 42,
+                timestamp: 999,
+                state: PROPERTY_NEW_VALUE,
+            },
+        );
+        assert_eq!(buf.len(), 32);
+        assert_eq!(buf[0], 89 + EVENT_NOTIFY);
+        assert_eq!(buf[1], NOTIFY_OUTPUT_PROPERTY);
+        assert_eq!(&buf[2..4], &3u16.to_le_bytes());
+        assert_eq!(&buf[4..8], &0x100u32.to_le_bytes());
+        assert_eq!(&buf[8..12], &1u32.to_le_bytes());
+        assert_eq!(&buf[12..16], &42u32.to_le_bytes());
+        assert_eq!(&buf[16..20], &999u32.to_le_bytes());
+        assert_eq!(buf[20], PROPERTY_NEW_VALUE);
     }
 
     #[test]

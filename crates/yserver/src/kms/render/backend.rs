@@ -27,7 +27,8 @@ use yserver_core::{
     backend::{
         AnyHandle, Backend, BackendFdKind, ClipState, CursorHandle, DrawState, Dri3Caps,
         Dri3PixmapExport, FillState, FontHandle, GlyphSetHandle, KeymapLoad, OriginContext,
-        PictureHandle, PixmapHandle, PresentCaps, WindowHandle, identity_ramp, resample_channel,
+        PictureHandle, PixmapHandle, PresentCaps, PresentSourceWait, WindowHandle, identity_ramp,
+        resample_channel,
     },
     core_loop::HostInputEvent,
     host_x11::{
@@ -521,6 +522,12 @@ pub struct KmsBackend {
     /// before the source drawable disappears so retain-after-free still
     /// holds for CPU-clipped fills.
     pub(crate) clip_mask_cache: Option<crate::kms::backend::ClipMaskCache>,
+    /// CPU cache of depth-1 SHAPE::Mask readbacks (`read_depth1_pixmap`).
+    /// Cuts the discrete-NVIDIA drag stall (#32/#96): ~60% of those reads
+    /// re-fetch an unchanged mask from VRAM. Keyed by never-recycled
+    /// `DrawableId` + validated by `content_version`. See
+    /// [`crate::kms::backend::Depth1MaskCache`].
+    pub(crate) depth1_mask_cache: crate::kms::backend::Depth1MaskCache,
     /// GPU snapshot of the current clip-mask pixmap for the masked CopyArea
     /// path (Task 14). Single current-clip carrier, mirroring
     /// `clip_mask_cache`'s ownership: created + eagerly populated on install,
@@ -601,6 +608,12 @@ pub struct KmsBackend {
     /// `XFixesDestroyFence` / `FreeSyncobj`.
     pub(crate) pending_present_batches:
         std::collections::VecDeque<crate::kms::render::present_completion::PendingPresentBatch>,
+
+    /// Imported Present sources parked on their producer sync-file. The exact
+    /// source `DrawableId` is incref'd while an entry lives here.
+    pub(crate) pending_present_source_waits:
+        HashMap<u64, crate::kms::render::present_source_wait::PendingPresentSourceWait>,
+    pub(crate) next_present_source_wait_id: u64,
 
     /// Stage 5 Task 6.1: shutdown-time accumulator for PRESENT
     /// completions that need to be drained past `disable_output`
@@ -1313,6 +1326,7 @@ impl KmsBackend {
             armed_vblank_targets: std::collections::HashMap::new(),
             crtc_queue_sequence_unsupported_devices: HashSet::new(),
             clip_mask_cache: None,
+            depth1_mask_cache: crate::kms::backend::Depth1MaskCache::new(256),
             clip_mask_snapshot: None,
             fill_pattern_cache: None,
             kms_outputs_active: true,
@@ -1323,6 +1337,8 @@ impl KmsBackend {
             dri3_xshmfences: HashMap::new(),
             dri3_sync_resources: HashMap::new(),
             pending_present_batches: std::collections::VecDeque::new(),
+            pending_present_source_waits: HashMap::new(),
+            next_present_source_wait_id: 1,
             pending_completed_events_on_shutdown: Vec::new(),
             cursor_records: HashMap::new(),
             cursor_pixmaps: HashMap::new(),
@@ -1449,6 +1465,34 @@ impl KmsBackend {
         // path can sample it. Best-effort: a Vk-less test fixture
         // skips the upload but still keeps the record so unit tests
         // can observe bytes / version.
+        if let Some(pixmap_id) = self.allocate_cursor_sprite_pixmap(&record) {
+            self.cursor_pixmaps.insert(xid, pixmap_id);
+        }
+        self.cursor_records.insert(xid, record);
+        self.refresh_effective_cursor();
+    }
+
+    fn insert_monochrome_cursor_record(
+        &mut self,
+        xid: u32,
+        width: u16,
+        height: u16,
+        hot_x: u16,
+        hot_y: u16,
+        bgra_bytes: Vec<u8>,
+        color_roles: Vec<crate::kms::render::cursor::CursorColorRole>,
+    ) {
+        let version = self.next_cursor_version;
+        self.next_cursor_version = self.next_cursor_version.saturating_add(1);
+        let record = crate::kms::render::cursor::CursorRecord::new_monochrome_with_bgra(
+            width,
+            height,
+            hot_x,
+            hot_y,
+            bgra_bytes,
+            color_roles,
+            version,
+        );
         if let Some(pixmap_id) = self.allocate_cursor_sprite_pixmap(&record) {
             self.cursor_pixmaps.insert(xid, pixmap_id);
         }
@@ -2176,6 +2220,7 @@ impl KmsBackend {
             armed_vblank_targets: std::collections::HashMap::new(),
             crtc_queue_sequence_unsupported_devices: HashSet::new(),
             clip_mask_cache: None,
+            depth1_mask_cache: crate::kms::backend::Depth1MaskCache::new(256),
             clip_mask_snapshot: None,
             fill_pattern_cache: None,
             kms_outputs_active: true,
@@ -2186,6 +2231,8 @@ impl KmsBackend {
             dri3_xshmfences: HashMap::new(),
             dri3_sync_resources: HashMap::new(),
             pending_present_batches: std::collections::VecDeque::new(),
+            pending_present_source_waits: HashMap::new(),
+            next_present_source_wait_id: 1,
             pending_completed_events_on_shutdown: Vec::new(),
             cursor_records: HashMap::new(),
             cursor_pixmaps: HashMap::new(),
@@ -11608,7 +11655,11 @@ impl Backend for KmsBackend {
                 crate::kms::render::present_completion::PresentBatchWait::Poll
             )
         });
-        let present_deadline = if needs_present_poll {
+        let needs_source_wait_poll = self
+            .pending_present_source_waits
+            .values()
+            .any(|wait| !wait.registered && !wait.ready_reported);
+        let present_deadline = if needs_present_poll || needs_source_wait_poll {
             Some(now + std::time::Duration::from_millis(1))
         } else {
             None
@@ -11846,48 +11897,111 @@ impl Backend for KmsBackend {
         }
     }
 
-    fn wait_present_source_ready(&mut self, src_pixmap_host_xid: u32) {
-        use crate::kms::vk::dri3::{DmabufReadWait, wait_dmabuf_read_ready};
-        // Bounded so an absent/stuck producer fence can never hang the
-        // single-threaded core. 50 ms (~3 vsync @ 60 Hz) is generous
-        // for a finished-but-not-flushed GPU frame, short enough that a
-        // pathological miss only yields one stale frame.
-        //
-        // This is a CPU wait — correct and safe, but it stalls the core
-        // for the (usually sub-frame) duration of the producer's
-        // outstanding render. The non-stalling form — a GPU
-        // acquire-semaphore imported from the same dma-buf fence and
-        // waited on the present copy's submit — is filed as a follow-up
-        // to land with the composite-into-frame-builder work (see
-        // docs/known-issues.md), where there is one well-defined submit
-        // per frame to attach the wait to.
-        const TIMEOUT_MS: i32 = 50;
+    fn arm_present_source_wait(
+        &mut self,
+        src_pixmap_host_xid: u32,
+    ) -> io::Result<PresentSourceWait> {
+        use std::os::fd::AsFd;
+
+        use crate::kms::{
+            render::present_source_wait::PendingPresentSourceWait,
+            vk::dri3::{ExportedSyncFile, export_dmabuf_read_access_sync_file},
+        };
+
         let Some(src_id) = self.store.lookup(src_pixmap_host_xid) else {
-            return;
+            return Ok(PresentSourceWait::Ready);
         };
-        // Only DRI3-imported (client-produced) sources carry a producer
-        // fence to wait on; server-owned storage is ordered by our own
-        // queue barriers, so `imported_dma_buf_fd()` → None → no wait
-        // (also why this never blocks the lavapipe/server-owned paths).
-        let Some(fd) = self
-            .store
-            .get(src_id)
-            .and_then(|d| d.storage.imported_drawable.as_ref())
-            .and_then(super::super::vk::target::DrawableImage::imported_dma_buf_fd)
-        else {
-            return;
+        let exported = {
+            let Some(fd) = self
+                .store
+                .get(src_id)
+                .and_then(|d| d.storage.imported_drawable.as_ref())
+                .and_then(super::super::vk::target::DrawableImage::imported_dma_buf_fd)
+            else {
+                return Ok(PresentSourceWait::Ready);
+            };
+            export_dmabuf_read_access_sync_file(fd)
         };
-        // Ready / Idle are the common, healthy outcomes — silent. Only
-        // surface the anomalies: TimedOut (we proceeded on a still-
-        // pending render → possible stale frame) and Unsupported (the
-        // ioctl is unavailable → we fell back to the old no-wait read).
-        match wait_dmabuf_read_ready(fd, TIMEOUT_MS) {
-            DmabufReadWait::Ready | DmabufReadWait::Idle => {}
-            other => log::debug!(
+
+        let sync_fd = match exported {
+            ExportedSyncFile::Idle => return Ok(PresentSourceWait::Ready),
+            ExportedSyncFile::Unsupported => {
+                log::warn!(
+                    target: "yserver::kms::render::present",
+                    "present source 0x{src_pixmap_host_xid:x}: dma-buf sync-file export unsupported; copying immediately",
+                );
+                return Ok(PresentSourceWait::Ready);
+            }
+            ExportedSyncFile::Fd(fd) => fd,
+        };
+
+        let mut pending = PendingPresentSourceWait {
+            fd: sync_fd,
+            source_id: src_id,
+            registered: false,
+            ready_reported: false,
+        };
+        if pending.is_ready() {
+            return Ok(PresentSourceWait::Ready);
+        }
+
+        let wait_id = self.next_present_source_wait_id;
+        self.next_present_source_wait_id = self.next_present_source_wait_id.wrapping_add(1).max(1);
+        self.store.incref(src_id);
+        match self
+            .platform
+            .present_completion_epfd
+            .register(pending.fd.as_fd(), wait_id)
+        {
+            Ok(()) => pending.registered = true,
+            Err(e) => log::warn!(
                 target: "yserver::kms::render::present",
-                "present source 0x{src_pixmap_host_xid:x} dma-buf read-wait → {other:?}",
+                "present source 0x{src_pixmap_host_xid:x}: readiness registration failed: {e}; polling",
             ),
         }
+        self.pending_present_source_waits.insert(wait_id, pending);
+        Ok(PresentSourceWait::Deferred(wait_id))
+    }
+
+    fn drain_ready_present_source_waits(&mut self) -> Vec<u64> {
+        use std::os::fd::AsFd;
+
+        let mut ready = Vec::new();
+        for (&wait_id, wait) in &mut self.pending_present_source_waits {
+            if wait.ready_reported || !wait.is_ready() {
+                continue;
+            }
+            wait.ready_reported = true;
+            if wait.registered {
+                if let Err(e) = self
+                    .platform
+                    .present_completion_epfd
+                    .unregister(wait.fd.as_fd())
+                {
+                    log::warn!("deferred Present source: readiness unregister failed: {e}");
+                }
+                wait.registered = false;
+            }
+            ready.push(wait_id);
+        }
+        ready
+    }
+
+    fn finish_present_source_wait(&mut self, wait_id: u64) {
+        use std::os::fd::AsFd;
+
+        let Some(wait) = self.pending_present_source_waits.remove(&wait_id) else {
+            return;
+        };
+        if wait.registered
+            && let Err(e) = self
+                .platform
+                .present_completion_epfd
+                .unregister(wait.fd.as_fd())
+        {
+            log::warn!("deferred Present source: readiness unregister failed: {e}");
+        }
+        self.store_decref_with_invalidate(wait.source_id);
     }
 
     fn poll_fds(&self) -> Vec<(std::os::fd::RawFd, BackendFdKind)> {
@@ -13736,7 +13850,7 @@ impl Backend for KmsBackend {
         let xid = self.core.next_host_xid();
         let handle = CursorHandle::from_raw(xid)
             .ok_or_else(|| io::Error::other("create_cursor: xid was 0"))?;
-        let (bgra, w, h) = if let Some((src_bytes, w, h)) =
+        let (bgra_bytes, color_roles, w, h) = if let Some((src_bytes, w, h)) =
             self.read_cursor_depth1_pixmap(source_pixmap.as_raw())
         {
             let mask_bytes = mask_pixmap.and_then(|mp| {
@@ -13752,7 +13866,7 @@ impl Backend for KmsBackend {
                     None
                 }
             });
-            let bgra = crate::kms::render::cursor::rasterise_create_cursor(
+            let image = crate::kms::render::cursor::rasterise_create_cursor_with_roles(
                 &src_bytes,
                 w,
                 h,
@@ -13760,15 +13874,20 @@ impl Backend for KmsBackend {
                 fore,
                 back,
             );
-            (bgra, w, h)
+            (image.bgra_bytes, image.color_roles, w, h)
         } else {
             log::warn!(
                 "render create_cursor: source pixmap 0x{:x} unreadable; cursor invisible",
                 source_pixmap.as_raw(),
             );
-            (vec![0u8; 4], 1u16, 1u16)
+            (
+                vec![0u8; 4],
+                vec![crate::kms::render::cursor::CursorColorRole::Transparent],
+                1u16,
+                1u16,
+            )
         };
-        self.insert_cursor_record(xid, w, h, hot_x, hot_y, bgra);
+        self.insert_monochrome_cursor_record(xid, w, h, hot_x, hot_y, bgra_bytes, color_roles);
         Ok(handle)
     }
 
@@ -13801,7 +13920,15 @@ impl Backend for KmsBackend {
             log::warn!(
                 "render create_glyph_cursor: source font 0x{src_xid:x} unknown; cursor invisible"
             );
-            self.insert_cursor_record(xid, 1, 1, 0, 0, vec![0u8; 4]);
+            self.insert_monochrome_cursor_record(
+                xid,
+                1,
+                1,
+                0,
+                0,
+                vec![0u8; 4],
+                vec![crate::kms::render::cursor::CursorColorRole::Transparent],
+            );
             return Ok(handle);
         };
         let mask_data =
@@ -13828,15 +13955,72 @@ impl Backend for KmsBackend {
             fore,
             back,
         );
-        self.insert_cursor_record(
+        self.insert_monochrome_cursor_record(
             xid,
             img.width,
             img.height,
             img.hot_x,
             img.hot_y,
             img.bgra_bytes,
+            img.color_roles,
         );
         Ok(handle)
+    }
+
+    fn recolor_cursor(
+        &mut self,
+        _origin: Option<OriginContext>,
+        host_xid: u32,
+        fore: (u16, u16, u16),
+        back: (u16, u16, u16),
+    ) -> io::Result<()> {
+        // RENDER animated cursors are wrappers around constituent cursors.
+        // Xorg's AnimCurRecolorCursor forwards each frame with that frame's
+        // own stored colors, so recoloring the wrapper does not replace frame
+        // colors. Preserve that behavior rather than recoloring snapshots.
+        if self.anim_cursor_records.contains_key(&host_xid) {
+            return Ok(());
+        }
+        let Some(old) = self.cursor_records.get(&host_xid).cloned() else {
+            return Ok(());
+        };
+        let Some(color_roles) = old.color_roles.clone() else {
+            // Xorg explicitly ignores RecolorCursor for ARGB cursors.
+            return Ok(());
+        };
+        let version = self.next_cursor_version;
+        self.next_cursor_version = self.next_cursor_version.saturating_add(1);
+        let record = crate::kms::render::cursor::CursorRecord::new_monochrome(
+            old.width,
+            old.height,
+            old.hot_x,
+            old.hot_y,
+            color_roles,
+            fore,
+            back,
+            version,
+        );
+        if let Some(&pixmap_id) = self.cursor_pixmaps.get(&host_xid) {
+            self.engine
+                .put_image(
+                    &mut self.store,
+                    &mut self.platform,
+                    pixmap_id,
+                    ash::vk::Offset2D::default(),
+                    ash::vk::Extent2D {
+                        width: u32::from(record.width),
+                        height: u32::from(record.height),
+                    },
+                    &record.bgra_bytes,
+                    32,
+                )
+                .map_err(|error| io::Error::other(format!("recolor cursor upload: {error:?}")))?;
+        }
+        self.cursor_records.insert(host_xid, record);
+        if self.effective_cursor_xid == Some(host_xid) {
+            self.display_cursor_by_handle(host_xid);
+        }
+        Ok(())
     }
 
     fn create_anim_cursor(
@@ -15187,12 +15371,26 @@ impl Backend for KmsBackend {
             self.log_render_gap("read_depth1_pixmap_unknown_xid");
             return Ok(None);
         };
-        let (depth, extent) = match self.store.get(target.id) {
-            Some(d) => (d.depth, d.storage.extent),
+        let (depth, extent, content_version) = match self.store.get(target.id) {
+            Some(d) => (d.depth, d.storage.extent, d.content_version),
             None => return Ok(None),
         };
         if depth != 1 {
             return Ok(None);
+        }
+        // #32/#96: serve an unchanged depth-1 SHAPE::Mask from the CPU
+        // cache instead of re-reading it from VRAM — the readback stalls
+        // the single-threaded loop on discrete NVIDIA, and ~60% of these
+        // reads re-fetch a mask that has not changed. `content_version`
+        // is bumped on every draw into this pixmap, so a same-version hit
+        // is guaranteed current; any draw forces a miss + fresh read.
+        // `DrawableId` is never recycled, so a stale entry cannot alias a
+        // reallocated pixmap.
+        if let Some((w, h, bytes)) =
+            self.depth1_mask_cache
+                .get(target.id, content_version, extent.width, extent.height)
+        {
+            return Ok(Some((w, h, bytes)));
         }
         let rect = ash::vk::Rect2D {
             offset: ash::vk::Offset2D {
@@ -15228,6 +15426,15 @@ impl Backend for KmsBackend {
                             }
                         }
                     }
+                    // #32/#96: cache this readback so the next unchanged
+                    // read of the same mask skips the VRAM round-trip.
+                    self.depth1_mask_cache.insert(
+                        target.id,
+                        content_version,
+                        extent.width,
+                        extent.height,
+                        bytes.clone(),
+                    );
                     Ok(Some((extent.width, extent.height, bytes)))
                 }
                 Err(e) => {
@@ -22277,6 +22484,40 @@ mod tests {
                 "{g} must not log a gap post-3f.4 (cursor scene blit is Stage 4)"
             );
         }
+    }
+
+    #[test]
+    fn recolor_cursor_updates_monochrome_records_and_ignores_argb() {
+        use crate::kms::render::cursor::{CursorColorRole, color_roles_to_bgra};
+
+        let mut b = KmsBackend::for_tests();
+        let mono = 0x1234_1001;
+        let roles = vec![
+            CursorColorRole::Transparent,
+            CursorColorRole::Foreground,
+            CursorColorRole::Background,
+        ];
+        let original = color_roles_to_bgra(&roles, (0x1111, 0x2222, 0x3333), (0, 0, 0));
+        b.insert_monochrome_cursor_record(mono, 3, 1, 0, 0, original, roles);
+        let old_version = b.cursor_records[&mono].version;
+
+        b.recolor_cursor(None, mono, (0xff00, 0, 0), (0, 0, 0xff00))
+            .expect("recolor monochrome cursor");
+
+        let recolored = &b.cursor_records[&mono];
+        assert!(recolored.version > old_version);
+        assert_eq!(&recolored.bgra_bytes[0..4], &[0, 0, 0, 0]);
+        assert_eq!(&recolored.bgra_bytes[4..8], &[0, 0, 0xff, 0xff]);
+        assert_eq!(&recolored.bgra_bytes[8..12], &[0xff, 0, 0, 0xff]);
+
+        let argb = 0x1234_1002;
+        b.insert_cursor_record(argb, 1, 1, 0, 0, vec![1, 2, 3, 4]);
+        let argb_before = b.cursor_records[&argb].clone();
+        b.recolor_cursor(None, argb, (0xffff, 0, 0), (0, 0, 0xffff))
+            .expect("ARGB recolor is an intentional no-op");
+        let argb_after = &b.cursor_records[&argb];
+        assert_eq!(argb_after.version, argb_before.version);
+        assert_eq!(argb_after.bgra_bytes, argb_before.bgra_bytes);
     }
 
     /// Stage 5 Phase A: define_cursor stores the cursor on the

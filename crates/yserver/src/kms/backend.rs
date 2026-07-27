@@ -69,6 +69,121 @@ pub(crate) struct ClipMaskCache {
     pub(crate) bytes: Vec<u8>,
 }
 
+/// CPU cache of depth-1 SHAPE::Mask readbacks (`read_depth1_pixmap`),
+/// added for #32/#96: on discrete NVIDIA each mask read is a VRAM->CPU
+/// round-trip that stalls the single-threaded loop, and ~60% of them are
+/// re-reads of an UNCHANGED mask (Peter's `rdepth1_diag`, 2026-07-24).
+/// On host-visible (integrated/APU) GPUs the readback is a cheap memcpy,
+/// so this is simply a no-op win there.
+///
+/// Keyed by `DrawableId` — minted monotonically and NEVER recycled, so a
+/// freed+reallocated pixmap always gets a fresh id and cannot alias a
+/// stale entry — and validated by `content_version`, which is bumped on
+/// every pixel write (the same invariant `ClipMaskCache` relies on), so
+/// any draw into the mask forces a re-read. Bounded LRU so masks of
+/// long-gone pixmaps can't accumulate (no free-path hook needed).
+pub(crate) struct Depth1MaskCache {
+    entries: std::collections::HashMap<crate::kms::render::store::DrawableId, Depth1MaskEntry>,
+    /// LRU order, back = most-recently-used. `touch` removes any prior
+    /// occurrence before pushing, so this stays duplicate-free and
+    /// `entries.len() == order.len()` holds.
+    order: std::collections::VecDeque<crate::kms::render::store::DrawableId>,
+    cap: usize,
+}
+
+struct Depth1MaskEntry {
+    content_version: u64,
+    width: u32,
+    height: u32,
+    bytes: Vec<u8>,
+}
+
+impl Depth1MaskCache {
+    /// `cap` = max distinct masks retained (clamped to >= 1). Peter's
+    /// session touched ~176 distinct masks; 256 covers it comfortably.
+    pub(crate) fn new(cap: usize) -> Self {
+        Self {
+            entries: std::collections::HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            cap: cap.max(1),
+        }
+    }
+
+    /// Cache hit iff we hold `id` at the SAME `content_version` AND the
+    /// SAME extent. Refreshes LRU recency and returns an owned copy of the
+    /// mask — a few-KB memcpy, vastly cheaper than the GPU readback it
+    /// replaces. The `width`/`height` guard is belt-and-suspenders: X11
+    /// pixmaps (the only SHAPE::Mask sources) can't resize, and any pixel
+    /// write already bumps `content_version`, but validating the extent
+    /// means a hit can never hand back bytes sized for a different
+    /// allocation even if some future caller reuses this with a
+    /// resizable drawable.
+    pub(crate) fn get(
+        &mut self,
+        id: crate::kms::render::store::DrawableId,
+        content_version: u64,
+        width: u32,
+        height: u32,
+    ) -> Option<(u32, u32, Vec<u8>)> {
+        let hit = matches!(
+            self.entries.get(&id),
+            Some(e) if e.content_version == content_version
+                && e.width == width
+                && e.height == height
+        );
+        if !hit {
+            return None;
+        }
+        self.touch(id);
+        let e = &self.entries[&id];
+        Some((e.width, e.height, e.bytes.clone()))
+    }
+
+    /// Insert (or replace) `id`'s entry and evict LRU victims past `cap`.
+    pub(crate) fn insert(
+        &mut self,
+        id: crate::kms::render::store::DrawableId,
+        content_version: u64,
+        width: u32,
+        height: u32,
+        bytes: Vec<u8>,
+    ) {
+        self.entries.insert(
+            id,
+            Depth1MaskEntry {
+                content_version,
+                width,
+                height,
+                bytes,
+            },
+        );
+        self.touch(id);
+        while self.entries.len() > self.cap {
+            match self.order.pop_front() {
+                Some(victim) => {
+                    self.entries.remove(&victim);
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// Move `id` to the MRU end, removing any stale position first so
+    /// `order` never holds duplicates.
+    fn touch(&mut self, id: crate::kms::render::store::DrawableId) {
+        if let Some(pos) = self.order.iter().position(|&x| x == id) {
+            self.order.remove(pos);
+        }
+        self.order.push_back(id);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        debug_assert_eq!(self.entries.len(), self.order.len());
+        self.entries.len()
+    }
+}
+
 /// Rasterise an X11 pixmap clip-mask against a paint-rect list.
 ///
 /// X11 GC clip-mask: a pixel paints iff the mask bit at
@@ -893,5 +1008,58 @@ pub(crate) fn parse_add_glyphs(gs: &mut GlyphSetState, body_tail: &[u8]) {
                 format: stored_format,
             },
         );
+    }
+}
+
+#[cfg(test)]
+mod depth1_mask_cache_tests {
+    use super::Depth1MaskCache;
+    use crate::kms::render::store::DrawableId;
+
+    #[test]
+    fn hit_only_on_matching_content_version() {
+        let mut c = Depth1MaskCache::new(8);
+        let id = DrawableId::for_tests(1);
+        assert!(c.get(id, 0, 4, 4).is_none(), "empty cache misses");
+
+        c.insert(id, 5, 4, 4, vec![0xAA; 16]);
+        // Same version + extent -> hit with the stored bytes.
+        assert_eq!(c.get(id, 5, 4, 4), Some((4, 4, vec![0xAA; 16])));
+        // A newer content_version (the mask was drawn into) -> miss,
+        // forcing a fresh readback.
+        assert!(c.get(id, 6, 4, 4).is_none(), "stale version must miss");
+        // Same version but a different extent -> miss (belt-and-suspenders
+        // guard against handing back wrongly-sized bytes).
+        assert!(c.get(id, 5, 8, 8).is_none(), "extent mismatch must miss");
+    }
+
+    #[test]
+    fn reinsert_updates_bytes_without_growing() {
+        let mut c = Depth1MaskCache::new(8);
+        let id = DrawableId::for_tests(1);
+        c.insert(id, 1, 2, 2, vec![0x00; 4]);
+        c.insert(id, 2, 2, 2, vec![0xFF; 4]);
+        assert_eq!(c.len(), 1, "same id must not duplicate");
+        assert!(c.get(id, 1, 2, 2).is_none(), "old version gone");
+        assert_eq!(c.get(id, 2, 2, 2), Some((2, 2, vec![0xFF; 4])));
+    }
+
+    #[test]
+    fn bounded_lru_evicts_least_recently_used() {
+        let mut c = Depth1MaskCache::new(2);
+        let (a, b, d) = (
+            DrawableId::for_tests(1),
+            DrawableId::for_tests(2),
+            DrawableId::for_tests(3),
+        );
+        c.insert(a, 1, 1, 1, vec![1]);
+        c.insert(b, 1, 1, 1, vec![2]);
+        // Touch `a` so `b` becomes the LRU victim.
+        assert!(c.get(a, 1, 1, 1).is_some());
+        c.insert(d, 1, 1, 1, vec![3]);
+        assert_eq!(c.len(), 2, "cap enforced");
+        assert!(c.get(b, 1, 1, 1).is_none(), "LRU entry b evicted");
+        assert!(c.get(a, 1, 1, 1).is_some(), "recently-used a survives");
+        assert!(c.get(d, 1, 1, 1).is_some(), "newest d survives");
     }
 }

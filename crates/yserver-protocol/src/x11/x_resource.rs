@@ -3,10 +3,10 @@
 //! `QueryClients` (the connected-client list) and `QueryClientResources`
 //! (per-type resource counts for a client) return real data — the two
 //! queries `xrestop` leans on. The remaining queries
-//! (`QueryClientPixmapBytes`, `QueryClientIds`, `QueryResourceBytes`)
-//! are still empty/zero stubs: yserver keeps no per-client byte tallies
-//! or PID map yet, so those report empty (same observable behaviour as
-//! an X server with those features unavailable).
+//! `QueryClientPixmapBytes` is computed from live pixmap geometry. The
+//! `QueryClientIds` reports ClientXID identities but omits PID identities
+//! because yserver does not retain peer credentials. `QueryResourceBytes`
+//! remains empty until recursive resource-size accounting exists.
 //!
 //! Canonical layout: `/usr/share/xcb/res.xml`, version 1.2.
 
@@ -24,6 +24,8 @@ pub const QUERY_RESOURCE_BYTES: u8 = 5;
 
 pub const MAJOR_VERSION: u16 = 1;
 pub const MINOR_VERSION: u16 = 2;
+pub const CLIENT_XID_MASK: u32 = 1 << 0;
+pub const LOCAL_CLIENT_PID_MASK: u32 = 1 << 1;
 
 fn read_u8(bytes: &[u8], idx: usize) -> u8 {
     bytes[idx]
@@ -136,20 +138,31 @@ pub fn encode_query_client_resources_empty_reply(
     encode_count_reply_32_byte(byte_order, sequence, 0)
 }
 
-/// Zero `QueryClientPixmapBytes` reply: `bytes = 0`, `bytes_overflow = 0`.
+/// `QueryClientPixmapBytes` reply. The 64-bit total is split into the low
+/// `bytes` word and high `bytes_overflow` word used by the protocol.
 /// Layout: pad(1) bytes(4) bytes_overflow(4) pad(16).
 #[must_use]
-pub fn encode_query_client_pixmap_bytes_zero_reply(
+pub fn encode_query_client_pixmap_bytes_reply(
     byte_order: ClientByteOrder,
     sequence: SequenceNumber,
+    bytes: u64,
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(32);
     out.push(1);
     out.push(0);
     write_u16(byte_order, &mut out, sequence.0);
     write_u32(byte_order, &mut out, 0);
-    write_u32(byte_order, &mut out, 0); // bytes
-    write_u32(byte_order, &mut out, 0); // bytes_overflow
+    let words = bytes.to_le_bytes();
+    write_u32(
+        byte_order,
+        &mut out,
+        u32::from_le_bytes(words[0..4].try_into().unwrap()),
+    );
+    write_u32(
+        byte_order,
+        &mut out,
+        u32::from_le_bytes(words[4..8].try_into().unwrap()),
+    );
     out.extend_from_slice(&[0u8; 16]);
     debug_assert_eq!(out.len(), 32);
     out
@@ -163,6 +176,90 @@ pub fn encode_query_client_ids_empty_reply(
     sequence: SequenceNumber,
 ) -> Vec<u8> {
     encode_count_reply_32_byte(byte_order, sequence, 0)
+}
+
+/// One `ClientIdValue` in a `QueryClientIds` reply: the 12-byte header
+/// `{client, mask, length}` plus `length` bytes of value words.
+///
+/// Xorg emits one of these PER IDENTITY, not per client, so a client with both
+/// a XID and a PID identity contributes two entries and counts twice in
+/// `num_ids` (`Xext/xres.c` `ConstructClientIdValue`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientIdEntry {
+    /// The subject client, as its resource-id base (Xorg's `clientAsMask`).
+    pub client: u32,
+    /// Exactly one of `CLIENT_XID_MASK` / `LOCAL_CLIENT_PID_MASK`.
+    pub mask: u32,
+    /// Value word, if this identity carries one. `None` encodes `length = 0`
+    /// (ClientXID); `Some(pid)` encodes `length = 4` plus the word.
+    pub value: Option<u32>,
+}
+
+impl ClientIdEntry {
+    /// ClientXID identity: always available, carries no value word.
+    #[must_use]
+    pub fn xid(client: u32) -> Self {
+        Self {
+            client,
+            mask: CLIENT_XID_MASK,
+            value: None,
+        }
+    }
+
+    /// LocalClientPID identity, carrying the peer pid as its single value word.
+    #[must_use]
+    pub fn pid(client: u32, pid: u32) -> Self {
+        Self {
+            client,
+            mask: LOCAL_CLIENT_PID_MASK,
+            value: Some(pid),
+        }
+    }
+
+    const fn wire_len(self) -> usize {
+        if self.value.is_some() { 16 } else { 12 }
+    }
+}
+
+/// `QueryClientIds` reply. `num_ids` counts ENTRIES (not clients), and the
+/// reply `length` is the total entry bytes in 4-byte units — matching Xorg's
+/// `rep.length = bytes_to_int32(ctx->resultBytes)`.
+///
+/// Per-entry `length` is in BYTES (`rep.length = 4` for a pid), not in words.
+#[must_use]
+pub fn encode_query_client_ids_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    entries: &[ClientIdEntry],
+) -> Vec<u8> {
+    let body_bytes: usize = entries.iter().map(|e| e.wire_len()).sum();
+    let mut out = Vec::with_capacity(32 + body_bytes);
+    out.push(1);
+    out.push(0);
+    write_u16(byte_order, &mut out, sequence.0);
+    write_u32(
+        byte_order,
+        &mut out,
+        u32::try_from(body_bytes / 4).unwrap_or(u32::MAX),
+    );
+    write_u32(
+        byte_order,
+        &mut out,
+        u32::try_from(entries.len()).unwrap_or(u32::MAX),
+    );
+    out.extend_from_slice(&[0u8; 20]);
+    for entry in entries {
+        write_u32(byte_order, &mut out, entry.client);
+        write_u32(byte_order, &mut out, entry.mask);
+        match entry.value {
+            Some(value) => {
+                write_u32(byte_order, &mut out, 4);
+                write_u32(byte_order, &mut out, value);
+            }
+            None => write_u32(byte_order, &mut out, 0),
+        }
+    }
+    out
 }
 
 /// Empty `QueryResourceBytes` reply (v1.2): `num_sizes = 0`.

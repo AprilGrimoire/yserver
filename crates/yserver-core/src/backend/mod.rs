@@ -20,8 +20,8 @@ pub use params::{
 };
 pub use trait_def::{
     ActiveCursorImage, Backend, BackendFdKind, CompletedPresentEvent, Dri3Caps, Dri3PixmapExport,
-    HostSocketStatus, KeymapLoad, ModeSpec, PresentCaps, PresentWake, SyncobjHandle,
-    XkbNewKeyboardInfo, XshmfenceHandle,
+    HostSocketStatus, KeymapLoad, ModeSpec, PresentCaps, PresentSourceWait, PresentWake,
+    SyncobjHandle, XkbNewKeyboardInfo, XshmfenceHandle,
 };
 
 use yserver_protocol::x11::ClientId;

@@ -70,7 +70,7 @@ pub fn encode_get_version_reply(
 }
 
 /// Encode a `CompareCursor` reply. `same` is 1 if the window's cursor matches
-/// the comparison cursor. We stub this as always-true.
+/// the comparison cursor.
 #[must_use]
 pub fn encode_compare_cursor_reply(
     byte_order: ClientByteOrder,

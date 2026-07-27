@@ -340,21 +340,28 @@ from.
       current frame. Fix is almost certainly in that accumulation, not
       in the input/protocol layer.
 
-- [ ] **Follow-up: replace the present-source CPU wait with a GPU
-      acquire-semaphore (perf).** `wait_present_source_ready`
-      (backend.rs) CPU-`poll()`s the source dma-buf's read fence before
-      the present copy — correct and bounded, but it stalls the
-      single-threaded core for the producer's outstanding render
-      (usually sub-frame; can add up under many concurrent GPU clients).
-      The non-stalling form imports that same fence as a `VkSemaphore`
-      (machinery already exists: `vk::sync::import_sync_file` +
-      `external_semaphore_fd`) and waits on it on the present copy's
-      **submit**. Land it with the composite-into-frame-builder work
-      (Stage 5 / Phase B): that gives one well-defined submit per frame
-      to carry the acquire list, with the semaphore's lifetime tied to
-      the frame's fence ticket. NB Vulkan queue waits have no timeout —
-      only ever wait when `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` returns a real
-      fd, else no-op, to avoid a never-signalled-wait hang.
+- [x] **Present-source CPU wait removed (2026-07-25).** The bounded
+      `wait_present_source_ready` poll proved timing-dependent under
+      Warframe: 50 ms stalled input, 1 ms happened to work on one box,
+      and 0/2 ms could copy stale content. A GPU acquire-semaphore was
+      also rejected because waiting on yserver's single graphics queue
+      head-of-line-blocks unrelated work under contention. The landed
+      path exports the same dma-buf READ sync-file, registers it with
+      the existing Present-completion poller, retains the exact source
+      drawable, and resumes the copy from the core loop only once the fd
+      is readable. Thus neither the CPU dispatch thread nor the Vulkan
+      queue waits behind the producer. Live Warframe/wezterm/Firefox KMS
+      revalidation remains recorded in `docs/status.md`.
+
+- [ ] **Remove or integrate the informational Present scheduler queue.**
+      Present Copy requests complete through the immediate/deferred-copy path,
+      but are also mirrored into `PresentScheduler`; no vblank caller consumes
+      that queue. It therefore grows for the lifetime of each window. Window
+      teardown drains the historical entries and attempts to signal already
+      freed idle syncobjs, producing 1,676 warnings in the final Warframe/MATE
+      capture. Until the vblank scheduler is integrated, stop mirroring
+      completed Copy requests (and retain only state genuinely needed for
+      Flip/DirectScanout).
 
 - [ ] **Stage 4c follow-up: scene-structure damage rects clip in
       the wrong frame on non-origin outputs (low impact).**

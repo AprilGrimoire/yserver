@@ -144,6 +144,18 @@ impl HostX11Backend {
         self.stream.flush()
     }
 
+    pub fn recolor_cursor(
+        &mut self,
+        host_xid: u32,
+        fore: (u16, u16, u16),
+        back: (u16, u16, u16),
+    ) -> io::Result<()> {
+        self.advance_sequence();
+        let buf = build_recolor_cursor(host_xid, fore, back);
+        self.stream.write_all(&buf)?;
+        self.stream.flush()
+    }
+
     /// Send a `ListFonts` request to the host and return the full reply
     /// bytes (including the 32-byte standard reply header).
     pub fn list_fonts_proxy(&mut self, max_names: u16, pattern: &str) -> io::Result<Vec<u8>> {
@@ -2298,6 +2310,21 @@ impl HostX11Backend {
     }
 }
 
+fn build_recolor_cursor(host_xid: u32, fore: (u16, u16, u16), back: (u16, u16, u16)) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(20);
+    buf.push(96); // RecolorCursor
+    buf.push(0);
+    write_u16(&mut buf, 5);
+    write_u32(&mut buf, host_xid);
+    write_u16(&mut buf, fore.0);
+    write_u16(&mut buf, fore.1);
+    write_u16(&mut buf, fore.2);
+    write_u16(&mut buf, back.0);
+    write_u16(&mut buf, back.1);
+    write_u16(&mut buf, back.2);
+    buf
+}
+
 #[must_use]
 pub(crate) fn xkb_minor_has_reply(minor: u8) -> bool {
     // Reply-producing XKB minor requests per /usr/share/xcb/xkb.xml
@@ -2462,8 +2489,29 @@ fn write_list_fonts(
 }
 #[cfg(test)]
 mod tests {
-    use super::{build_shape_rectangles, xkb_minor_has_reply};
+    use super::{build_recolor_cursor, build_shape_rectangles, xkb_minor_has_reply};
     use yserver_protocol::x11::xfixes::RegionRect;
+
+    #[test]
+    fn recolor_cursor_wire_shape() {
+        let bytes = build_recolor_cursor(
+            0xdead_beef,
+            (0x1122, 0x3344, 0x5566),
+            (0x7788, 0x99aa, 0xbbcc),
+        );
+        assert_eq!(bytes.len(), 20);
+        assert_eq!(bytes[0], 96);
+        assert_eq!(u16::from_le_bytes(bytes[2..4].try_into().unwrap()), 5);
+        assert_eq!(
+            u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            0xdead_beef
+        );
+        let colors: Vec<u16> = bytes[8..]
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes(pair.try_into().unwrap()))
+            .collect();
+        assert_eq!(colors, [0x1122, 0x3344, 0x5566, 0x7788, 0x99aa, 0xbbcc]);
+    }
 
     #[test]
     fn xkb_reply_minor_audit_includes_known_blocking_requests() {

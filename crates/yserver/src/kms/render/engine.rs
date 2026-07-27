@@ -717,6 +717,13 @@ pub(crate) struct StagingBuffer {
     /// `HOST_CACHED`-only readback type), CPU reads of `mapped` must be
     /// preceded by `invalidate_for_read` so they observe the GPU's writes.
     coherent: bool,
+    /// True if this buffer was handed out by [`StagingPool::acquire`] (the
+    /// `put_image` upload path) and should be RETURNED to the pool at retire
+    /// instead of destroyed. Fresh `new*` buffers (readback, custom usage) are
+    /// `false` and drop normally. Perf: avoids per-upload
+    /// vkCreateBuffer/vkAllocateMemory churn, which is costly on NVIDIA. Remove
+    /// with the rest of this investigation if the pool doesn't pan out.
+    from_pool: bool,
 }
 
 impl std::fmt::Debug for StagingBuffer {
@@ -836,6 +843,7 @@ impl StagingBuffer {
             mapped,
             size,
             coherent,
+            from_pool: false,
         })
     }
 
@@ -907,6 +915,82 @@ impl Drop for StagingBuffer {
             self.vk.device.destroy_buffer(self.buffer, None);
             self.vk.device.free_memory(self.memory, None);
         }
+    }
+}
+
+/// EXPERIMENT (NVIDIA per-op driver cost, 2026-07-20): free-list of reusable
+/// upload `StagingBuffer`s for the `put_image` path, keyed by exact byte size.
+///
+/// `put_image` used to `vkCreateBuffer` + `vkAllocateMemory` + map a fresh
+/// staging buffer per upload (~11.5k/session under an xfce drag storm) and
+/// destroy it at retire. On NVIDIA proprietary each alloc/free is a costly
+/// driver ioctl (perf: yserver CPU dominated by the nvidia stack); RADV does it
+/// nearly for free (hence this only helps NVIDIA). Reuse eliminates the churn:
+/// the returned buffer is fully overwritten by the next `unpack_to_staging`
+/// before its GPU copy, so no stale-data hazard. Buckets are exact-size (upload
+/// sizes recur per widget, like the pixmap pool). Bounded by per-bucket count +
+/// total bytes; over-cap returns just drop (destroy). Remove with the rest of
+/// this investigation if it doesn't pan out.
+#[derive(Default)]
+struct StagingPool {
+    buckets: std::collections::HashMap<u64, Vec<StagingBuffer>>,
+    pooled_bytes: u64,
+    hits: u64,
+    misses: u64,
+    returned: u64,
+    rejected: u64,
+}
+
+/// Max buffers kept per exact-size bucket.
+const STAGING_POOL_BUCKET_CAP: usize = 16;
+/// Total bytes cap across all buckets (~64 MiB). Beyond this, returns drop.
+const STAGING_POOL_TOTAL_BYTES_CAP: u64 = 64 * 1024 * 1024;
+
+impl StagingPool {
+    /// Reuse a same-size buffer, or allocate a fresh one. The returned buffer
+    /// is flagged `from_pool` so retire routes it back here.
+    fn acquire(&mut self, vk: &Arc<VkContext>, size: u64) -> Result<StagingBuffer, vk::Result> {
+        if let Some(buf) = self.buckets.get_mut(&size).and_then(Vec::pop) {
+            self.pooled_bytes = self.pooled_bytes.saturating_sub(buf.size);
+            self.hits += 1;
+            return Ok(buf);
+        }
+        self.misses += 1;
+        let mut buf = StagingBuffer::new(Arc::clone(vk), size)?;
+        buf.from_pool = true;
+        Ok(buf)
+    }
+
+    /// Return a retired `from_pool` buffer for reuse, or drop it (destroy) if
+    /// the bucket/byte caps are exceeded. Caller guarantees `buf.from_pool`.
+    fn release(&mut self, buf: StagingBuffer) {
+        let bucket = self.buckets.entry(buf.size).or_default();
+        if bucket.len() >= STAGING_POOL_BUCKET_CAP
+            || self.pooled_bytes.saturating_add(buf.size) > STAGING_POOL_TOTAL_BYTES_CAP
+        {
+            self.rejected += 1;
+            return; // buf drops → StagingBuffer::Drop destroys it
+        }
+        self.pooled_bytes = self.pooled_bytes.saturating_add(buf.size);
+        self.returned += 1;
+        bucket.push(buf);
+    }
+
+    /// Destroy every pooled buffer. Call at shutdown after the queue is idle.
+    /// Logs a lifetime summary so the pool's effectiveness is measurable on HW
+    /// (high `hits` vs `misses` ⇒ the per-upload alloc churn was eliminated).
+    fn drain(&mut self) {
+        log::info!(
+            "staging pool: hits={} misses={} returned={} rejected={} buckets={} pooled_bytes={}",
+            self.hits,
+            self.misses,
+            self.returned,
+            self.rejected,
+            self.buckets.len(),
+            self.pooled_bytes,
+        );
+        self.buckets.clear(); // StagingBuffer::Drop frees each
+        self.pooled_bytes = 0;
     }
 }
 
@@ -996,6 +1080,10 @@ struct RenderEngineInner {
     /// [`RenderEngine::poll_retired`] (called periodically by
     /// `KmsBackend` and at shutdown).
     submitted: VecDeque<SubmittedOp>,
+    /// EXPERIMENT (#nvidia perf): reusable upload staging buffers for
+    /// `put_image`, to avoid per-upload vkCreateBuffer/vkAllocateMemory churn
+    /// (costly on NVIDIA). See [`StagingPool`].
+    staging_pool: StagingPool,
     /// Stage 3b: per-picture GPU-side state. Today only carries
     /// gradient `GradientPicture` instances built lazily by Stage
     /// 3c's first `render_composite`; Stage 3b just ensures
@@ -1625,6 +1713,7 @@ impl RenderEngine {
             inner: Some(RenderEngineInner {
                 vk,
                 submitted: VecDeque::new(),
+                staging_pool: StagingPool::default(),
                 picture_paint: HashMap::new(),
                 glyph_atlas: None,
                 text_pipelines: HashMap::new(),
@@ -1698,7 +1787,9 @@ impl RenderEngine {
             unsafe {
                 device.free_command_buffers(pool, &[op.cb]);
             }
-            // staging drops at end of scope → destroys Vk handles.
+            // staging drops at end of scope → destroys Vk handles. (Frame-
+            // builder put_image staging lives in the frame pin-set, not here;
+            // it's pooled at the pending_frames retire below.)
             drop(op.staging.take());
             // Phase B.2 Mechanism 3: release retired BatchResources
             // attached via adopt_retired_resource_for_gpu_retirement
@@ -1734,6 +1825,19 @@ impl RenderEngine {
             // BatchResource; see paint_batch.rs:147).
             for r in record.pins.retired_resources.drain(..) {
                 r.release(&inner.vk);
+            }
+            // #nvidia perf: reclaim pooled upload staging buffers for reuse
+            // instead of destroying them (avoids per-upload vkCreateBuffer/
+            // vkAllocateMemory churn, costly on NVIDIA). The pin holds the sole
+            // staging Arc at retire (put_image's local dropped after recording;
+            // RecordedPutImage keeps only an index), so try_unwrap succeeds;
+            // from_pool buffers go back to the pool, others drop.
+            for arc in record.pins.staging_buffers.drain(..) {
+                if let Ok(buf) = Arc::try_unwrap(arc)
+                    && buf.from_pool
+                {
+                    inner.staging_pool.release(buf);
+                }
             }
             // The Arcs inside the record drop here, releasing pinned resources.
             drop(record);
@@ -2030,6 +2134,9 @@ impl RenderEngine {
             }
             inner.descriptor_pool_ring.release_up_to(op.generation);
         }
+        // #nvidia perf: destroy pooled upload staging buffers (all submitted
+        // work above is waited out, so none is in flight).
+        inner.staging_pool.drain();
         // Phase B.1: drain in-flight frame pins. wait() ensures Vk-side
         // completion before the Arc<StagingBuffer> drops would otherwise
         // race with GPU reads. Off-hot-path; one wait per pending frame
@@ -5160,7 +5267,16 @@ impl RenderEngine {
         // Phase B.3 (N8-style ordering): allocate the staging buffer BEFORE
         // any open-frame mutation so an allocation failure leaves the frame
         // untouched (no rollback needed).
-        let staging = Arc::new(StagingBuffer::new(inner.vk.clone(), staging_size.max(1))?);
+        // #nvidia perf: reuse a pooled upload staging buffer instead of a fresh
+        // vkCreateBuffer+vkAllocateMemory per put_image (costly on NVIDIA).
+        // Returned to the pool at retire (poll_retired). Clone vk to a local
+        // first so the &mut borrow of `inner.staging_pool` doesn't alias `inner.vk`.
+        let staging_vk = inner.vk.clone();
+        let staging = Arc::new(
+            inner
+                .staging_pool
+                .acquire(&staging_vk, staging_size.max(1))?,
+        );
         // Convert src_bytes → staging according to (depth, dst_format).
         let (sx, sy) = src_origin_in_input;
         unpack_to_staging(
